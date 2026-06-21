@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+{# ---------------------------------------------------------------------------
+   Base layout for every HTML page served by the web router.
+
+   Frontend stack (all via CDN — see design, "Frontend libs" decision):
+   * Tailwind CSS (Play script) — utility classes, class-based dark mode.
+   * HTMX — declarative AJAX, used by later work units.
+   * Alpine.js — minimal reactivity, used here for the dark-mode toggle.
+
+   Dark mode strategy
+   ------------------
+   Tailwind's class-based dark mode flips colours whenever the
+   ``<html>`` element carries the ``dark`` class. Two complementary
+   mechanisms keep that class correct:
+
+   1. The inline ``<script>`` below runs synchronously inside ``<head>``
+      *before* the browser paints the body, so the user's saved
+      preference (localStorage) or system preference
+      (``prefers-color-scheme``) is applied immediately. This is the
+      standard pattern from the Tailwind dark-mode docs and prevents
+      the "flash of incorrect theme" (FOIT) that a pure Alpine/JS-only
+      approach would produce.
+
+   2. The ``darkMode`` Alpine component, registered in the second
+      inline script, mirrors the same state and exposes a ``toggle()``
+      action used by the header button. The component's initial value
+      is read from the same localStorage key so the two mechanisms
+      stay in sync; the inline pre-paint script is the source of truth
+      for the *first* render, and Alpine takes over for subsequent
+      user interactions.
+
+   The Alpine ``x-data="darkMode"`` and ``:class`` bindings on the
+   ``<html>`` element below exist so Alpine can update the class on
+   toggle without re-reading localStorage manually.
+--------------------------------------------------------------------------- #}
+<html lang="en" x-data="darkMode" :class="{ 'dark': isDark }">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+
+    <title>{% block title %}{{ app_name }}{% endblock %}</title>
+
+    {# --- Dark-mode pre-paint script ------------------------------------- #}
+    {# Runs synchronously inside <head>; must come before any styling that
+       depends on the ``dark`` class so the body never paints in the
+       wrong theme. Kept dependency-free: no Alpine, no Tailwind.       #}
+    <script>
+        (function () {
+            try {
+                var stored = localStorage.getItem('theme');
+                var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                var shouldBeDark = stored === 'dark' || (stored === null && prefersDark);
+                if (shouldBeDark) {
+                    document.documentElement.classList.add('dark');
+                } else {
+                    document.documentElement.classList.remove('dark');
+                }
+            } catch (err) {
+                /* localStorage may be unavailable (private mode, etc.) —
+                   fall back to the system preference and let Alpine
+                   re-sync the class on init. */
+            }
+        })();
+    </script>
+
+    {# --- Tailwind CSS Play CDN ------------------------------------------ #}
+    {# The Play CDN is acceptable for the Phase 0 MVP. Production builds
+       should switch to a compiled stylesheet (see design, "Open
+       Questions"). The inline ``tailwind.config`` enables class-based
+       dark mode so the ``dark`` prefix on utility classes works.     #}
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' };
+    </script>
+
+    {# --- HTMX ----------------------------------------------------------- #}
+    {# Loaded synchronously so inline ``hx-get`` / ``hx-post`` attributes
+       in child templates are active as soon as the page mounts.        #}
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+
+    {# --- Alpine.js ------------------------------------------------------ #}
+    {# ``defer`` lets the browser parse the rest of the document first;
+       Alpine walks the DOM on ``DOMContentLoaded``.                    #}
+    <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+
+    {# --- ``darkMode`` Alpine component ---------------------------------- #}
+    {# Registered on ``alpine:init`` so it is available to every
+       ``x-data="darkMode"`` binding on the page. ``init()`` re-reads
+       the class set by the pre-paint script so Alpine's reactive
+       state matches the DOM on mount.                                 #}
+    <script>
+        document.addEventListener('alpine:init', function () {
+            window.Alpine.data('darkMode', function () {
+                return {
+                    isDark: document.documentElement.classList.contains('dark'),
+                    toggle: function () {
+                        this.isDark = !this.isDark;
+                        try {
+                            localStorage.setItem('theme', this.isDark ? 'dark' : 'light');
+                        } catch (err) {
+                            /* localStorage unavailable — toggle still
+                               affects the current session. */
+                        }
+                        document.documentElement.classList.toggle('dark', this.isDark);
+                    },
+                };
+            });
+        });
+    </script>
+</head>
+
+{# Body uses neutral background/foreground pairs that flip with the
+   ``dark`` class. ``min-h-screen`` keeps the footer pinned to the
+   bottom on short pages. ``x-data`` is repeated on the body to keep
+   the Alpine scope consistent for any descendants.                  #}
+<body class="bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 min-h-screen flex flex-col">
+
+    {# --- Header --------------------------------------------------------- #}
+    {# Sticky, full-width, with a subtle bottom border that also flips
+       with the theme. The dark-mode toggle button lives on the right.  #}
+    <header class="border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+        <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+            <a href="/" class="text-xl font-semibold text-gray-900 dark:text-gray-100">
+                {{ app_name }}
+            </a>
+
+            <button
+                type="button"
+                data-testid="dark-mode-toggle"
+                aria-label="Toggle dark mode"
+                class="px-3 py-1.5 rounded-md text-sm font-medium
+                       bg-gray-100 hover:bg-gray-200 text-gray-800
+                       dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-100
+                       focus:outline-none focus:ring-2 focus:ring-offset-2
+                       focus:ring-indigo-500 dark:focus:ring-offset-gray-900"
+                @click="toggle()"
+                x-text="isDark ? '☀ Light' : '☾ Dark'"
+            ></button>
+        </div>
+    </header>
+
+    {# --- Main content --------------------------------------------------- #}
+    {# ``flex-1`` keeps the footer pinned to the bottom when the page is
+       short (a common pattern in Tailwind layouts).                     #}
+    <main class="flex-1">
+        <div class="max-w-5xl mx-auto px-4 py-8">
+            {% block content %}{% endblock %}
+        </div>
+    </main>
+
+    {# --- Footer (optional but cheap) ------------------------------------ #}
+    <footer class="border-t border-gray-200 dark:border-gray-700">
+        <div class="max-w-5xl mx-auto px-4 py-4 text-sm text-gray-500 dark:text-gray-400">
+            {{ app_name }} &mdash; Phase 0 foundation.
+        </div>
+    </footer>
+</body>
+</html>

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{# Landing page. Inherits the full layout (HTMX, Alpine, Tailwind,
+   dark-mode toggle) from base.html. The body content is intentionally
+   light for Phase 0 — the real dashboard lands in Phase 3.         #}
+
+{% block title %}{{ app_name }} &mdash; Home{% endblock %}
+
+{% block content %}
+    {# --- Hero ---------------------------------------------------------- #}
+    <section class="text-center py-12">
+        <h1 class="text-4xl font-bold text-gray-900 dark:text-gray-100">
+            Welcome to {{ app_name }}
+        </h1>
+        <p class="mt-4 text-lg text-gray-600 dark:text-gray-300">
+            A personal financial analyzer and spend control.
+        </p>
+    </section>
+
+    {# --- Phase 0 status ------------------------------------------------- #}
+    <section class="mt-8 p-6 rounded-lg border border-gray-200 dark:border-gray-700
+                    bg-gray-50 dark:bg-gray-800">
+        <h2 class="text-xl font-semibold text-gray-900 dark:text-gray-100">
+            Phase 0 &mdash; Foundation
+        </h2>
+        <p class="mt-2 text-gray-700 dark:text-gray-300">
+            The application skeleton is wired: FastAPI, async SQLite,
+            HTMX, Alpine.js and Tailwind CSS are all live. The dashboard
+            and domain features (transactions, budgets, accounts) ship
+            in Phase 3.
+        </p>
+
+        {# --- Tech checklist (HTMX-friendly) ----------------------------- #}
+        <ul class="mt-4 space-y-2 text-sm text-gray-700 dark:text-gray-300">
+            <li class="flex items-center">
+                <span class="mr-2">&check;</span>
+                FastAPI app factory with health check
+            </li>
+            <li class="flex items-center">
+                <span class="mr-2">&check;</span>
+                Async SQLAlchemy with SQLite (WAL mode)
+            </li>
+            <li class="flex items-center">
+                <span class="mr-2">&check;</span>
+                Alembic migrations
+            </li>
+            <li class="flex items-center">
+                <span class="mr-2">&check;</span>
+                HTMX + Alpine.js + Tailwind CSS shell
+            </li>
+            <li class="flex items-center">
+                <span class="mr-2">&check;</span>
+                Dark mode toggle (with system-preference fallback)
+            </li>
+        </ul>
+    </section>
+{% endblock %}
