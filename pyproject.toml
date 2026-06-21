@@ -92,7 +92,11 @@ disallow_untyped_decorators = false
 warn_return_any = true
 warn_unused_configs = true
 show_error_codes = true
-exclude = ["alembic/", "tests/"]
+# ``alembic/versions/`` holds auto-generated migrations and the
+# ``script.py.mako`` template, neither of which we want mypy to
+# analyse. ``alembic/env.py`` is type-checked on purpose so the
+# runtime configuration stays correct.
+exclude = ["alembic/versions", "tests/"]
 
 # ---------------------------------------------------------------------------
 # pytest
