@@ -28,6 +28,7 @@ round-trips are exercised separately by :mod:`tests.test_alembic`.
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -58,7 +59,7 @@ from app.services.llm.protocol import LLMProvider
 from app.services.llm.schemas import ExtractionResponse
 
 # ---------------------------------------------------------------------------
-# Sample PDF paths and passwords
+# Sample PDF paths and the TEST_RUT env var
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -68,10 +69,12 @@ SANTANDER_PDF = SAMPLE_PDFS_DIR / "80_15796_0350262800062166708_20260422.pdf"
 BANCO_CHILE_PDF = SAMPLE_PDFS_DIR / "EECCTarjetaVisa.pdf"
 ITAU_PDF = SAMPLE_PDFS_DIR / "EECCvirtual.pdf"
 
-SAMPLE_RUT = "26.450.463-5"
-SANTANDER_PASSWORD = "26450463"  # rut_sin_dv
-BANCO_CHILE_PASSWORD = "0463"  # rut_ultimos_4
-ITAU_PASSWORD = "26450463"  # rut_sin_dv
+#: Cardholder RUT, read from the environment so the real identifier
+#: never has to be committed. The orchestrator derives the
+#: per-bank PDF password from this value before attempting to
+#: decrypt the sample statement, so every test below that runs
+#: the full pipeline (almost all of them) needs it.
+TEST_RUT: str | None = os.getenv("TEST_RUT")
 
 _SAMPLE_PDFS_PRESENT = SANTANDER_PDF.exists() and BANCO_CHILE_PDF.exists() and ITAU_PDF.exists()
 
@@ -80,6 +83,20 @@ needs_sample_pdfs = pytest.mark.skipif(
     reason=(
         f"Sample PDFs not found in {SAMPLE_PDFS_DIR}. "
         "The integration tests are skipped in this environment."
+    ),
+)
+
+#: Skip the integration tests that decrypt the real sample PDFs:
+#: they need the cardholder RUT to derive the right password, and
+#: that value lives in the env, not in the repo. Set
+#: ``TEST_RUT=<your-rut>`` to run them.
+needs_test_rut = pytest.mark.skipif(
+    TEST_RUT is None,
+    reason=(
+        "TEST_RUT environment variable not set. "
+        "Tests that decrypt real PDFs are skipped to keep the "
+        "cardholder's RUT out of the repository. Run them locally with "
+        "`TEST_RUT=<your-rut> pytest tests/`."
     ),
 )
 
@@ -352,6 +369,7 @@ def make_ingestion_service(
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestIngestStatementHappyPath:
     """``IngestStatement`` runs the full pipeline and persists every row."""
 
@@ -367,7 +385,7 @@ class TestIngestStatementHappyPath:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -401,7 +419,7 @@ class TestIngestStatementHappyPath:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -423,7 +441,7 @@ class TestIngestStatementHappyPath:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -447,7 +465,7 @@ class TestIngestStatementHappyPath:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -470,7 +488,7 @@ class TestIngestStatementHappyPath:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -498,7 +516,7 @@ class TestIngestStatementHappyPath:
             await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -523,7 +541,7 @@ class TestIngestStatementHappyPath:
             await service1.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -544,7 +562,7 @@ class TestIngestStatementHappyPath:
                 statement2 = await service2.ingest_statement(
                     file_path=second_pdf,
                     bank_name="santander",
-                    rut=SAMPLE_RUT,
+                    rut=TEST_RUT,
                     card_number_masked="XXXX XXXX XXXX 0463",
                     cardholder="LUIS SOTILLO",
                     currency="CLP",
@@ -559,6 +577,7 @@ class TestIngestStatementHappyPath:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestIngestStatementIdempotency:
     """Re-uploading the same file is a no-op."""
 
@@ -580,7 +599,7 @@ class TestIngestStatementIdempotency:
             first = await service1.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -593,7 +612,7 @@ class TestIngestStatementIdempotency:
             second = await service2.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="CLP",
@@ -615,6 +634,7 @@ class TestIngestStatementIdempotency:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestIngestStatementErrors:
     """Failure modes mark the statement as FAILED and surface the cause."""
 
@@ -630,7 +650,7 @@ class TestIngestStatementErrors:
                 await service.ingest_statement(
                     file_path=SANTANDER_PDF,
                     bank_name="not_a_real_bank",
-                    rut=SAMPLE_RUT,
+                    rut=TEST_RUT,
                     card_number_masked="XXXX XXXX XXXX 0463",
                     cardholder="LUIS SOTILLO",
                     currency="CLP",
@@ -720,7 +740,7 @@ class TestIngestStatementErrors:
                 await service.ingest_statement(
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
-                    rut=SAMPLE_RUT,
+                    rut=TEST_RUT,
                     card_number_masked="XXXX XXXX XXXX 0463",
                     cardholder="LUIS SOTILLO",
                     currency="CLP",
@@ -765,7 +785,7 @@ class TestIngestStatementErrors:
                 await service.ingest_statement(
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
-                    rut=SAMPLE_RUT,
+                    rut=TEST_RUT,
                     card_number_masked="XXXX XXXX XXXX 0463",
                     cardholder="LUIS SOTILLO",
                     currency="CLP",
@@ -801,7 +821,7 @@ class TestIngestStatementErrors:
                 await service.ingest_statement(
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
-                    rut=SAMPLE_RUT,
+                    rut=TEST_RUT,
                     card_number_masked="XXXX XXXX XXXX 0463",
                     cardholder="LUIS SOTILLO",
                     currency="CLP",
@@ -814,6 +834,7 @@ class TestIngestStatementErrors:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestIngestStatementInternacional:
     """The INTERNACIONAL variant flows through the same pipeline."""
 
@@ -830,7 +851,7 @@ class TestIngestStatementInternacional:
             statement = await service.ingest_statement(
                 file_path=ITAU_PDF,
                 bank_name="itau",
-                rut=SAMPLE_RUT,
+                rut=TEST_RUT,
                 card_number_masked="XXXX XXXX XXXX 0463",
                 cardholder="LUIS SOTILLO",
                 currency="USD",
@@ -875,6 +896,7 @@ def _make_session_override(
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestUploadEndpoint:
     """The ``POST /api/v1/statements/upload`` endpoint drives the orchestrator."""
 
@@ -904,7 +926,7 @@ class TestUploadEndpoint:
                 files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -952,7 +974,7 @@ class TestUploadEndpoint:
                 files = {"file": ("itau.pdf", ITAU_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "itau",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "USD",
@@ -992,7 +1014,7 @@ class TestUploadEndpoint:
                 files = {"file": ("evil.pdf", b"not-a-pdf-just-bytes", "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -1041,7 +1063,7 @@ class TestUploadEndpoint:
                 files = {"file": ("huge.pdf", big, "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -1080,7 +1102,7 @@ class TestUploadEndpoint:
                 files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "unknown_bank",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -1123,7 +1145,7 @@ class TestUploadEndpoint:
                 files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -1152,6 +1174,7 @@ class TestUploadEndpoint:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestGetStatementEndpoint:
     """The ``GET /api/v1/statements/{id}`` endpoint reads a statement."""
 
@@ -1183,7 +1206,7 @@ class TestGetStatementEndpoint:
                 files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -1232,6 +1255,7 @@ class TestGetStatementEndpoint:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestListTransactionsEndpoint:
     """The ``GET /api/v1/transactions`` endpoint supports filterable lists."""
 
@@ -1262,7 +1286,7 @@ class TestListTransactionsEndpoint:
                 files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
@@ -1444,6 +1468,7 @@ class TestListTransactionsEndpoint:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestUpdateTransactionEndpoint:
     """The ``PATCH /api/v1/transactions/{id}`` endpoint edits the category."""
 
@@ -1475,7 +1500,7 @@ class TestUpdateTransactionEndpoint:
                 files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
                 data = {
                     "bank_name": "santander",
-                    "rut": SAMPLE_RUT,
+                    "rut": TEST_RUT,
                     "card_number_masked": "XXXX XXXX XXXX 0463",
                     "cardholder": "LUIS SOTILLO",
                     "currency": "CLP",
