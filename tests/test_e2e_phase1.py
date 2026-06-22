@@ -16,6 +16,7 @@ narrow: one PDF, three transactions, one list page.
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -49,14 +50,32 @@ SAMPLE_PDFS_DIR = PROJECT_ROOT / "shared" / "account-state-examples"
 
 SANTANDER_PDF = SAMPLE_PDFS_DIR / "80_15796_0350262800062166708_20260422.pdf"
 
-SAMPLE_RUT = "26.450.463-5"
-SANTANDER_PASSWORD = "26450463"
+#: Cardholder RUT, read from the environment so the real identifier
+#: never has to be committed. The orchestrator derives the
+#: per-bank PDF password from this value, so the happy-path tests
+#: below need it. The wrong-RUT test deliberately uses a
+#: hard-coded fictional RUT, so it does not.
+TEST_RUT: str | None = os.getenv("TEST_RUT")
 
 _SAMPLE_PDF_PRESENT = SANTANDER_PDF.exists()
 needs_sample_pdf = pytest.mark.skipif(
     not _SAMPLE_PDF_PRESENT,
     reason=(
         f"Sample PDF not found in {SAMPLE_PDFS_DIR}. The E2E test is skipped in this environment."
+    ),
+)
+
+#: Skip the E2E tests that decrypt the real sample PDF: they need
+#: the cardholder RUT to derive the right password, and that
+#: value lives in the env, not in the repo. Set
+#: ``TEST_RUT=<your-rut>`` to run them.
+needs_test_rut = pytest.mark.skipif(
+    TEST_RUT is None,
+    reason=(
+        "TEST_RUT environment variable not set. "
+        "The E2E test that decrypts a real PDF is skipped to keep "
+        "the cardholder's RUT out of the repository. Run locally with "
+        "`TEST_RUT=<your-rut> pytest tests/test_e2e_phase1.py`."
     ),
 )
 
@@ -225,6 +244,7 @@ def _make_session_override(
 
 
 @needs_sample_pdf
+@needs_test_rut
 @pytest.mark.asyncio
 async def test_upload_real_pdf_creates_completed_statement(
     test_settings: Settings,
@@ -255,7 +275,7 @@ async def test_upload_real_pdf_creates_completed_statement(
             files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
             data = {
                 "bank_name": "santander",
-                "rut": SAMPLE_RUT,
+                "rut": TEST_RUT,
                 "card_number_masked": "XXXX XXXX XXXX 0463",
                 "cardholder": "LUIS SOTILLO",
                 "currency": "CLP",
@@ -399,6 +419,7 @@ async def test_wrong_rut_marks_statement_failed_and_returns_422(
 
 
 @needs_sample_pdf
+@needs_test_rut
 @pytest.mark.asyncio
 async def test_duplicate_upload_does_not_create_extra_transactions(
     test_settings: Settings,
@@ -424,7 +445,7 @@ async def test_duplicate_upload_does_not_create_extra_transactions(
             files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
             data = {
                 "bank_name": "santander",
-                "rut": SAMPLE_RUT,
+                "rut": TEST_RUT,
                 "card_number_masked": "XXXX XXXX XXXX 0463",
                 "cardholder": "LUIS SOTILLO",
                 "currency": "CLP",
@@ -460,6 +481,7 @@ async def test_duplicate_upload_does_not_create_extra_transactions(
 
 
 @needs_sample_pdf
+@needs_test_rut
 @pytest.mark.asyncio
 async def test_patch_category_persists(
     test_settings: Settings,
@@ -491,7 +513,7 @@ async def test_patch_category_persists(
             files = {"file": ("statement.pdf", SANTANDER_PDF.read_bytes(), "application/pdf")}
             data = {
                 "bank_name": "santander",
-                "rut": SAMPLE_RUT,
+                "rut": TEST_RUT,
                 "card_number_masked": "XXXX XXXX XXXX 0463",
                 "cardholder": "LUIS SOTILLO",
                 "currency": "CLP",

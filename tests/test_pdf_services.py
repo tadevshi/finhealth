@@ -19,31 +19,33 @@ Test layout
 
 The password-deriver, variant-detector, and amount-parser tests
 are pure-Python: they need no I/O beyond what the function under
-test performs. The decryptor and extractor tests use the real
-sample PDFs in ``shared/account-state-examples/`` — the
-``needs_sample_pdfs`` marker below skips them gracefully when the
-files are not present, so the test suite still runs in CI
-environments where the PDFs have not been provisioned.
+test performs, and they use *fictional* RUTs (e.g. ``12.345.678-9``)
+so the test suite never carries a real cardholder's identifier.
+The decryptor, extractor, and end-to-end pipeline tests use the
+real sample PDFs in ``shared/account-state-examples/`` and need
+the actual cardholder RUT to derive the right password — the
+``TEST_RUT`` env var carries it, the ``needs_test_rut`` marker
+skips those tests when the var is absent, and the
+``needs_sample_pdfs`` marker skips them when the PDFs themselves
+are not provisioned locally.
 
 Sample corpus
 -------------
 
-The three sample PDFs that ship with the project (and the
-passwords the project author derived from them) are:
+The three sample PDFs the project ships with (drop yours into
+``shared/account-state-examples/``) are:
 
 * ``80_15796_..._20260422.pdf`` — Santander, NACIONAL (CLP).
-  Password: ``26450463`` (RUT body, ``rut_sin_dv`` formula).
+  Password formula: ``rut_sin_dv`` (RUT body, no DV).
 * ``EECCTarjetaVisa.pdf`` — Banco de Chile, NACIONAL (CLP).
-  Password: ``0463`` (last 4 of RUT body, ``rut_ultimos_4``).
+  Password formula: ``rut_ultimos_4`` (last 4 of RUT body).
 * ``EECCvirtual.pdf`` — Itaú, INTERNACIONAL (USD).
-  Password: ``26450463`` (RUT body, ``rut_sin_dv``).
-
-The RUT used in all three is ``26.450.463-5`` (body
-``26450463``, DV ``5``).
+  Password formula: ``rut_sin_dv`` (RUT body, no DV).
 """
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from pathlib import Path
 
@@ -82,13 +84,11 @@ SANTANDER_PDF = SAMPLE_PDFS_DIR / "80_15796_0350262800062166708_20260422.pdf"
 BANCO_CHILE_PDF = SAMPLE_PDFS_DIR / "EECCTarjetaVisa.pdf"
 ITAU_PDF = SAMPLE_PDFS_DIR / "EECCvirtual.pdf"
 
-SAMPLE_RUT = "26.450.463-5"
-SAMPLE_RUT_BODY = "26450463"
-SAMPLE_RUT_LAST4 = "0463"
-
-SANTANDER_PASSWORD = SAMPLE_RUT_BODY  # rut_sin_dv
-BANCO_CHILE_PASSWORD = SAMPLE_RUT_LAST4  # rut_ultimos_4
-ITAU_PASSWORD = SAMPLE_RUT_BODY  # rut_sin_dv
+#: Cardholder RUT, read from the environment so the real identifier
+#: never has to be committed. The integration tests below derive
+#: the per-bank PDF password from this value and need it to match
+#: the one the sample PDFs were encrypted with.
+TEST_RUT: str | None = os.getenv("TEST_RUT")
 
 #: True when every sample PDF the decryptor / extractor tests need
 #: is present on disk. Computed once at import time.
@@ -102,6 +102,40 @@ needs_sample_pdfs = pytest.mark.skipif(
         "The decryptor / extractor tests are skipped in this environment."
     ),
 )
+
+#: Skip the integration tests that decrypt the real sample PDFs:
+#: they need the cardholder RUT to derive the right password, and
+#: that value lives in the env, not in the repo. Set
+#: ``TEST_RUT=<your-rut>`` to run them.
+needs_test_rut = pytest.mark.skipif(
+    TEST_RUT is None,
+    reason=(
+        "TEST_RUT environment variable not set. "
+        "Tests that decrypt real PDFs are skipped to keep the "
+        "cardholder's RUT out of the repository. Run them locally with "
+        "`TEST_RUT=<your-rut> pytest tests/`."
+    ),
+)
+
+
+def _derive_test_password(formula: str) -> str:
+    """Return the per-bank PDF password derived from ``TEST_RUT``.
+
+    Only call this from tests guarded by ``@needs_test_rut``: the
+    marker is the contract that guarantees ``TEST_RUT`` is not
+    ``None`` at call time. Raising a clear error here means a
+    future refactor that drops the marker fails loudly instead of
+    silently passing ``None`` into :func:`decrypt_pdf`.
+    """
+    if TEST_RUT is None:
+        raise RuntimeError(
+            "_derive_test_password called without TEST_RUT set. "
+            "Guard the caller with @needs_test_rut."
+        )
+    return derive_password(
+        Bank(name="__test__", password_formula=formula),
+        TEST_RUT,
+    )
 
 
 @pytest.fixture
@@ -153,21 +187,30 @@ def bank_unknown_formula() -> Bank:
 
 
 class TestDerivePasswordHappyPath:
-    """``derive_password`` produces the expected password for known formulas."""
+    """``derive_password`` produces the expected password for known formulas.
+
+    The RUTs below are *fictional* — the password-deriver does not
+    care about the value, only the format and the formula, so a
+    privacy-safe synthetic RUT exercises the same code paths
+    without committing a real cardholder identifier to the repo.
+    """
 
     @pytest.mark.parametrize(
         ("rut", "expected"),
         [
-            # Standard Chilean form with dots and dash.
-            ("26.450.463-5", "26450463"),
+            # Standard Chilean form with dots and dash (8-digit body).
+            ("12.345.678-9", "12345678"),
             # Compact form, no dots, with dash.
-            ("26450463-5", "26450463"),
+            ("12345678-9", "12345678"),
             # No DV (some users omit it).
-            ("26450463", "26450463"),
+            ("12345678", "12345678"),
             # Spaces as thousand separators (uncommon but seen).
-            ("26 450 463-5", "26450463"),
+            ("12 345 678-9", "12345678"),
             # Surrounding whitespace.
-            ("  26.450.463-5  ", "26450463"),
+            ("  12.345.678-9  ", "12345678"),
+            # 7-digit body (< 10M) — no leading zero added by rut_sin_dv.
+            ("1.234.567-8", "1234567"),
+            ("1234567-8", "1234567"),
         ],
     )
     def test_rut_sin_dv_strips_formatting(
@@ -182,10 +225,14 @@ class TestDerivePasswordHappyPath:
     @pytest.mark.parametrize(
         ("rut", "expected"),
         [
-            ("26.450.463-5", "0463"),
-            ("26450463-5", "0463"),
-            ("26450463", "0463"),
-            ("  26.450.463-5  ", "0463"),
+            # 8-digit body — last 4 are the rightmost 4 digits.
+            ("12.345.678-9", "5678"),
+            ("12345678-9", "5678"),
+            ("12345678", "5678"),
+            ("  12.345.678-9  ", "5678"),
+            # 7-digit body — last 4 are the rightmost 4 digits
+            # (no leading zero, since the body itself is ≥ 4 chars).
+            ("1.234.567-8", "4567"),
         ],
     )
     def test_rut_ultimos_4_returns_zero_padded_suffix(
@@ -217,8 +264,12 @@ class TestDerivePasswordHappyPath:
 
         This is the *property* the seed data guarantees; if a future
         migration diverges the formulas, this test will fail loudly.
+        The RUT is a fictional value — the property under test is the
+        formula equality, not the password.
         """
-        assert derive_password(bank_santander, SAMPLE_RUT) == derive_password(bank_itau, SAMPLE_RUT)
+        assert derive_password(bank_santander, "12.345.678-9") == derive_password(
+            bank_itau, "12.345.678-9"
+        )
 
     def test_formula_constants_match_seeded_values(
         self, bank_santander: Bank, bank_banco_de_chile: Bank
@@ -243,10 +294,10 @@ class TestDerivePasswordErrors:
             "",
             "   ",
             "abc-def",
-            "26.450.463-",  # DV position present but empty
-            "26.450.463-5-6",  # two DVs
-            "26-450-463",  # misplaced dash
-            "26.450.463a",  # non-digit non-K trailer
+            "12.345.678-",  # DV position present but empty
+            "12.345.678-9-0",  # two DVs
+            "12-345-678",  # misplaced dash
+            "12.345.678a",  # non-digit non-K trailer
         ],
     )
     def test_invalid_rut_raises(self, bank_santander: Bank, rut: str) -> None:
@@ -261,7 +312,7 @@ class TestDerivePasswordErrors:
         message names the formula so the operator can fix the seed.
         """
         with pytest.raises(InvalidPasswordFormulaError) as exc_info:
-            derive_password(bank_unknown_formula, SAMPLE_RUT)
+            derive_password(bank_unknown_formula, "12.345.678-9")
         assert "rut_reversed" in str(exc_info.value)
 
 
@@ -271,25 +322,27 @@ class TestDerivePasswordErrors:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestDecryptPDF:
     """``decrypt_pdf`` opens encrypted PDFs and writes a plain copy."""
 
     @pytest.mark.parametrize(
-        ("pdf_path", "password"),
+        ("pdf_path", "formula"),
         [
-            (SANTANDER_PDF, SANTANDER_PASSWORD),
-            (BANCO_CHILE_PDF, BANCO_CHILE_PASSWORD),
-            (ITAU_PDF, ITAU_PASSWORD),
+            (SANTANDER_PDF, FORMULA_RUT_SIN_DV),
+            (BANCO_CHILE_PDF, FORMULA_RUT_ULTIMOS_4),
+            (ITAU_PDF, FORMULA_RUT_SIN_DV),
         ],
         ids=["santander", "banco_de_chile", "itau"],
     )
     def test_correct_password_decrypts_sample(
         self,
         pdf_path: Path,
-        password: str,
+        formula: str,
         tmp_path: Path,
     ) -> None:
         """The three sample PDFs each open with the bank-specific password."""
+        password = _derive_test_password(formula)
         output = tmp_path / "decrypted.pdf"
         result = decrypt_pdf(pdf_path, password, output)
 
@@ -337,8 +390,9 @@ class TestDecryptPDF:
         tmp_path: Path,
     ) -> None:
         """The output parent directory is created if it does not exist."""
+        password = _derive_test_password(FORMULA_RUT_SIN_DV)
         nested = tmp_path / "a" / "b" / "c" / "out.pdf"
-        result = decrypt_pdf(SANTANDER_PDF, SANTANDER_PASSWORD, nested)
+        result = decrypt_pdf(SANTANDER_PDF, password, nested)
         assert result == nested
         assert nested.exists()
 
@@ -347,9 +401,10 @@ class TestDecryptPDF:
         tmp_path: Path,
     ) -> None:
         """A pre-existing output file is overwritten."""
+        password = _derive_test_password(FORMULA_RUT_SIN_DV)
         output = tmp_path / "decrypted.pdf"
         output.write_bytes(b"junk that will be replaced")
-        decrypt_pdf(SANTANDER_PDF, SANTANDER_PASSWORD, output)
+        decrypt_pdf(SANTANDER_PDF, password, output)
         with pikepdf.open(output) as pdf:
             assert len(pdf.pages) >= 1
 
@@ -370,6 +425,7 @@ class TestDecryptPDF:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestExtractText:
     """``extract_text`` produces clean, concatenated text from a PDF."""
 
@@ -377,7 +433,8 @@ class TestExtractText:
     def decrypted_santander(self, tmp_path: Path) -> Path:
         """A decrypted copy of the Santander sample PDF."""
         out = tmp_path / "santander.pdf"
-        decrypt_pdf(SANTANDER_PDF, SANTANDER_PASSWORD, out)
+        password = _derive_test_password(FORMULA_RUT_SIN_DV)
+        decrypt_pdf(SANTANDER_PDF, password, out)
         return out
 
     def test_returns_non_empty_text(self, decrypted_santander: Path) -> None:
@@ -683,6 +740,7 @@ class TestParseAmount:
 
 
 @needs_sample_pdfs
+@needs_test_rut
 class TestPipelineEndToEnd:
     """Run the full deterministic pipeline against a real sample PDF.
 
@@ -692,23 +750,24 @@ class TestPipelineEndToEnd:
     """
 
     @pytest.mark.parametrize(
-        ("pdf_path", "password", "expected_variant", "expected_currency_marker"),
+        ("pdf_path", "formula", "expected_variant", "expected_currency_marker"),
         [
-            (SANTANDER_PDF, SANTANDER_PASSWORD, "NACIONAL", "$"),
-            (BANCO_CHILE_PDF, BANCO_CHILE_PASSWORD, "NACIONAL", "$"),
-            (ITAU_PDF, ITAU_PASSWORD, "INTERNACIONAL", "US$"),
+            (SANTANDER_PDF, FORMULA_RUT_SIN_DV, "NACIONAL", "$"),
+            (BANCO_CHILE_PDF, FORMULA_RUT_ULTIMOS_4, "NACIONAL", "$"),
+            (ITAU_PDF, FORMULA_RUT_SIN_DV, "INTERNACIONAL", "US$"),
         ],
         ids=["santander", "banco_de_chile", "itau"],
     )
     def test_decrypt_extract_detect_chain(
         self,
         pdf_path: Path,
-        password: str,
+        formula: str,
         expected_variant: str,
         expected_currency_marker: str,
         tmp_path: Path,
     ) -> None:
         """Decrypt → extract → detect_variant succeeds for every sample."""
+        password = _derive_test_password(formula)
         decrypted = tmp_path / "decrypted.pdf"
         decrypt_pdf(pdf_path, password, decrypted)
         text = extract_text(decrypted)

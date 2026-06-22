@@ -215,6 +215,23 @@ PDFs in `shared/account-state-examples/`. The repo does not commit
 those (they contain real card numbers); drop the bank's own statement
 PDFs into that directory to exercise the pipeline locally.
 
+#### Running the integration tests (real PDFs)
+
+Integration and E2E tests that decrypt the real sample PDFs need the
+cardholder's RUT to derive the per-bank password. The RUT is read
+from the `TEST_RUT` environment variable so the real identifier never
+has to be committed:
+
+```bash
+TEST_RUT=12.345.678-9 pytest tests/test_e2e_phase1.py
+```
+
+Without `TEST_RUT`, those tests are skipped automatically — the
+deterministic unit tests (password deriver, amount parser, variant
+detector) and the rest of the suite still run. Any standard Chilean
+RUT format is accepted (with or without the verification digit,
+dots, spaces). See `.env.example` for the canonical entry.
+
 ### Lint and format
 
 ```bash
