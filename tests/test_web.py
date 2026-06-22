@@ -85,8 +85,13 @@ async def app_under_test(test_settings: Settings) -> AsyncIterator[FastAPI]:
 
 @pytest.mark.asyncio
 async def test_index_returns_200_html(client: AsyncClient) -> None:
-    """``GET /`` responds 200 with ``text/html`` content type."""
-    response = await client.get(INDEX_PATH)
+    """``GET /`` responds 200 with ``text/html`` content type.
+
+    Phase 1 changed the root handler to redirect to ``/upload``;
+    ``follow_redirects=True`` follows the 307 to the upload page
+    and asserts the destination returns 200 + ``text/html``.
+    """
+    response = await client.get(INDEX_PATH, follow_redirects=True)
 
     assert response.status_code == 200
     content_type = response.headers["content-type"]
@@ -98,7 +103,7 @@ async def test_index_returns_200_html(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_index_contains_html5_doctype_and_viewport(client: AsyncClient) -> None:
     """The rendered document declares HTML5 and sets a mobile viewport."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert "<!DOCTYPE html>" in body
     assert 'charset="UTF-8"' in body
@@ -111,10 +116,10 @@ async def test_index_title_uses_app_name_from_settings(
     client: AsyncClient, test_settings: Settings
 ) -> None:
     """The ``<title>`` reflects ``Settings.APP_NAME`` (defaults to "finhealth")."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
-    # The base template's default title is the app name; ``index.html``
-    # extends it with " &mdash; Home". Both forms should be present.
+    # The base template's default title is the app name; ``upload.html``
+    # extends it with " &mdash; Upload". Both forms should be present.
     assert test_settings.APP_NAME in body
     assert "<title>" in body
     assert "</title>" in body
@@ -128,7 +133,7 @@ async def test_index_title_uses_app_name_from_settings(
 @pytest.mark.asyncio
 async def test_index_loads_htmx_via_cdn(client: AsyncClient) -> None:
     """A ``<script>`` tag references the HTMX CDN URL."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert HTMX_CDN in body, (
         f"HTMX CDN URL {HTMX_CDN!r} not found in rendered body. Check app/web/templates/base.html."
@@ -140,7 +145,7 @@ async def test_index_loads_htmx_via_cdn(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_index_loads_alpine_via_cdn(client: AsyncClient) -> None:
     """A ``<script defer>`` tag references the Alpine.js CDN URL."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert ALPINE_CDN in body
     # ``defer`` is required so Alpine boots after the DOM is parsed.
@@ -150,7 +155,7 @@ async def test_index_loads_alpine_via_cdn(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_index_loads_tailwind_via_cdn(client: AsyncClient) -> None:
     """A ``<script>`` tag references the Tailwind Play CDN URL."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert TAILWIND_CDN in body
     assert f'src="{TAILWIND_CDN}"' in body
@@ -161,7 +166,7 @@ async def test_index_configures_tailwind_class_based_dark_mode(
     client: AsyncClient,
 ) -> None:
     """Tailwind is configured with ``darkMode: 'class'`` so ``dark:`` utilities work."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert TAILWIND_CONFIG_MARKER in body
     assert TAILWIND_DARKMODE_CLASS in body, (
@@ -180,7 +185,7 @@ async def test_index_renders_tailwind_utility_classes(client: AsyncClient) -> No
     (otherwise a misconfigured template would still "work" but render
     no styling).
     """
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     missing = [cls for cls in EXPECTED_TAILWIND_CLASSES if cls not in body]
     assert not missing, f"Tailwind utility classes missing from body: {missing}"
@@ -200,7 +205,7 @@ async def test_index_has_pre_paint_dark_mode_script(client: AsyncClient) -> None
     must run *before* the body paints, so it lives in ``<head>`` and
     uses the synchronous pattern documented in base.html.
     """
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     # Order matters: the pre-paint script must come before Tailwind/HTMX
     # so the ``dark`` class is set before any utility class is computed.
@@ -222,7 +227,7 @@ async def test_index_has_pre_paint_dark_mode_script(client: AsyncClient) -> None
 @pytest.mark.asyncio
 async def test_index_registers_alpine_dark_mode_component(client: AsyncClient) -> None:
     """The ``darkMode`` Alpine component is registered via ``alpine:init``."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert "alpine:init" in body, (
         "darkMode Alpine component must be registered on the "
@@ -238,7 +243,7 @@ async def test_index_registers_alpine_dark_mode_component(client: AsyncClient) -
 @pytest.mark.asyncio
 async def test_index_renders_dark_mode_toggle_button(client: AsyncClient) -> None:
     """The header contains a dark-mode toggle button with Alpine bindings."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert DARK_TOGGLE_TESTID in body, (
         "Header must render a button with data-testid='dark-mode-toggle'."
@@ -259,20 +264,26 @@ async def test_index_renders_dark_mode_toggle_button(client: AsyncClient) -> Non
 
 @pytest.mark.asyncio
 async def test_index_renders_welcome_message(client: AsyncClient) -> None:
-    """The index page contains the Phase 0 welcome content."""
-    body = (await client.get(INDEX_PATH)).text
+    """The upload page contains the Phase 1 welcome content.
 
-    assert "Welcome to" in body
-    assert "Phase 0" in body
-    # The dashboard placeholder is signalled explicitly so testers
-    # can find it from the rendered page.
-    assert "Phase 3" in body
+    Phase 1 replaced the Phase 0 marketing landing with a
+    functional upload page. The ``/`` URL now 307-redirects
+    to ``/upload``; following the redirect lands on a page
+    that talks about uploading statements rather than
+    ``Welcome to ...`` and ``Phase 3``.
+    """
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
+
+    assert "Upload statement" in body
+    # The dashboard placeholder is no longer mentioned, but the
+    # app name still shows up in the header.
+    assert "Phase 1" in body or "PDF" in body
 
 
 @pytest.mark.asyncio
 async def test_index_renders_header_and_footer(client: AsyncClient) -> None:
     """The base layout renders both ``<header>`` and ``<footer>`` elements."""
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert "<header" in body and "</header>" in body
     assert "<footer" in body and "</footer>" in body
@@ -293,7 +304,7 @@ async def test_index_uses_settings_app_name(
     value must come from ``app.state.settings.APP_NAME`` so a custom
     name in ``.env`` is honoured.
     """
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert test_settings.APP_NAME in body
     # And the app instance really did receive the test settings.
@@ -311,9 +322,23 @@ async def test_index_html_matches_version_agnostic(
     contract: a future change that accidentally leaks the Python
     version into the template will fail loudly.
     """
-    body = (await client.get(INDEX_PATH)).text
+    body = (await client.get(INDEX_PATH, follow_redirects=True)).text
 
     assert __version__ not in body
+
+
+# ---------------------------------------------------------------------------
+# Redirect
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_root_redirects_to_upload(client: AsyncClient) -> None:
+    """``GET /`` returns 307 with a ``Location`` header pointing at ``/upload``."""
+    response = await client.get(INDEX_PATH, follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/upload"
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +346,15 @@ async def test_index_html_matches_version_agnostic(
 # ---------------------------------------------------------------------------
 
 
-def test_templates_directory_contains_base_and_index() -> None:
+def test_templates_directory_contains_required_templates() -> None:
     """The template files exist on disk where the router expects them.
 
-    This is a path-level guard: if someone moves or renames the
-    templates the router's ``Jinja2Templates`` initialisation would
-    raise at import time, but a static analysis run (or a developer
-    reading the file tree) gets an early signal.
+    Phase 1 replaced the ``index.html`` placeholder with the
+    ``upload.html`` + ``transactions.html`` + ``partials/`` set.
+    A missing template would surface at import time (the
+    router's ``Jinja2Templates`` initialisation would fail), but
+    a static check makes the failure obvious to a developer
+    reading the file tree.
     """
     # Resolve from this file's location — same convention as the
     # router — so the test does not depend on the working directory.
@@ -335,4 +362,8 @@ def test_templates_directory_contains_base_and_index() -> None:
 
     assert templates_dir.is_dir(), f"Templates directory missing: {templates_dir}"
     assert (templates_dir / "base.html").is_file(), "base.html missing"
-    assert (templates_dir / "index.html").is_file(), "index.html missing"
+    assert (templates_dir / "upload.html").is_file(), "upload.html missing"
+    assert (templates_dir / "transactions.html").is_file(), "transactions.html missing"
+    assert (templates_dir / "partials" / "transactions_table.html").is_file(), (
+        "partials/transactions_table.html missing"
+    )

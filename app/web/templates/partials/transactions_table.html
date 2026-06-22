@@ -1,0 +1,65 @@
+{# Partial: the table body for the transactions list.
+
+   Returned by ``GET /transactions/rows`` and swapped into the
+   ``<tbody id="transaction-list-body">`` of ``transactions.html``
+   by HTMX. Kept as a separate template so the page template
+   (``transactions.html``) and the partial can share the row
+   markup via a Jinja ``include`` if it grows.
+
+   The partial is rendered with the same context the page
+   template receives: ``transactions`` (list of ORM rows) and
+   ``error`` (optional human-readable error string). When the
+   query is empty the partial renders an empty-state row so the
+   table never collapses.                                                #}
+{% if error %}
+    <tr>
+        <td colspan="5"
+            class="px-4 py-6 text-center text-sm text-red-700 dark:text-red-300">
+            {{ error }}
+        </td>
+    </tr>
+{% elif transactions|length == 0 %}
+    <tr>
+        <td colspan="5"
+            class="px-4 py-6 text-center text-sm text-gray-500 dark:text-gray-400">
+            No transactions match the current filters.
+        </td>
+    </tr>
+{% else %}
+    {% for txn in transactions %}
+    <tr class="hover:bg-gray-50 dark:hover:bg-gray-800"
+        data-testid="transaction-row">
+        <td class="px-4 py-2 text-sm text-gray-700 dark:text-gray-200 whitespace-nowrap">
+            {{ txn.date.isoformat() }}
+        </td>
+        <td class="px-4 py-2 text-sm text-gray-700 dark:text-gray-200"
+            data-testid="transaction-description">
+            {{ txn.description }}
+        </td>
+        <td class="px-4 py-2 text-sm text-right whitespace-nowrap
+                   {% if txn.amount < 0 %}text-red-700 dark:text-red-400{% else %}text-gray-700 dark:text-gray-200{% endif %}"
+            data-testid="transaction-amount">
+            {{ "{:,.2f}".format(txn.amount|abs) }}
+        </td>
+        <td class="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">
+            {{ txn.currency }}
+        </td>
+        <td class="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">
+            <input type="text"
+                   value="{{ txn.category or '' }}"
+                   placeholder="--"
+                   data-testid="category-input"
+                   data-transaction-id="{{ txn.id }}"
+                   class="w-32 px-2 py-1 text-sm border border-gray-300
+                          dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100
+                          rounded focus:outline-none focus:ring-1 focus:ring-indigo-500
+                          focus:border-indigo-500"
+                   hx-patch="/api/v1/transactions/{{ txn.id }}"
+                   hx-trigger="change"
+                   hx-target="closest tr"
+                   hx-swap="outerHTML"
+                   name="category">
+        </td>
+    </tr>
+    {% endfor %}
+{% endif %}

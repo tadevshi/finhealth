@@ -1,0 +1,311 @@
+{% extends "base.html" %}
+
+{# Upload page.
+
+   Lets the user drag-and-drop (or click to pick) a bank statement
+   PDF, fill in the form fields the backend needs (bank, RUT, masked
+   PAN, cardholder, currency), and submit it to the ingestion
+   pipeline. The form posts to ``/api/v1/statements/upload`` via
+   plain ``fetch`` (not HTMX) so we can:
+
+   1. Show fine-grained progress (idle → uploading → done | error).
+   2. Render a structured success message with a link to
+      ``/transactions`` (the JSON response does not carry the page
+      we want to link to).
+   3. Surface validation errors as a readable banner.
+
+   The drag-and-drop is wired with Alpine.js (already loaded by
+   ``base.html``). The drop zone is a regular ``<input type="file">``
+   so the keyboard-only and no-JS paths still work; Alpine just
+   reflects the file selection in a friendly label.
+   --------------------------------------------------------------------------- #}
+
+{% block title %}{{ app_name }} &mdash; Upload{% endblock %}
+
+{% block content %}
+<section class="max-w-2xl mx-auto"
+         x-data="uploadForm()"
+         x-init="init()">
+
+    <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">
+        Upload statement
+    </h1>
+    <p class="mt-2 text-gray-600 dark:text-gray-300">
+        Drop your encrypted PDF here, choose the issuing bank, and we'll
+        extract every line item via the configured LLM provider.
+    </p>
+
+    {# --- Status banner (hidden until Alpine shows it) ------------------- #}
+    <div x-show="status !== 'idle'"
+         x-cloak
+         class="mt-4 p-4 rounded-md border"
+         :class="{
+             'bg-blue-50 border-blue-200 text-blue-800 dark:bg-blue-900/30 dark:border-blue-800 dark:text-blue-100': status === 'uploading',
+             'bg-green-50 border-green-200 text-green-800 dark:bg-green-900/30 dark:border-green-800 dark:text-green-100': status === 'done',
+             'bg-red-50 border-red-200 text-red-800 dark:bg-red-900/30 dark:border-red-800 dark:text-red-100': status === 'error',
+         }">
+        <p class="font-medium" x-text="statusMessage"></p>
+        <template x-if="status === 'done' && resultUrl">
+            <p class="mt-2 text-sm">
+                <a :href="resultUrl"
+                   class="underline hover:no-underline font-semibold"
+                   data-testid="view-transactions-link">
+                    View transactions &rarr;
+                </a>
+            </p>
+        </template>
+    </div>
+
+    {# --- Drag-and-drop zone + file input ------------------------------ #}
+    <div class="mt-6">
+        <label for="file-input"
+               class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+            Statement PDF
+        </label>
+        <div class="mt-1 flex justify-center px-6 pt-8 pb-8 border-2 border-dashed rounded-md
+                    transition-colors"
+             :class="dragging
+                     ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
+                     : 'border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800'"
+             @dragover.prevent="dragging = true"
+             @dragleave.prevent="dragging = false"
+             @drop.prevent="onDrop($event)">
+            <div class="space-y-1 text-center">
+                <svg class="mx-auto h-12 w-12 text-gray-400"
+                     stroke="currentColor"
+                     fill="none"
+                     viewBox="0 0 48 48"
+                     aria-hidden="true">
+                    <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round" />
+                </svg>
+                <div class="text-sm text-gray-600 dark:text-gray-300">
+                    <label for="file-input"
+                           class="relative cursor-pointer font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 focus-within:outline-none focus-within:ring-2 focus-within:ring-offset-2 focus-within:ring-indigo-500">
+                        <span>Click to choose</span>
+                        <input id="file-input"
+                               name="file"
+                               type="file"
+                               accept="application/pdf,.pdf"
+                               required
+                               class="sr-only"
+                               data-testid="file-input"
+                               @change="onFileSelect($event)">
+                    </label>
+                    <span class="pl-1">or drag and drop</span>
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400" data-testid="file-name"
+                   x-text="file ? file.name : 'PDF up to 10 MB'"></p>
+            </div>
+        </div>
+    </div>
+
+    {# --- Form fields -------------------------------------------------- #}
+    <form id="upload-form"
+          class="mt-6 space-y-4"
+          @submit.prevent="submit($event)"
+          data-testid="upload-form">
+
+        <div>
+            <label for="bank-select"
+                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+                Bank
+            </label>
+            <select id="bank-select"
+                    name="bank_name"
+                    required
+                    data-testid="bank-select"
+                    class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300
+                           dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100
+                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
+                           sm:text-sm rounded-md">
+                <option value="">-- Select a bank --</option>
+                {% for bank in banks %}
+                <option value="{{ bank.name }}">{{ bank.display_name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div>
+            <label for="rut"
+                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+                RUT
+            </label>
+            <input id="rut"
+                   name="rut"
+                   type="text"
+                   required
+                   placeholder="26.450.463-5"
+                   data-testid="rut-input"
+                   class="mt-1 block w-full border-gray-300 dark:border-gray-600
+                          dark:bg-gray-800 dark:text-gray-100
+                          focus:ring-indigo-500 focus:border-indigo-500
+                          sm:text-sm rounded-md px-3 py-2">
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                With or without dots and dash. The bank password is derived from this.
+            </p>
+        </div>
+
+        <div>
+            <label for="card-masked"
+                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+                Card number (masked)
+            </label>
+            <input id="card-masked"
+                   name="card_number_masked"
+                   type="text"
+                   required
+                   placeholder="XXXX XXXX XXXX 0951"
+                   data-testid="card-input"
+                   class="mt-1 block w-full border-gray-300 dark:border-gray-600
+                          dark:bg-gray-800 dark:text-gray-100
+                          focus:ring-indigo-500 focus:border-indigo-500
+                          sm:text-sm rounded-md px-3 py-2">
+        </div>
+
+        <div>
+            <label for="cardholder"
+                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+                Cardholder name
+            </label>
+            <input id="cardholder"
+                   name="cardholder"
+                   type="text"
+                   required
+                   placeholder="JOHN DOE"
+                   data-testid="cardholder-input"
+                   class="mt-1 block w-full border-gray-300 dark:border-gray-600
+                          dark:bg-gray-800 dark:text-gray-100
+                          focus:ring-indigo-500 focus:border-indigo-500
+                          sm:text-sm rounded-md px-3 py-2">
+        </div>
+
+        <div>
+            <label for="currency"
+                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+                Currency
+            </label>
+            <select id="currency"
+                    name="currency"
+                    required
+                    data-testid="currency-select"
+                    class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300
+                           dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100
+                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
+                           sm:text-sm rounded-md">
+                <option value="CLP">CLP — Chilean Peso</option>
+                <option value="USD">USD — US Dollar</option>
+            </select>
+        </div>
+
+        <div class="pt-2">
+            <button type="submit"
+                    :disabled="status === 'uploading'"
+                    data-testid="upload-submit"
+                    class="w-full inline-flex justify-center items-center px-4 py-2
+                           border border-transparent text-sm font-medium rounded-md
+                           text-white bg-indigo-600 hover:bg-indigo-700
+                           focus:outline-none focus:ring-2 focus:ring-offset-2
+                           focus:ring-indigo-500 disabled:opacity-50
+                           disabled:cursor-not-allowed">
+                <span x-show="status !== 'uploading'">Upload statement</span>
+                <span x-show="status === 'uploading'" x-cloak>Uploading…</span>
+            </button>
+        </div>
+    </form>
+
+    {# --- Alpine component definition ---------------------------------- #}
+    {# Kept inline so the page works even when served directly
+       (e.g. tests) without a separate JS bundle. ``x-cloak`` hides
+       elements until Alpine boots; the rule is defined in
+       base.html.                                                       #}
+    <script>
+        function uploadForm() {
+            return {
+                file: null,
+                dragging: false,
+                status: 'idle',  // idle | uploading | done | error
+                statusMessage: '',
+                resultUrl: null,
+
+                init() {
+                    // Nothing to do on init; the form fields are
+                    // read at submit time. ``init`` is here so the
+                    // template can call it via ``x-init``.
+                },
+
+                onDrop(event) {
+                    this.dragging = false;
+                    const dropped = event.dataTransfer && event.dataTransfer.files;
+                    if (dropped && dropped.length > 0) {
+                        this.accept(dropped[0]);
+                    }
+                },
+
+                onFileSelect(event) {
+                    const picked = event.target.files;
+                    if (picked && picked.length > 0) {
+                        this.accept(picked[0]);
+                    }
+                },
+
+                accept(candidate) {
+                    if (candidate.type !== 'application/pdf'
+                        && !candidate.name.toLowerCase().endsWith('.pdf')) {
+                        this.status = 'error';
+                        this.statusMessage = 'Only PDF files are accepted.';
+                        this.file = null;
+                        return;
+                    }
+                    this.file = candidate;
+                    this.status = 'idle';
+                    this.statusMessage = '';
+                },
+
+                async submit() {
+                    if (!this.file) {
+                        this.status = 'error';
+                        this.statusMessage = 'Please choose a PDF file first.';
+                        return;
+                    }
+                    const form = document.getElementById('upload-form');
+                    const formData = new FormData(form);
+                    formData.set('file', this.file);
+
+                    this.status = 'uploading';
+                    this.statusMessage = 'Uploading and parsing… this can take up to 15 seconds.';
+                    this.resultUrl = null;
+
+                    try {
+                        const response = await fetch('/api/v1/statements/upload', {
+                            method: 'POST',
+                            body: formData,
+                        });
+                        const body = await response.json().catch(() => ({}));
+                        if (!response.ok) {
+                            this.status = 'error';
+                            this.statusMessage = body.detail
+                                || `Upload failed (HTTP ${response.status}).`;
+                            return;
+                        }
+                        if (body.status !== 'completed') {
+                            this.status = 'error';
+                            this.statusMessage = `Statement saved but parsing failed: ${body.error_message || 'unknown error'}.`;
+                            return;
+                        }
+                        const count = (body.transactions || []).length;
+                        this.status = 'done';
+                        this.statusMessage = `Statement ingested. ${count} transaction(s) extracted.`;
+                        this.resultUrl = '/transactions?statement_id=' + encodeURIComponent(body.id);
+                    } catch (err) {
+                        this.status = 'error';
+                        this.statusMessage = 'Network error: ' + (err && err.message ? err.message : err);
+                    }
+                },
+            };
+        }
+    </script>
+</section>
+{% endblock %}

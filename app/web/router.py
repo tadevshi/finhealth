@@ -2,21 +2,32 @@
 
 Server-rendered pages using Jinja2 templates. The base template
 (``app/web/templates/base.html``) wires the full frontend stack
-(HTMX, Alpine.js, Tailwind CSS) and the dark-mode toggle, so a single
-``index`` handler is enough for the Phase 0 MVP.
+(HTMX, Alpine.js, Tailwind CSS) and the dark-mode toggle, so a
+single ``index`` handler is enough for the Phase 0 MVP.
 
 The router is mounted at the application root (no prefix) by
-:mod:`app.main`. ``GET /`` renders the landing page; the API surface
-lives under ``/api/v1`` and is wired separately by
+:mod:`app.main`. ``GET /`` redirects to ``/upload``; the API
+surface lives under ``/api/v1`` and is wired separately by
 :mod:`app.api.v1.router`.
 """
 
-from pathlib import Path
-from typing import Any
+from __future__ import annotations
 
-from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+import uuid
+from datetime import date as date_typ
+from decimal import Decimal
+from pathlib import Path
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_session
+from app.models.bank import Bank
+from app.models.transaction import Transaction
 
 # Templates directory resolved relative to this file so the router
 # works regardless of the working directory the app is launched from
@@ -28,34 +39,254 @@ templates: Jinja2Templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 web_router: APIRouter = APIRouter(tags=["web"])
 
 
+# ---------------------------------------------------------------------------
+# Page routes
+# ---------------------------------------------------------------------------
+
+
 @web_router.get(
     "/",
+    response_class=RedirectResponse,
+    summary="Root — redirect to the upload page",
+    status_code=307,
+)
+async def index() -> RedirectResponse:
+    """Redirect ``/`` to ``/upload``.
+
+    The upload page is the natural starting point: every other
+    page is downstream of having ingested a statement. Using a
+    307 (rather than 302) preserves the HTTP method, which
+    matters if a future endpoint accepts POST at the root.
+    """
+    return RedirectResponse(url="/upload", status_code=307)
+
+
+@web_router.get(
+    "/upload",
     response_class=HTMLResponse,
-    summary="Landing page",
+    summary="Statement upload page (drag-and-drop form)",
     responses={
         200: {
-            "description": "Server-rendered HTML landing page with the "
-            "HTMX/Alpine/Tailwind shell and dark-mode toggle.",
+            "description": "Server-rendered upload page with the bank dropdown "
+            "and the drag-and-drop zone.",
             "content": {"text/html": {}},
         },
     },
 )
-async def index(request: Request) -> HTMLResponse:
-    """Render the landing page.
+async def upload_page(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> HTMLResponse:
+    """Render the upload page.
 
-    The template context is intentionally minimal: ``app_name`` comes
-    from :attr:`app.state.settings.APP_NAME` (set by the factory in
-    :mod:`app.main`) so the header reflects the configured name. No
-    database access is performed — the page is a static marketing /
-    status placeholder until Phase 3 introduces the dashboard.
+    The bank dropdown is populated server-side from the
+    ``banks`` table so the page is meaningful with JavaScript
+    disabled and the LLM never has to make a follow-up request
+    just to render a ``<select>``.
+
+    Parameters
+    ----------
+    request:
+        The current FastAPI request — required by
+        :class:`Jinja2Templates` for URL generation.
+    session:
+        A request-scoped :class:`AsyncSession` used to read the
+        active bank rows. The dependency rolls back on
+        exception, so a render error cannot leave a half-built
+        transaction open.
     """
-    # ``app.state.settings`` is set by ``create_app``; the type is
-    # ``Settings`` (a pydantic model) so ``.APP_NAME`` is typed.
+    result = await session.execute(
+        select(Bank).where(Bank.is_active.is_(True)).order_by(Bank.display_name.asc())
+    )
+    banks = list(result.scalars().all())
+
     app_name: str = request.app.state.settings.APP_NAME
-    context: dict[str, Any] = {"app_name": app_name}
+    context: dict[str, Any] = {"app_name": app_name, "banks": banks}
     return templates.TemplateResponse(
         request=request,
-        name="index.html",
+        name="upload.html",
+        context=context,
+    )
+
+
+@web_router.get(
+    "/transactions",
+    response_class=HTMLResponse,
+    summary="Filterable, paginated transaction list page",
+    responses={
+        200: {
+            "description": "Server-rendered transactions page with the filter "
+            "form and the (possibly empty) table.",
+            "content": {"text/html": {}},
+        },
+    },
+)
+async def transactions_page(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    statement_id: Annotated[
+        uuid.UUID | None,
+        Query(description="Optional filter to a single statement."),
+    ] = None,
+    date_from: Annotated[
+        date_typ | None,
+        Query(description="Inclusive lower bound on the posting date."),
+    ] = None,
+    date_to: Annotated[
+        date_typ | None,
+        Query(description="Inclusive upper bound on the posting date."),
+    ] = None,
+    min_amount: Annotated[
+        Decimal | None,
+        Query(description="Inclusive lower bound on the absolute amount."),
+    ] = None,
+    max_amount: Annotated[
+        Decimal | None,
+        Query(description="Inclusive upper bound on the absolute amount."),
+    ] = None,
+    description: Annotated[
+        str | None,
+        Query(description="Case-insensitive substring match on the description."),
+    ] = None,
+    currency: Annotated[
+        str | None,
+        Query(description="ISO-4217 code ('CLP' or 'USD')."),
+    ] = None,
+) -> HTMLResponse:
+    """Render the transactions page with the first page of rows.
+
+    The page does *not* paginate yet — Phase 1 is small enough
+    that a single page of up to ``MAX_PAGE_SIZE`` rows is fine.
+    A future WU will add cursor pagination and a footer.
+
+    The query is the same one the JSON API uses, inlined here
+    so the two endpoints stay obviously similar. If the
+    filter set grows, a small ``_query_transactions`` helper
+    belongs in this module (see also ``/transactions/rows``).
+    """
+    query = select(Transaction)
+    if statement_id is not None:
+        query = query.where(Transaction.statement_id == statement_id)
+    if date_from is not None:
+        query = query.where(Transaction.date >= date_from)
+    if date_to is not None:
+        query = query.where(Transaction.date <= date_to)
+    if min_amount is not None:
+        query = query.where(func.abs(Transaction.amount) >= min_amount)
+    if max_amount is not None:
+        query = query.where(func.abs(Transaction.amount) <= max_amount)
+    if description is not None:
+        needle = f"%{description.lower()}%"
+        query = query.where(func.lower(Transaction.description).like(needle))
+    if currency is not None:
+        query = query.where(Transaction.currency == currency)
+
+    query = query.order_by(Transaction.date.asc(), Transaction.id.asc())
+    result = await session.execute(query)
+    transactions = list(result.scalars().all())
+
+    app_name: str = request.app.state.settings.APP_NAME
+    context: dict[str, Any] = {
+        "app_name": app_name,
+        "transactions": transactions,
+        "total": len(transactions),
+        "filters": {
+            "statement_id": statement_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "min_amount": min_amount,
+            "max_amount": max_amount,
+            "description": description,
+            "currency": currency,
+        },
+    }
+    return templates.TemplateResponse(
+        request=request,
+        name="transactions.html",
+        context=context,
+    )
+
+
+@web_router.get(
+    "/transactions/rows",
+    response_class=HTMLResponse,
+    summary="HTMX partial: just the table body rows",
+    responses={
+        200: {
+            "description": "Rendered ``<tr>`` rows for the current filter set. "
+            "Intended as the ``hx-target`` of the filter form.",
+            "content": {"text/html": {}},
+        },
+    },
+)
+async def transactions_rows_partial(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    statement_id: Annotated[
+        uuid.UUID | None,
+        Query(description="Optional filter to a single statement."),
+    ] = None,
+    date_from: Annotated[
+        date_typ | None,
+        Query(description="Inclusive lower bound on the posting date."),
+    ] = None,
+    date_to: Annotated[
+        date_typ | None,
+        Query(description="Inclusive upper bound on the posting date."),
+    ] = None,
+    min_amount: Annotated[
+        Decimal | None,
+        Query(description="Inclusive lower bound on the absolute amount."),
+    ] = None,
+    max_amount: Annotated[
+        Decimal | None,
+        Query(description="Inclusive upper bound on the absolute amount."),
+    ] = None,
+    description: Annotated[
+        str | None,
+        Query(description="Case-insensitive substring match on the description."),
+    ] = None,
+    currency: Annotated[
+        str | None,
+        Query(description="ISO-4217 code ('CLP' or 'USD')."),
+    ] = None,
+) -> HTMLResponse:
+    """Render just the ``<tr>`` rows of the transactions table.
+
+    This is the HTMX-friendly endpoint. The filter form posts
+    (via ``hx-get``) to this URL and the response is swapped
+    into ``#transaction-list-body`` by HTMX — no full page
+    reload, no client-side templating, no JSON-to-DOM.
+
+    The query is identical to :func:`transactions_page` so a
+    refresh of the full page and a HTMX filter request are
+    guaranteed to return the same rows.
+    """
+    query = select(Transaction)
+    if statement_id is not None:
+        query = query.where(Transaction.statement_id == statement_id)
+    if date_from is not None:
+        query = query.where(Transaction.date >= date_from)
+    if date_to is not None:
+        query = query.where(Transaction.date <= date_to)
+    if min_amount is not None:
+        query = query.where(func.abs(Transaction.amount) >= min_amount)
+    if max_amount is not None:
+        query = query.where(func.abs(Transaction.amount) <= max_amount)
+    if description is not None:
+        needle = f"%{description.lower()}%"
+        query = query.where(func.lower(Transaction.description).like(needle))
+    if currency is not None:
+        query = query.where(Transaction.currency == currency)
+
+    query = query.order_by(Transaction.date.asc(), Transaction.id.asc())
+    result = await session.execute(query)
+    transactions = list(result.scalars().all())
+
+    context: dict[str, Any] = {"transactions": transactions, "error": None}
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/transactions_table.html",
         context=context,
     )
 

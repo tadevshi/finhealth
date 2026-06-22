@@ -10,7 +10,10 @@ every test:
   disposes it after the test.
 * :func:`client` builds the FastAPI app against the test settings and
   wires an :class:`httpx.AsyncClient` with :class:`ASGITransport`
-  so requests are handled in-process — no real network I/O.
+  so requests are handled in-process — no real network I/O. The
+  full ORM schema is created before any request so endpoints that
+  touch the database (e.g. the upload page reading ``banks``) work
+  out of the box.
 
 The lifespan event is *not* triggered by ``ASGITransport`` (httpx's
 default), so the test does not exercise the production startup/shutdown
@@ -31,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.core.config import Settings, get_settings
 from app.main import create_app
+from app.models.base import Base
 
 
 @pytest.fixture
@@ -55,13 +59,23 @@ def test_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
 
 @pytest.fixture
 async def engine(test_settings: Settings) -> AsyncIterator[AsyncEngine]:
-    """Yield an :class:`AsyncEngine` bound to the test database file."""
+    """Yield an :class:`AsyncEngine` bound to the test database file.
+
+    The full ORM schema is created on a fresh engine so any test
+    that needs the tables (e.g. the web page tests that read
+    ``banks``) works without a separate setup step. ``Base.metadata``
+    is the source of truth for the test schema — no Alembic
+    migration is run; ``test_alembic.py`` exercises the migration
+    path explicitly.
+    """
     eng = create_async_engine(
         test_settings.DATABASE_URL,
         echo=False,
         connect_args={"check_same_thread": False},
     )
     try:
+        async with eng.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
         yield eng
     finally:
         await eng.dispose()
@@ -73,9 +87,31 @@ async def client(test_settings: Settings) -> AsyncIterator[AsyncClient]:
 
     The app is created with the test settings so its lifespan,
     CORS, and ``get_session`` dependency all point at the temporary
-    database. ``ASGITransport`` handles requests in-process.
+    database. The full schema is created up front so endpoints
+    that read from the database (e.g. ``GET /upload`` listing
+    banks) do not need a separate setup fixture.
+
+    ``ASGITransport`` handles requests in-process.
     """
     app = create_app(test_settings)
+
+    # Create the schema against the per-test database. The engine
+    # used here is disposed before the test ends so the connection
+    # pool does not leak across tests. We do not call
+    # ``Base.metadata.drop_all`` on teardown — the temporary
+    # directory is wiped by ``test_settings`` so the file is gone
+    # anyway.
+    bootstrap_engine = create_async_engine(
+        test_settings.DATABASE_URL,
+        echo=False,
+        connect_args={"check_same_thread": False},
+    )
+    try:
+        async with bootstrap_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    finally:
+        await bootstrap_engine.dispose()
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
         yield ac
