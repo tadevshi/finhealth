@@ -45,7 +45,15 @@ dmypy.json
 *.db
 *.sqlite
 *.sqlite3
-/shared/
-/data/
-/uploads/
+# Local-only runtime data. The ``*`` (not ``/``) patterns below
+# ignore the *contents* of these directories while still allowing
+# the directory itself (with a ``.gitkeep`` placeholder) to be
+# tracked. That way ``git clone`` produces the empty directories
+# Docker needs for its bind mounts, without forcing the user's
+# PDFs or the SQLite database into version control.
+/shared/*
+!/shared/.gitkeep
+/data/*
+!/data/.gitkeep
+/uploads/*
 /.atl/

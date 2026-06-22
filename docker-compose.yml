@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# finhealth — production docker-compose.
+#
+# Quick start:
+#   1. ``cp .env.example .env`` and edit it (LLM endpoint, model, etc.)
+#   2. ``docker compose build``
+#   3. ``docker compose up -d``
+#   4. Open http://localhost:8000
+#
+# Data persists across container restarts via the two bind mounts
+# below. ``docker compose down`` keeps the host directories intact;
+# ``docker compose down -v`` would also wipe them — pass ``-v`` only
+# when you really want a clean slate.
+# ---------------------------------------------------------------------------
+
+services:
+  finhealth:
+    # Build the image from the project root using the multi-stage
+    # Dockerfile in this directory. Tagging the image ``finhealth:local``
+    # makes ``docker compose down && docker compose up -d`` pick up
+    # the freshly built image without ``docker compose build``.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: finhealth:local
+    container_name: finhealth
+
+    # Map the container's effective user to the host UID/GID so
+    # the bind-mounted ``./data`` and ``./shared`` directories
+    # remain owned by the host user. Defaults to 0:0 (root) for
+    # the "I just want it to work" case; set ``HOST_UID`` /
+    # ``HOST_GID`` in your ``.env`` to match the host user
+    # (typically the value ``id -u`` and ``id -g`` print when
+    # you run them) to keep the SQLite database and uploaded
+    # PDFs owned by you instead of by root.
+    user: "${HOST_UID:-0}:${HOST_GID:-0}"
+
+    ports:
+      # Host port 8000 -> container port 8000. Change the left side
+      # if the host port is already taken (``"9000:8000"``).
+      - "8000:8000"
+
+    volumes:
+      # PDF uploads. Drop a statement PDF in ``./shared`` and it
+      # is immediately visible to the running app (and vice versa).
+      - ./shared:/app/shared
+      # SQLite database + WAL files. One directory keeps the
+      # schema, the main DB, and the write-ahead log together so
+      # atomic commits survive a container restart.
+      - ./data:/app/data
+
+    environment:
+      # Database URL points inside the container; the bind mount
+      # above makes ``/app/data`` the same directory as ``./data``
+      # on the host.
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/finhealth.db
+      - DEBUG=false
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      - LLM_PROVIDER=${LLM_PROVIDER:-opencode_go}
+      # ``host.docker.internal`` resolves to the host machine from
+      # inside the container on Docker Desktop and on Linux Docker
+      # Engine 20.10+. If the LLM daemon is on another host,
+      # override ``LLM_API_ENDPOINT`` in ``.env``.
+      - LLM_API_ENDPOINT=${LLM_API_ENDPOINT:-http://host.docker.internal:11434}
+      - LLM_MODEL=${LLM_MODEL:-qwen3.7-max}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
+      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-3}
+      # PDF upload directory *inside* the container. The bind
+      # mount above keeps it in sync with ``./shared`` on the host.
+      - PDF_UPLOAD_DIR=/app/shared
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-10}
+
+    # Self-hosted single-user app: always come back up unless the
+    # operator explicitly stops the container. Use ``docker compose
+    # stop`` to take it down for maintenance.
+    restart: unless-stopped
