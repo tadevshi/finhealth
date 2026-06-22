@@ -12,6 +12,11 @@ temporary SQLite file and verify that:
 * Running ``upgrade head`` a second time is a no-op.
 * The full upgrade → downgrade cycle leaves the database empty of
   domain tables (only ``alembic_version`` remains).
+* The ``created_at`` / ``updated_at`` columns on the four domain
+  tables carry ``DEFAULT CURRENT_TIMESTAMP`` after the latest
+  migration runs, so an INSERT that omits the timestamps succeeds
+  (this is the regression guard for the
+  ``NOT NULL constraint failed: credit_cards.created_at`` bug).
 
 The tests are intentionally synchronous: ``alembic.command.upgrade``
 and friends are blocking functions that internally drive the
@@ -26,10 +31,14 @@ read from the :class:`ScriptDirectory` so the tests stay correct
 no matter how many migrations exist.
 """
 
-from collections.abc import Iterator
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from alembic.command import downgrade as alembic_downgrade
 from alembic.command import upgrade as alembic_upgrade
 from alembic.config import Config as AlembicConfig
@@ -37,8 +46,15 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.config import Settings
+from app.models import Bank, CreditCard, Statement, Transaction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
@@ -240,3 +256,223 @@ def test_alembic_seeds_known_banks(alembic_config: AlembicConfig, sync_engine: E
         "itau": ("rut_sin_dv", 1),
         "santander": ("rut_sin_dv", 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# Timestamp server_default regression guard
+# ---------------------------------------------------------------------------
+#
+# The migration ``0002_phase1_ingestion`` created ``created_at`` and
+# ``updated_at`` as ``NOT NULL`` columns *without* a ``server_default``
+# clause. The ORM model had ``server_default=func.now()``, but the
+# database schema Alembic produced did not carry the same default —
+# so SQLAlchemy's flush path (which can omit the column on dialects
+# with ``RETURNING``) tripped ``NOT NULL constraint failed:
+# credit_cards.created_at``.
+#
+# The regression is fixed by migration ``0004_timestamp_server_defaults``
+# (which adds ``DEFAULT CURRENT_TIMESTAMP`` to both columns on every
+# domain table) and by the companion change to ``TimestampMixin``
+# (which adds the matching ``default=func.now()`` and ``nullable=False``
+# on the Python side). The tests below prove both halves of the fix:
+# the schema carries the default, and the ORM honours it on flush.
+
+
+@pytest_asyncio.fixture
+async def async_session_factory(
+    migrated_test_settings: Settings,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Yield a session factory bound to a freshly-migrated async engine.
+
+    Unlike the ``test_models`` fixture, which uses
+    ``Base.metadata.create_all``, this one runs the *real* Alembic
+    migration chain (via the sync ``migrated_test_settings``
+    fixture, so ``alembic_upgrade`` does not call ``asyncio.run``
+    inside our event loop). The point of the regression guard is to
+    verify the migration produces a schema that lets the
+    application insert rows without explicit timestamps —
+    recreating the schema with ``create_all`` would mask the bug
+    entirely (the ORM model itself already had the right
+    ``server_default``).
+    """
+    eng: AsyncEngine = create_async_engine(migrated_test_settings.DATABASE_URL)
+    try:
+        factory = async_sessionmaker(eng, expire_on_commit=False)
+        yield factory
+    finally:
+        await eng.dispose()
+
+
+@pytest.fixture
+def migrated_test_settings(test_settings: Settings) -> Settings:
+    """Run ``alembic upgrade head`` on the test database, return the settings.
+
+    This is intentionally a *sync* fixture: ``alembic.command.upgrade``
+    calls ``asyncio.run`` internally (see ``alembic/env.py``) and
+    that call would fail with ``RuntimeError: asyncio.run() cannot
+    be called from a running event loop`` if invoked from inside
+    a ``pytest-asyncio`` test. Keeping the migration in a sync
+    fixture lets Alembic drive its own event loop on a clean slate.
+    """
+    cfg = AlembicConfig(str(ALEMBIC_INI))
+    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+    cfg.set_main_option("sqlalchemy.url", test_settings.DATABASE_URL)
+    alembic_upgrade(cfg, "head")
+    return test_settings
+
+
+def test_alembic_timestamp_columns_have_server_default(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """The four domain tables carry ``DEFAULT CURRENT_TIMESTAMP`` on timestamps.
+
+    Inspects the live database schema (after ``upgrade head``) and
+    asserts that the ``server_default`` of every ``created_at`` and
+    ``updated_at`` column is non-``None``. This is the *schema-level*
+    half of the fix: without this, SQLAlchemy's flush path on SQLite
+    (which relies on ``RETURNING`` and omits server-defaulted
+    columns) hits the ``NOT NULL`` constraint.
+    """
+    alembic_upgrade(alembic_config, "head")
+    inspector = inspect(sync_engine)
+
+    for table in ("banks", "credit_cards", "statements", "transactions"):
+        columns = {col["name"]: col for col in inspector.get_columns(table)}
+        for ts_col in ("created_at", "updated_at"):
+            assert ts_col in columns, f"{table}.{ts_col} missing from schema"
+            default = columns[ts_col].get("default")
+            assert default is not None, (
+                f"{table}.{ts_col} has no server default — "
+                f"the upload endpoint will hit NOT NULL constraint failure"
+            )
+            # The default is rendered as a SQL fragment; ``CURRENT_TIMESTAMP``
+            # is what ``sa.func.now()`` compiles to on every dialect this
+            # project supports (SQLite and PostgreSQL). Matching on the
+            # substring keeps the test portable across both.
+            assert "CURRENT_TIMESTAMP" in str(default).upper(), (
+                f"{table}.{ts_col} default is {default!r}, expected CURRENT_TIMESTAMP"
+            )
+
+
+@pytest.mark.asyncio
+async def test_credit_card_creation_without_explicit_timestamps(
+    async_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A ``CreditCard`` inserted on a migrated DB gets timestamps from the DB.
+
+    Regression guard for ``NOT NULL constraint failed:
+    credit_cards.created_at``. Before migration ``0004``, the
+    application raised 500 on every upload because the database
+    schema lacked the ``DEFAULT CURRENT_TIMESTAMP`` clause. With
+    the migration in place, the same INSERT succeeds and the row
+    carries non-``None`` ``created_at`` / ``updated_at`` populated
+    by the engine.
+    """
+    async with async_session_factory() as session:
+        # Seed a bank first (banks is the parent of credit_cards).
+        # The bank row also goes through the timestamp path — the
+        # seed in ``0002`` writes explicit timestamps, so this row
+        # is just a control to make sure the fixture is alive.
+        bank = Bank(
+            id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+            name="repro_bank",
+            display_name="Repro Bank",
+            password_formula="rut_sin_dv",
+        )
+        session.add(bank)
+        await session.commit()
+
+        # The card is the *real* subject of the regression: pre-fix
+        # this ``commit()`` raised IntegrityError because the DB
+        # schema had ``NOT NULL created_at`` with no default.
+        card = CreditCard(
+            bank_id=bank.id,
+            card_number_masked="XXXX XXXX XXXX 1234",
+            cardholder="REPRO USER",
+            currency="CLP",
+        )
+        session.add(card)
+        await session.commit()  # was raising before the fix
+        await session.refresh(card)
+
+        assert card.id is not None
+        assert card.created_at is not None, "created_at not populated by DB default"
+        assert card.updated_at is not None, "updated_at not populated by DB default"
+        assert isinstance(card.created_at, type(card.updated_at))
+        assert card.created_at <= card.updated_at
+
+
+@pytest.mark.asyncio
+async def test_all_timestamp_mixin_tables_accept_timeless_inserts(
+    async_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every model that opts into ``TimestampMixin`` accepts a timestamp-less insert.
+
+    The ``TimestampMixin`` is shared across the four domain tables,
+    so the fix must hold for *all* of them — not just
+    ``credit_cards``. This test inserts one row per table (in
+    dependency order) and asserts each commit succeeds and the
+    timestamps are populated. The parent rows are seeded with
+    explicit UUIDs to keep the test self-contained.
+    """
+    bank_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    card_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
+    statement_id = uuid.UUID("44444444-4444-4444-4444-444444444444")
+
+    async with async_session_factory() as session:
+        # Bank
+        bank = Bank(
+            id=bank_id,
+            name="repro_bank_all",
+            display_name="Repro All",
+            password_formula="rut_sin_dv",
+        )
+        session.add(bank)
+        await session.commit()
+        await session.refresh(bank)
+        assert bank.created_at is not None
+        assert bank.updated_at is not None
+
+        # CreditCard
+        card = CreditCard(
+            id=card_id,
+            bank_id=bank.id,
+            card_number_masked="XXXX XXXX XXXX 9999",
+            cardholder="REPRO ALL",
+            currency="CLP",
+        )
+        session.add(card)
+        await session.commit()
+        await session.refresh(card)
+        assert card.created_at is not None
+        assert card.updated_at is not None
+
+        # Statement
+        statement = Statement(
+            id=statement_id,
+            credit_card_id=card.id,
+            period_start=date(2026, 5, 1),
+            period_end=date(2026, 5, 31),
+            statement_date=date(2026, 6, 1),
+            file_path="repro/2026-05.pdf",
+            file_hash="a" * 64,
+        )
+        session.add(statement)
+        await session.commit()
+        await session.refresh(statement)
+        assert statement.created_at is not None
+        assert statement.updated_at is not None
+
+        # Transaction (the deepest child)
+        tx = Transaction(
+            statement_id=statement.id,
+            date=date(2026, 5, 5),
+            description="REPRO TX",
+            amount=Decimal("100.00"),
+            currency="CLP",
+        )
+        session.add(tx)
+        await session.commit()
+        await session.refresh(tx)
+        assert tx.created_at is not None
+        assert tx.updated_at is not None
