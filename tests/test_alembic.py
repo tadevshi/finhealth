@@ -4,17 +4,26 @@ These tests exercise the full upgrade/downgrade round-trip against a
 temporary SQLite file and verify that:
 
 * ``alembic upgrade head`` creates the ``alembic_version`` table and
-  stamps it with the initial revision.
-* ``alembic downgrade base`` drops the version table and clears the
-  stamp.
+  stamps it with the current head revision.
+* ``alembic downgrade base`` clears the stamp (the ``alembic_version``
+  table itself is preserved by Alembic's bookkeeping).
 * ``alembic current`` (i.e. the live revision in the database)
   matches the head revision reported by the script directory.
 * Running ``upgrade head`` a second time is a no-op.
-* The full upgrade → downgrade cycle leaves the database empty.
+* The full upgrade → downgrade cycle leaves the database empty of
+  domain tables (only ``alembic_version`` remains).
 
 The tests are intentionally synchronous: ``alembic.command.upgrade``
 and friends are blocking functions that internally drive the
 ``asyncio`` event loop inside ``env.py`` to reach the async engine.
+
+Phase 1 note
+------------
+These tests no longer hardcode ``0001_initial`` as the head: the
+project now has multiple migrations and the head changes as new
+ones are added. The head revision and the full revision list are
+read from the :class:`ScriptDirectory` so the tests stay correct
+no matter how many migrations exist.
 """
 
 from collections.abc import Iterator
@@ -34,7 +43,6 @@ from app.core.config import Settings
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 ALEMBIC_DIR = PROJECT_ROOT / "alembic"
-INITIAL_REVISION = "0001_initial"
 
 
 def _sync_url(async_url: str) -> str:
@@ -105,13 +113,19 @@ def test_alembic_upgrade_creates_version_table(
 def test_alembic_current_reports_head_after_upgrade(
     alembic_config: AlembicConfig, sync_engine: Engine
 ) -> None:
-    """``alembic current`` shows the initial revision after upgrade."""
+    """``alembic current`` shows the head revision after upgrade.
+
+    The expected head is read from the :class:`ScriptDirectory` so
+    the test does not need to be updated every time a new migration
+    is added.
+    """
     script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_current_head() == INITIAL_REVISION
+    expected_head = script.get_current_head()
+    assert expected_head is not None
 
     alembic_upgrade(alembic_config, "head")
 
-    assert _current_revision(sync_engine) == INITIAL_REVISION
+    assert _current_revision(sync_engine) == expected_head
 
 
 def test_alembic_downgrade_clears_version_stamp(
@@ -123,17 +137,20 @@ def test_alembic_downgrade_clears_version_stamp(
     its own bookkeeping), but the stamped revision row is removed so
     ``alembic current`` reports no version afterwards.
     """
+    script = ScriptDirectory.from_config(alembic_config)
+    expected_head = script.get_current_head()
+    assert expected_head is not None
+
     alembic_upgrade(alembic_config, "head")
     assert "alembic_version" in _table_names(sync_engine)
-    assert _current_revision(sync_engine) == INITIAL_REVISION
+    assert _current_revision(sync_engine) == expected_head
 
     alembic_downgrade(alembic_config, "base")
 
     assert _current_revision(sync_engine) is None
     # The table stays — Alembic keeps an empty placeholder so a
     # subsequent ``upgrade head`` can re-stamp it without recreating
-    # the schema. This is the documented Alembic behaviour for a
-    # no-op initial migration.
+    # the schema. This is the documented Alembic behaviour.
     assert "alembic_version" in _table_names(sync_engine)
 
 
@@ -145,32 +162,81 @@ def test_alembic_upgrade_is_idempotent(alembic_config: AlembicConfig, sync_engin
     alembic_upgrade(alembic_config, "head")
     second_tables = _table_names(sync_engine)
 
-    assert first_tables == second_tables == {"alembic_version"}
+    assert first_tables == second_tables
+    # ``alembic_version`` is always present; the rest are the
+    # domain tables introduced by the migrations.
+    assert "alembic_version" in first_tables
+    assert len(first_tables) > 1  # at least one domain table
 
 
 def test_alembic_round_trip_is_reversible(
     alembic_config: AlembicConfig, sync_engine: Engine
 ) -> None:
     """Upgrade → downgrade reverts to an unstamped, single-table state."""
+    script = ScriptDirectory.from_config(alembic_config)
+    expected_head = script.get_current_head()
+    assert expected_head is not None
+
     alembic_upgrade(alembic_config, "head")
-    assert _current_revision(sync_engine) == INITIAL_REVISION
+    assert _current_revision(sync_engine) == expected_head
 
     alembic_downgrade(alembic_config, "base")
     assert _current_revision(sync_engine) is None
+    # Every domain table is gone — only the bookkeeping table
+    # remains.
+    assert _table_names(sync_engine) == {"alembic_version"}
 
     # Re-upgrade from the unstamped state works — proves the
     # downgrade didn't leave Alembic in a broken state.
     alembic_upgrade(alembic_config, "head")
-    assert _current_revision(sync_engine) == INITIAL_REVISION
+    assert _current_revision(sync_engine) == expected_head
 
 
-def test_alembic_script_directory_has_only_initial_revision(
+def test_alembic_script_directory_has_a_linear_history(
     alembic_config: AlembicConfig,
 ) -> None:
-    """The script directory exposes exactly one revision: the placeholder."""
+    """The script directory's revisions form a single linear chain.
+
+    Multiple revisions are expected (Phase 1 added a second one);
+    the test now verifies the chain's *shape* rather than its
+    size so future migrations don't break it.
+    """
     script = ScriptDirectory.from_config(alembic_config)
     revisions = list(script.walk_revisions())
 
-    assert len(revisions) == 1
-    assert revisions[0].revision == INITIAL_REVISION
-    assert revisions[0].down_revision is None
+    assert len(revisions) >= 1
+    head = script.get_current_head()
+    assert head is not None
+    # The newest revision (first in ``walk_revisions``) is the
+    # current head and has no down-revision pointing past it.
+    newest = revisions[0]
+    assert newest.revision == head
+    assert newest.down_revision is not None
+    # The oldest revision (last in the list) is the root of the
+    # chain and has no down-revision at all.
+    root = revisions[-1]
+    assert root.down_revision is None
+
+
+def test_alembic_seeds_known_banks(alembic_config: AlembicConfig, sync_engine: Engine) -> None:
+    """``alembic upgrade head`` seeds the three known Chilean banks.
+
+    The seed is part of the Phase 1 ingestion migration so a fresh
+    checkout running ``alembic upgrade head`` ends up with a usable
+    database. The test guards against accidental removal of the
+    seed when the migration is refactored.
+    """
+    alembic_upgrade(alembic_config, "head")
+
+    with sync_engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT name, password_formula, is_active FROM banks ORDER BY name"
+        ).fetchall()
+
+    assert len(rows) == 3
+    by_name = {name: (formula, active) for name, formula, active in rows}
+    assert by_name == {
+        "banco_de_chile": ("rut_ultimos_4", 1),
+        "itau": ("rut_sin_dv", 1),
+        "santander": ("rut_sin_dv", 1),
+    }
