@@ -62,6 +62,10 @@ services:
       # Engine 20.10+. If the LLM daemon is on another host,
       # override ``LLM_API_ENDPOINT`` in ``.env``.
       - LLM_API_ENDPOINT=${LLM_API_ENDPOINT:-http://host.docker.internal:11434}
+      # API key for LLM provider authentication. Optional for local
+      # providers like Ollama (leave empty). Required for cloud
+      # providers. Set in ``.env`` to avoid committing secrets.
+      - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-qwen3.7-max}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
       - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-3}
