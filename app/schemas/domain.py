@@ -143,7 +143,15 @@ class StatementCreate(BaseModel):
 
 
 class StatementResponse(BaseModel):
-    """Shape returned when reading a :class:`app.models.Statement` row."""
+    """Shape returned when reading a :class:`app.models.Statement` row.
+
+    The statement is returned *with* its transactions so a
+    single ``GET`` is enough to render a statement detail page
+    on the client. The relationship is eagerly loaded by the
+    endpoint (``selectinload`` for ``Statement.transactions``)
+    so the Pydantic model can access the list without an extra
+    round-trip.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -155,6 +163,11 @@ class StatementResponse(BaseModel):
     file_path: str
     file_hash: str
     status: StatementStatus
+    error_message: str | None
+    transactions: list[TransactionResponse] = Field(
+        default_factory=list,
+        description="All transactions extracted from this statement.",
+    )
     created_at: datetime
     updated_at: datetime
 

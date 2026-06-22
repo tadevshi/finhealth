@@ -20,7 +20,7 @@ import uuid
 from datetime import date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Date, Enum, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -96,10 +96,21 @@ class Statement(UUIDMixin, TimestampMixin, Base):
     file_path: Mapped[str] = mapped_column(String(512))
     file_hash: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[StatementStatus] = mapped_column(
-        Enum(StatementStatus, native_enum=False, length=20),
+        Enum(
+            StatementStatus,
+            native_enum=False,
+            length=20,
+            # ``values_callable`` tells SQLAlchemy to store the
+            # StrEnum *value* (``"failed"``) rather than the
+            # *name* (``"FAILED"``). The migration 0002 also
+            # stores the lowercase form, so the two stay in
+            # lock-step.
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
         default=StatementStatus.PENDING,
         index=True,
     )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships ---------------------------------------------------------
     credit_card: Mapped[CreditCard] = relationship(
