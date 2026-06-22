@@ -198,7 +198,8 @@ class OpenCodeGoClient(LLMProvider):
 
         try:
             client = self._get_client()
-            response = await client.post(url, json=payload, timeout=timeout)
+            headers = self._build_headers()
+            response = await client.post(url, json=payload, timeout=timeout, headers=headers)
         except httpx.TimeoutException as exc:
             raise LLMExtractionError(
                 f"OpenCode Go timed out after {timeout}s: {exc}", retryable=True
@@ -253,6 +254,19 @@ class OpenCodeGoClient(LLMProvider):
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
         }
+
+    def _build_headers(self) -> dict[str, str]:
+        """Build HTTP headers for the request.
+
+        Includes ``Authorization: Bearer <key>`` when
+        ``LLM_API_KEY`` is configured. Empty string means
+        no authentication (useful for local providers like
+        Ollama that don't require API keys).
+        """
+        headers: dict[str, str] = {}
+        if self._settings.LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {self._settings.LLM_API_KEY}"
+        return headers
 
     def _parse_response(self, body: dict[str, Any]) -> ExtractionResponse:
         """Extract the assistant message and validate it as :class:`ExtractionResponse`.

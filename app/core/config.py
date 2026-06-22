@@ -75,6 +75,10 @@ class Settings(BaseSettings):
         default="http://localhost:11434",
         description="Base URL for the LLM provider's HTTP API.",
     )
+    LLM_API_KEY: str = Field(
+        default="",
+        description="API key for LLM provider authentication (optional for local providers like Ollama).",
+    )
     LLM_MODEL: str = Field(
         default="qwen3.7-max",
         description="Model name sent to the LLM provider.",
