@@ -1,0 +1,70 @@
+# .dockerignore — keep the build context as small as possible.
+#
+# Anything not listed here is sent to the Docker daemon on every
+# build. Pruning aggressively cuts both build time and the
+# ``Sending build context to Docker daemon`` size.
+
+# Version control — never bake credentials or history into images
+.git
+.gitignore
+.gitattributes
+
+# Secrets and local config — must not be baked in
+.env
+.env.local
+.env.*.local
+
+# Virtual environments and caches — rebuilt inside the image
+.venv
+venv
+env
+ENV
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+build
+dist
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+.tox
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+
+# Local-only test fixtures and tooling
+tests
+docs
+.pre-commit-config.yaml
+.atl
+.atldir
+
+# NOTE: ``README.md`` and ``LICENSE`` are intentionally *not*
+# excluded. The Dockerfile copies them in the builder stage
+# because ``pyproject.toml`` references them as build-time
+# metadata (``readme = "README.md"``, ``license = { file =
+# "LICENSE" }``) and hatchling will fail the wheel build
+# without them.
+
+# User data mounted at runtime — the host bind mount supplies
+# whatever the container needs. The trailing ``*`` avoids copying
+# the directory metadata while still excluding any leftover files
+# from a previous build.
+shared/*
+!shared/.gitkeep
+data/*
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3

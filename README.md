@@ -345,3 +345,134 @@ project root). See `.env.example` for the full list. Key entries:
 ## License
 
 [MIT](./LICENSE)
+
+---
+
+## Docker deployment
+
+A self-hosted single-user app is the natural fit for a single
+container, so finhealth ships a multi-stage `Dockerfile` and a
+`docker-compose.yml` that mount the SQLite database and the
+upload directory as host bind mounts for persistence.
+
+### Quick start
+
+1. Create a `.env` file from the template (see the configuration
+   section below for the relevant keys):
+
+   ```bash
+   cp .env.example .env
+   # Edit .env — at minimum set SECRET_KEY and the LLM endpoint.
+   ```
+
+2. Build the image and start the container in the background:
+
+   ```bash
+   docker compose build
+   docker compose up -d
+   ```
+
+3. Open <http://localhost:8000>. The upload page is at
+   `/upload`, the transactions list at `/transactions`, the
+   interactive API docs at `/docs`.
+
+The first `up -d` runs `alembic upgrade head` on container start,
+so the SQLite schema is created and the three supported banks
+(Santander, Itaú, Banco de Chile) are seeded automatically.
+
+### Configuration
+
+All settings come from environment variables, which the compose
+file reads from your local `.env`. The most relevant keys for a
+Docker deployment are:
+
+| Variable            | Default (Docker)                              | Purpose                                       |
+| ------------------- | --------------------------------------------- | --------------------------------------------- |
+| `DATABASE_URL`      | `sqlite+aiosqlite:////app/data/finhealth.db`  | Async SQLAlchemy URL. The path is *inside* the container — the host bind mount on `./data` makes it persistent. |
+| `SECRET_KEY`        | `change-me-in-production`                     | Set a real random value in `.env` for production. |
+| `LLM_PROVIDER`      | `opencode_go`                                 | LLM provider identifier (`opencode_go`, `ollama`, `openai_compat`). |
+| `LLM_API_ENDPOINT`  | `http://host.docker.internal:11434`           | Base URL for the LLM provider's HTTP API. `host.docker.internal` resolves to the Docker host — use a routable IP or hostname if the LLM runs elsewhere. |
+| `LLM_MODEL`         | `qwen3.7-max`                                 | Model name sent to the LLM provider. |
+| `LLM_TIMEOUT`       | `60`                                          | Timeout (seconds) for one LLM call. |
+| `LLM_MAX_RETRIES`   | `3`                                           | Automatic retries on transient LLM errors. |
+| `PDF_UPLOAD_DIR`    | `/app/shared`                                 | Where uploaded PDFs are stored *inside* the container. |
+| `MAX_FILE_SIZE_MB`  | `10`                                          | Upload size cap (returns 413 over the cap). |
+
+### Volumes
+
+The compose file bind-mounts two host directories into the
+container. They survive `docker compose down` and any number of
+container restarts. `docker compose down -v` would *also* wipe
+the host directories — only pass `-v` when you really want a
+clean slate.
+
+| Host path   | Container path  | Purpose                                                                 |
+| ----------- | --------------- | ----------------------------------------------------------------------- |
+| `./shared`  | `/app/shared`   | PDF uploads. Drop a statement PDF in `./shared/` and it is immediately visible to the running app. |
+| `./data`    | `/app/data`     | SQLite database + WAL files. The schema, the main DB, and the write-ahead log all live in one directory so atomic commits survive a restart. |
+
+Both directories are tracked as empty in git via `.gitkeep`
+files, so a fresh `git clone` produces the directories Docker
+needs to bind-mount. Anything you drop in there is ignored by
+git (see `.gitignore`).
+
+### File ownership (HOST_UID / HOST_GID)
+
+The compose file maps the container's effective user to
+`${HOST_UID:-0}:${HOST_GID:-0}`. The default `0:0` (root)
+works for any host that does not care who owns the files in
+`./data` and `./shared`; the SQLite database and any uploaded
+PDFs will be owned by `root` on the host.
+
+To keep those files owned by your own user (recommended for
+self-hosted deployments), set `HOST_UID` and `HOST_GID` in
+`.env` to match your host user:
+
+```bash
+echo "HOST_UID=$(id -u)" >> .env
+echo "HOST_GID=$(id -g)" >> .env
+docker compose up -d
+```
+
+The variables are read on every `docker compose` invocation, so
+no rebuild is needed — `docker compose restart` is enough to
+apply a new UID/GID.
+
+### Updating
+
+Pull the new code, rebuild, and restart:
+
+```bash
+git pull
+docker compose build
+docker compose up -d
+```
+
+Migrations are applied automatically on every container start,
+so a schema change in a newer image does not need a manual
+`alembic upgrade head`.
+
+### Logs
+
+```bash
+# Stream the app's stdout/stderr.
+docker compose logs -f finhealth
+
+# Last 100 lines, no follow.
+docker compose logs --tail=100 finhealth
+```
+
+### Health check
+
+The container declares a Docker-level `HEALTHCHECK` against
+`/api/v1/health`, which does a DB round-trip. Check the state
+with:
+
+```bash
+docker compose ps
+#   NAME        IMAGE           COMMAND                  SERVICE     STATUS
+#   finhealth   finhealth:local "sh -c alembic upgrad…"  finhealth   Up 2 minutes (healthy)
+```
+
+The status column switches to `(unhealthy)` if the DB is
+unreachable or the migrations fail.
