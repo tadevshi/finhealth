@@ -12,6 +12,14 @@ class Settings(BaseSettings):
     Values are read first from environment variables, then from a local
     ``.env`` file if present. All fields are fully type-annotated so the
     configuration surface is introspectable and ``mypy --strict`` clean.
+
+    New in Phase 1
+    --------------
+    The ``LLM_*`` block configures the LLM extraction provider used to
+    turn decrypted PDF text into structured transactions. The
+    ``PDF_*`` block governs the upload pipeline. Both blocks are
+    documented inline; see ``.env.example`` for the full list of
+    overridable keys.
     """
 
     model_config = SettingsConfigDict(
@@ -47,6 +55,53 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = Field(
         default_factory=lambda: ["http://localhost:8000"],
         description="Allowed origins for CORS requests (JSON list in env).",
+    )
+
+    # LLM provider --------------------------------------------------------------
+    # ``LLM_PROVIDER`` selects the concrete client implementation
+    # (``opencode_go``, ``ollama``, ``openai_compat``). The provider is
+    # intentionally a string, not an enum, so adding a new one is a
+    # matter of code — not a schema migration. ``LLM_API_ENDPOINT`` is
+    # the base URL the provider's client talks to (an Ollama daemon
+    # by default). ``LLM_MODEL`` is the model name passed to the
+    # provider. ``LLM_TIMEOUT`` bounds a single extraction call;
+    # ``LLM_MAX_RETRIES`` is the number of automatic retries on
+    # transient errors (network blips, 5xx responses, timeouts).
+    LLM_PROVIDER: str = Field(
+        default="opencode_go",
+        description="LLM provider identifier (e.g. 'opencode_go', 'ollama').",
+    )
+    LLM_API_ENDPOINT: str = Field(
+        default="http://localhost:11434",
+        description="Base URL for the LLM provider's HTTP API.",
+    )
+    LLM_MODEL: str = Field(
+        default="qwen3.7-max",
+        description="Model name sent to the LLM provider.",
+    )
+    LLM_TIMEOUT: int = Field(
+        default=60,
+        ge=1,
+        description="Timeout in seconds for a single LLM extraction call.",
+    )
+    LLM_MAX_RETRIES: int = Field(
+        default=3,
+        ge=0,
+        description="Number of automatic retries on transient LLM errors.",
+    )
+
+    # PDF ingestion --------------------------------------------------------------
+    # ``PDF_UPLOAD_DIR`` is resolved relative to the project root when
+    # it is not absolute. ``MAX_FILE_SIZE_MB`` caps the upload size —
+    # exceeding it returns ``413 Payload Too Large`` from the route.
+    PDF_UPLOAD_DIR: str = Field(
+        default="shared",
+        description="Directory where uploaded PDFs are stored (absolute or relative).",
+    )
+    MAX_FILE_SIZE_MB: int = Field(
+        default=10,
+        ge=1,
+        description="Maximum upload size in megabytes.",
     )
 
 
