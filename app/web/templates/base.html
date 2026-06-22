@@ -74,6 +74,16 @@
         tailwind.config = { darkMode: 'class' };
     </script>
 
+    {# --- x-cloak fallback for Alpine ---------------------------------- #}
+    {# Alpine hides ``x-cloak``-marked nodes by the time it boots.
+       The Play CDN occasionally loads slowly on a cold cache, so we
+       set the same ``display: none`` rule directly in CSS — the
+       result is identical (the node stays hidden) whether the rule
+       is applied by Alpine or by the browser.                          #}
+    <style>
+        [x-cloak] { display: none !important; }
+    </style>
+
     {# --- HTMX ----------------------------------------------------------- #}
     {# Loaded synchronously so inline ``hx-get`` / ``hx-post`` attributes
        in child templates are active as soon as the page mounts.        #}
