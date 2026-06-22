@@ -77,18 +77,34 @@ class TimestampMixin:
     """Mixin that adds timezone-aware ``created_at`` and ``updated_at``.
 
     Both columns are declared as ``DateTime(timezone=True)`` so the
-    database stores the offset (the project standard is UTC). Defaults
-    are applied at the database level via :func:`sqlalchemy.func.now`
-    so values are set even when the application clock is wrong, and
-    ``updated_at`` is refreshed automatically on UPDATE.
+    database stores the offset (the project standard is UTC) and
+    ``nullable=False`` so the database rejects inserts that omit them.
+
+    Two complementary defaults are wired up:
+
+    * ``default=func.now()`` — SQLAlchemy includes the SQL expression
+      in the ``INSERT`` statement at flush time, so the column is
+      always sent (even on dialects without ``RETURNING``).
+    * ``server_default=func.now()`` — the column carries a
+      ``DEFAULT CURRENT_TIMESTAMP`` clause at the database level, so
+      raw SQL, ad-hoc psql sessions, and any future migration that
+      inserts rows without specifying the timestamp still get a
+      valid value.
+
+    ``updated_at`` also carries ``onupdate=func.now()`` so SQLAlchemy
+    refreshes it on every ``UPDATE`` issued by the ORM.
     """
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=func.now(),
         server_default=func.now(),
+        nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=func.now(),
         server_default=func.now(),
         onupdate=func.now(),
+        nullable=False,
     )
