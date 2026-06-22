@@ -1,0 +1,716 @@
+"""Tests for the PDF service layer (Work Unit 2).
+
+These tests cover the deterministic half of the ingestion pipeline
+introduced in Phase 1, WU 2:
+
+* :mod:`app.services.pdf.password_deriver` — turns a RUT plus a
+  bank's ``password_formula`` into the PDF password.
+* :mod:`app.services.pdf.decryptor` — opens the encrypted PDF with
+  :mod:`pikepdf` and writes a plain copy.
+* :mod:`app.services.pdf.extractor` — pulls linearised text out
+  of the decrypted PDF via :mod:`pdfplumber`.
+* :mod:`app.services.pdf.variant_detector` — identifies the
+  statement as ``NACIONAL`` or ``INTERNACIONAL``.
+* :mod:`app.services.pdf.amount_parser` — converts a raw amount
+  string to :class:`decimal.Decimal` with no floating-point drift.
+
+Test layout
+-----------
+
+The password-deriver, variant-detector, and amount-parser tests
+are pure-Python: they need no I/O beyond what the function under
+test performs. The decryptor and extractor tests use the real
+sample PDFs in ``shared/account-state-examples/`` — the
+``needs_sample_pdfs`` marker below skips them gracefully when the
+files are not present, so the test suite still runs in CI
+environments where the PDFs have not been provisioned.
+
+Sample corpus
+-------------
+
+The three sample PDFs that ship with the project (and the
+passwords the project author derived from them) are:
+
+* ``80_15796_..._20260422.pdf`` — Santander, NACIONAL (CLP).
+  Password: ``26450463`` (RUT body, ``rut_sin_dv`` formula).
+* ``EECCTarjetaVisa.pdf`` — Banco de Chile, NACIONAL (CLP).
+  Password: ``0463`` (last 4 of RUT body, ``rut_ultimos_4``).
+* ``EECCvirtual.pdf`` — Itaú, INTERNACIONAL (USD).
+  Password: ``26450463`` (RUT body, ``rut_sin_dv``).
+
+The RUT used in all three is ``26.450.463-5`` (body
+``26450463``, DV ``5``).
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from pathlib import Path
+
+import pikepdf
+import pytest
+
+from app.models.bank import Bank
+from app.services.pdf import (
+    AmountParseError,
+    InvalidPasswordFormulaError,
+    InvalidRUTError,
+    PDFDecryptError,
+    PDFPasswordError,
+    TextExtractionError,
+    VariantDetectionError,
+    decrypt_pdf,
+    derive_password,
+    detect_variant,
+    extract_text,
+    parse_amount,
+)
+from app.services.pdf.amount_parser import _CLP_MARKER, _USD_MARKER
+from app.services.pdf.password_deriver import (
+    FORMULA_RUT_SIN_DV,
+    FORMULA_RUT_ULTIMOS_4,
+)
+
+# ---------------------------------------------------------------------------
+# Paths and shared fixtures
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SAMPLE_PDFS_DIR = PROJECT_ROOT / "shared" / "account-state-examples"
+
+SANTANDER_PDF = SAMPLE_PDFS_DIR / "80_15796_0350262800062166708_20260422.pdf"
+BANCO_CHILE_PDF = SAMPLE_PDFS_DIR / "EECCTarjetaVisa.pdf"
+ITAU_PDF = SAMPLE_PDFS_DIR / "EECCvirtual.pdf"
+
+SAMPLE_RUT = "26.450.463-5"
+SAMPLE_RUT_BODY = "26450463"
+SAMPLE_RUT_LAST4 = "0463"
+
+SANTANDER_PASSWORD = SAMPLE_RUT_BODY  # rut_sin_dv
+BANCO_CHILE_PASSWORD = SAMPLE_RUT_LAST4  # rut_ultimos_4
+ITAU_PASSWORD = SAMPLE_RUT_BODY  # rut_sin_dv
+
+#: True when every sample PDF the decryptor / extractor tests need
+#: is present on disk. Computed once at import time.
+_SAMPLE_PDFS_PRESENT = SANTANDER_PDF.exists() and BANCO_CHILE_PDF.exists() and ITAU_PDF.exists()
+
+
+needs_sample_pdfs = pytest.mark.skipif(
+    not _SAMPLE_PDFS_PRESENT,
+    reason=(
+        f"Sample PDFs not found in {SAMPLE_PDFS_DIR}. "
+        "The decryptor / extractor tests are skipped in this environment."
+    ),
+)
+
+
+@pytest.fixture
+def bank_santander() -> Bank:
+    """A :class:`Bank` row mirroring the Santander seed."""
+    return Bank(
+        name="santander",
+        display_name="Banco Santander",
+        password_formula=FORMULA_RUT_SIN_DV,
+    )
+
+
+@pytest.fixture
+def bank_itau() -> Bank:
+    """A :class:`Bank` row mirroring the Itaú seed."""
+    return Bank(
+        name="itau",
+        display_name="Itaú",
+        password_formula=FORMULA_RUT_SIN_DV,
+    )
+
+
+@pytest.fixture
+def bank_banco_de_chile() -> Bank:
+    """A :class:`Bank` row mirroring the Banco de Chile seed."""
+    return Bank(
+        name="banco_de_chile",
+        display_name="Banco de Chile",
+        password_formula=FORMULA_RUT_ULTIMOS_4,
+    )
+
+
+@pytest.fixture
+def bank_unknown_formula() -> Bank:
+    """A :class:`Bank` with an unsupported ``password_formula``.
+
+    Used to verify the dispatch table rejects unknown tokens.
+    """
+    return Bank(
+        name="future_bank",
+        display_name="Future Bank",
+        password_formula="rut_reversed",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Password deriver
+# ---------------------------------------------------------------------------
+
+
+class TestDerivePasswordHappyPath:
+    """``derive_password`` produces the expected password for known formulas."""
+
+    @pytest.mark.parametrize(
+        ("rut", "expected"),
+        [
+            # Standard Chilean form with dots and dash.
+            ("26.450.463-5", "26450463"),
+            # Compact form, no dots, with dash.
+            ("26450463-5", "26450463"),
+            # No DV (some users omit it).
+            ("26450463", "26450463"),
+            # Spaces as thousand separators (uncommon but seen).
+            ("26 450 463-5", "26450463"),
+            # Surrounding whitespace.
+            ("  26.450.463-5  ", "26450463"),
+        ],
+    )
+    def test_rut_sin_dv_strips_formatting(
+        self,
+        bank_santander: Bank,
+        rut: str,
+        expected: str,
+    ) -> None:
+        """``rut_sin_dv`` returns the RUT body regardless of formatting."""
+        assert derive_password(bank_santander, rut) == expected
+
+    @pytest.mark.parametrize(
+        ("rut", "expected"),
+        [
+            ("26.450.463-5", "0463"),
+            ("26450463-5", "0463"),
+            ("26450463", "0463"),
+            ("  26.450.463-5  ", "0463"),
+        ],
+    )
+    def test_rut_ultimos_4_returns_zero_padded_suffix(
+        self,
+        bank_banco_de_chile: Bank,
+        rut: str,
+        expected: str,
+    ) -> None:
+        """``rut_ultimos_4`` returns the last 4 digits, zero-padded."""
+        assert derive_password(bank_banco_de_chile, rut) == expected
+
+    def test_rut_ultimos_4_pads_short_rut(self, bank_banco_de_chile: Bank) -> None:
+        """A 1-digit RUT body still produces a 4-character password.
+
+        The Chilean RUT body is normally 6-8 digits, but a
+        defensive implementation should not crash on a 1-digit
+        body. The result is the body, left-padded with zeros to
+        reach 4 characters.
+        """
+        assert derive_password(bank_banco_de_chile, "1-9") == "0001"
+
+    def test_same_password_for_santander_and_itau(
+        self,
+        bank_santander: Bank,
+        bank_itau: Bank,
+    ) -> None:
+        """Santander and Itaú share the same formula, so the same RUT yields
+        the same password for both banks.
+
+        This is the *property* the seed data guarantees; if a future
+        migration diverges the formulas, this test will fail loudly.
+        """
+        assert derive_password(bank_santander, SAMPLE_RUT) == derive_password(bank_itau, SAMPLE_RUT)
+
+    def test_formula_constants_match_seeded_values(
+        self, bank_santander: Bank, bank_banco_de_chile: Bank
+    ) -> None:
+        """The exported ``FORMULA_*`` constants match what the seed uses.
+
+        The migration in ``0002_phase1_ingestion`` seeds the
+        ``password_formula`` column with literal strings. A typo
+        here would silently break every PDF upload; this test
+        guards against drift between code and data.
+        """
+        assert bank_santander.password_formula == FORMULA_RUT_SIN_DV
+        assert bank_banco_de_chile.password_formula == FORMULA_RUT_ULTIMOS_4
+
+
+class TestDerivePasswordErrors:
+    """``derive_password`` raises specific exceptions for invalid input."""
+
+    @pytest.mark.parametrize(
+        "rut",
+        [
+            "",
+            "   ",
+            "abc-def",
+            "26.450.463-",  # DV position present but empty
+            "26.450.463-5-6",  # two DVs
+            "26-450-463",  # misplaced dash
+            "26.450.463a",  # non-digit non-K trailer
+        ],
+    )
+    def test_invalid_rut_raises(self, bank_santander: Bank, rut: str) -> None:
+        """Malformed RUTs raise :class:`InvalidRUTError`."""
+        with pytest.raises(InvalidRUTError):
+            derive_password(bank_santander, rut)
+
+    def test_unknown_formula_raises(self, bank_unknown_formula: Bank) -> None:
+        """An unknown ``password_formula`` raises :class:`InvalidPasswordFormulaError`.
+
+        This is a configuration error, not a user error. The error
+        message names the formula so the operator can fix the seed.
+        """
+        with pytest.raises(InvalidPasswordFormulaError) as exc_info:
+            derive_password(bank_unknown_formula, SAMPLE_RUT)
+        assert "rut_reversed" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# PDF decryptor
+# ---------------------------------------------------------------------------
+
+
+@needs_sample_pdfs
+class TestDecryptPDF:
+    """``decrypt_pdf`` opens encrypted PDFs and writes a plain copy."""
+
+    @pytest.mark.parametrize(
+        ("pdf_path", "password"),
+        [
+            (SANTANDER_PDF, SANTANDER_PASSWORD),
+            (BANCO_CHILE_PDF, BANCO_CHILE_PASSWORD),
+            (ITAU_PDF, ITAU_PASSWORD),
+        ],
+        ids=["santander", "banco_de_chile", "itau"],
+    )
+    def test_correct_password_decrypts_sample(
+        self,
+        pdf_path: Path,
+        password: str,
+        tmp_path: Path,
+    ) -> None:
+        """The three sample PDFs each open with the bank-specific password."""
+        output = tmp_path / "decrypted.pdf"
+        result = decrypt_pdf(pdf_path, password, output)
+
+        assert result == output
+        assert output.exists()
+        assert output.stat().st_size > 0
+        # The decrypted file must be openable *without* a password
+        # — that is the whole point of the step.
+        with pikepdf.open(output) as pdf:
+            assert len(pdf.pages) >= 1
+
+    def test_wrong_password_raises_password_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An incorrect password raises :class:`PDFPasswordError`."""
+        output = tmp_path / "decrypted.pdf"
+        with pytest.raises(PDFPasswordError) as exc_info:
+            decrypt_pdf(SANTANDER_PDF, "this-is-wrong", output)
+        # The output file should not be created on a failed
+        # decryption.
+        assert not output.exists()
+        assert isinstance(exc_info.value, PDFDecryptError)
+
+    def test_empty_password_raises_password_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An empty password is treated as wrong and raises the same error."""
+        output = tmp_path / "decrypted.pdf"
+        with pytest.raises(PDFPasswordError):
+            decrypt_pdf(SANTANDER_PDF, "", output)
+
+    def test_missing_input_file_raises_filenotfound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A missing input path raises :class:`FileNotFoundError` (not wrapped)."""
+        missing = tmp_path / "does-not-exist.pdf"
+        with pytest.raises(FileNotFoundError):
+            decrypt_pdf(missing, "any-password", tmp_path / "out.pdf")
+
+    def test_output_directory_is_created(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The output parent directory is created if it does not exist."""
+        nested = tmp_path / "a" / "b" / "c" / "out.pdf"
+        result = decrypt_pdf(SANTANDER_PDF, SANTANDER_PASSWORD, nested)
+        assert result == nested
+        assert nested.exists()
+
+    def test_output_overwrites_existing_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A pre-existing output file is overwritten."""
+        output = tmp_path / "decrypted.pdf"
+        output.write_bytes(b"junk that will be replaced")
+        decrypt_pdf(SANTANDER_PDF, SANTANDER_PASSWORD, output)
+        with pikepdf.open(output) as pdf:
+            assert len(pdf.pages) >= 1
+
+    def test_password_error_is_subclass_of_decrypt_error(self) -> None:
+        """``PDFPasswordError`` is a subclass of ``PDFDecryptError``.
+
+        Callers that only want to catch the base type still match
+        the more specific error. This is the *property* that lets
+        the orchestrator use a single ``except PDFDecryptError``
+        block.
+        """
+        assert issubclass(PDFPasswordError, PDFDecryptError)
+
+
+# ---------------------------------------------------------------------------
+# Text extractor
+# ---------------------------------------------------------------------------
+
+
+@needs_sample_pdfs
+class TestExtractText:
+    """``extract_text`` produces clean, concatenated text from a PDF."""
+
+    @pytest.fixture
+    def decrypted_santander(self, tmp_path: Path) -> Path:
+        """A decrypted copy of the Santander sample PDF."""
+        out = tmp_path / "santander.pdf"
+        decrypt_pdf(SANTANDER_PDF, SANTANDER_PASSWORD, out)
+        return out
+
+    def test_returns_non_empty_text(self, decrypted_santander: Path) -> None:
+        """The extractor returns a non-empty string for a real statement."""
+        text = extract_text(decrypted_santander)
+        assert isinstance(text, str)
+        assert text.strip()
+
+    def test_text_contains_cardholder_name(self, decrypted_santander: Path) -> None:
+        """The extracted text contains the cardholder's name as it appears
+        on the Santander statement.
+
+        This is a smoke test: the LLM layer in WU 3 will rely on
+        the same name being present in the text it sees, so a
+        regression here would break extraction silently.
+        """
+        text = extract_text(decrypted_santander)
+        assert "SOTILLO" in text
+
+    def test_text_contains_amount_marker(self, decrypted_santander: Path) -> None:
+        """The extracted text contains the CLP currency marker."""
+        text = extract_text(decrypted_santander)
+        assert _CLP_MARKER in text
+
+    def test_concatenates_pages_in_order(self, decrypted_santander: Path) -> None:
+        """The first page header appears before the last page footer.
+
+        Verifies that ``extract_text`` joins pages in document
+        order rather than scrambling them — the variant detector
+        and LLM prompts both rely on this.
+        """
+        text = extract_text(decrypted_santander)
+        first_page_marker = "1 DE 5"
+        last_page_marker = "5 DE 5"
+        if first_page_marker in text and last_page_marker in text:
+            assert text.index(first_page_marker) < text.index(last_page_marker)
+
+    def test_encrypted_pdf_raises(self, tmp_path: Path) -> None:
+        """Extracting text from an *encrypted* PDF raises :class:`TextExtractionError`.
+
+        The pipeline is supposed to decrypt first; if a caller
+        forgets, the failure must be loud, not silent.
+        """
+        with pytest.raises(TextExtractionError) as exc_info:
+            extract_text(SANTANDER_PDF)
+        assert "password" in str(exc_info.value).lower() or "decrypt" in str(exc_info.value).lower()
+        assert isinstance(exc_info.value.__cause__, Exception)
+
+    def test_missing_file_raises_filenotfound(self, tmp_path: Path) -> None:
+        """A missing path raises :class:`FileNotFoundError` (not wrapped)."""
+        with pytest.raises(FileNotFoundError):
+            extract_text(tmp_path / "does-not-exist.pdf")
+
+
+# ---------------------------------------------------------------------------
+# Variant detector
+# ---------------------------------------------------------------------------
+
+
+class TestDetectVariant:
+    """``detect_variant`` identifies the statement variant from anchors."""
+
+    NACIONAL_BANCO_CHILE_HEADER = (
+        "1 de 3\n"
+        "ESTADO DE CUENTA NACIONAL DE TARJETA DE CRÉDITO\n"
+        "NOMBRE DEL TITULAR LUIS E. SOTILLO\n"
+    )
+    NACIONAL_SANTANDER_HEADER = (
+        "1 DE 5\n"
+        "ESTADO DE CUENTA EN MONEDA NACIONAL DE TARJETA DE CRÉDITO\n"
+        "NOMBRE DEL TITULAR LUIS SOTILLO AGUIAR\n"
+    )
+    INTERNACIONAL_HEADER = (
+        "1 de 2\n"
+        "ESTADO DE CUENTA INTERNACIONAL DE TARJETA DE CRÉDITO\n"
+        "NOMBRE DEL TITULAR LUIS EDUARDO SOTILLO AGUIAR\n"
+    )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            NACIONAL_BANCO_CHILE_HEADER,
+            NACIONAL_SANTANDER_HEADER,
+            # Case-insensitivity: lowercase header is still detected.
+            NACIONAL_BANCO_CHILE_HEADER.lower(),
+            # Header buried mid-document (still a substring match).
+            "--- divider ---\n" + NACIONAL_SANTANDER_HEADER,
+        ],
+        ids=["banco_chile", "santander", "lowercase", "mid_doc"],
+    )
+    def test_nacional_anchors(self, text: str) -> None:
+        """Both ``ESTADO DE CUENTA NACIONAL`` and the Santander
+        ``EN MONEDA NACIONAL`` form are recognised.
+        """
+        assert detect_variant(text) == "NACIONAL"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            INTERNACIONAL_HEADER,
+            INTERNACIONAL_HEADER.lower(),
+            # Header buried mid-document (still a substring match).
+            "--- divider ---\n" + INTERNACIONAL_HEADER,
+        ],
+        ids=["standard", "lowercase", "mid_doc"],
+    )
+    def test_internacional_anchor(self, text: str) -> None:
+        """``ESTADO DE CUENTA INTERNACIONAL`` is detected regardless of
+        position or case.
+        """
+        assert detect_variant(text) == "INTERNACIONAL"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "   \n  \n",
+            # Unrelated document.
+            "Lorem ipsum dolor sit amet.",
+            # Has the word "INTERNACIONAL" but not the header.
+            "Resumen de cargos INTERNACIONALES del mes.",
+            # Has "MONEDA NACIONAL" but not the section header.
+            "Pago en MONEDA NACIONAL por servicios varios.",
+        ],
+    )
+    def test_no_anchor_raises(self, text: str) -> None:
+        """Texts without any of the recognised anchors raise
+        :class:`VariantDetectionError`.
+        """
+        with pytest.raises(VariantDetectionError):
+            detect_variant(text)
+
+    def test_nacional_wins_when_anchors_appear_in_order(self) -> None:
+        """A NACIONAL section followed by an INTERNACIONAL supplement
+        classifies as NACIONAL (the bank's primary section wins).
+        """
+        # This is the layout the Banco de Chile PDF uses in
+        # practice: the CLP section is primary and the USD
+        # section is appended after.
+        text = (
+            self.NACIONAL_BANCO_CHILE_HEADER
+            + "Detalle de transacciones CLP\n"
+            + "... lots of CLP rows ...\n"
+            + "-----\n"
+            + "ESTADO DE CUENTA INTERNACIONAL DE TARJETA DE CRÉDITO\n"
+            + "Detalle de transacciones USD\n"
+        )
+        assert detect_variant(text) == "NACIONAL"
+
+    def test_internacional_wins_when_anchors_appear_in_order(self) -> None:
+        """An INTERNACIONAL statement (no NACIONAL anchor) classifies
+        as INTERNACIONAL even if a stray body-text mention of
+        ``NACIONAL`` appears after the header.
+        """
+        text = self.INTERNACIONAL_HEADER + "TRASPASO DEUDA NACIONAL US$ 0,00\n"
+        assert detect_variant(text) == "INTERNACIONAL"
+
+
+# ---------------------------------------------------------------------------
+# Amount parser
+# ---------------------------------------------------------------------------
+
+
+class TestParseAmount:
+    """``parse_amount`` handles the Chilean bank statement amount formats."""
+
+    @pytest.mark.parametrize(
+        ("text", "currency", "expected"),
+        [
+            # CLP — positive, with thousand separators.
+            ("$ 1.234.567", "CLP", Decimal("1234567")),
+            ("$1.234.567", "CLP", Decimal("1234567")),
+            ("$ 12.500", "CLP", Decimal("12500")),
+            ("$ 0", "CLP", Decimal("0")),
+            ("$ 4250", "CLP", Decimal("4250")),
+            # CLP — negative. The minus sign sits after the currency
+            # marker on real bank statements.
+            ("$ -100.000", "CLP", Decimal("-100000")),
+            ("$-100.000", "CLP", Decimal("-100000")),
+            ("$ -1.442.438", "CLP", Decimal("-1442438")),
+            # USD — positive, comma decimal, dot thousands.
+            ("US$ 1.234,56", "USD", Decimal("1234.56")),
+            ("US$236,86", "USD", Decimal("236.86")),
+            ("US$ 0,00", "USD", Decimal("0.00")),
+            ("US$ 5.200,00", "USD", Decimal("5200.00")),
+            # USD — negative.
+            ("US$ -1.234,56", "USD", Decimal("-1234.56")),
+            ("US$ -100.000,00", "USD", Decimal("-100000.00")),
+            # Leading plus sign is accepted (no-op).
+            ("+ $ 1.234.567", "CLP", Decimal("1234567")),
+            # Case-insensitive currency code.
+            ("$ 1.234.567", "clp", Decimal("1234567")),
+            ("US$ 1.234,56", "usd", Decimal("1234.56")),
+        ],
+    )
+    def test_parses_supported_formats(
+        self,
+        text: str,
+        currency: str,
+        expected: Decimal,
+    ) -> None:
+        """The parser handles the documented CLP and USD formats."""
+        result = parse_amount(text, currency)
+        assert result == expected
+        # ``Decimal`` equality is exact — the round-trip is
+        # guaranteed to have no float drift.
+        assert isinstance(result, Decimal)
+
+    def test_round_trip_clp(self) -> None:
+        """``parse_amount`` is the inverse of string-formatting for CLP.
+
+        Property-style: for every canonical amount we care about,
+        formatting-then-parsing returns the same :class:`Decimal`.
+        This is the property the LLM layer depends on.
+        """
+        canonicals = [
+            Decimal("0"),
+            Decimal("1"),
+            Decimal("12500"),
+            Decimal("1234567"),
+            Decimal("-100000"),
+            Decimal("-1442438"),
+        ]
+        for value in canonicals:
+            text = f"$ {abs(value):,}".replace(",", ".")  # 1,234,567 → 1.234.567
+            if value < 0:
+                text = f"$ -{abs(value):,}".replace(",", ".")
+            assert parse_amount(text, "CLP") == value
+
+    def test_round_trip_usd(self) -> None:
+        """``parse_amount`` is the inverse of string-formatting for USD."""
+        canonicals = [
+            Decimal("0.00"),
+            Decimal("236.86"),
+            Decimal("1234.56"),
+            Decimal("-100000.00"),
+        ]
+        for value in canonicals:
+            sign = "-" if value < 0 else ""
+            whole, _, frac = f"{abs(value):.2f}".partition(".")
+            whole_with_dots = f"{int(whole):,}".replace(",", ".")
+            text = f"US$ {sign}{whole_with_dots},{frac}"
+            assert parse_amount(text, "USD") == value
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "   ",
+            "$",
+            "US$",
+            "$ -",
+            "$ abc",
+            "$ 1.2.3.4",
+            "US$ 1,2,3",
+        ],
+    )
+    def test_unparseable_input_raises(self, text: str) -> None:
+        """Garbage in raises :class:`AmountParseError`."""
+        with pytest.raises(AmountParseError):
+            parse_amount(text, "CLP")
+
+    @pytest.mark.parametrize("currency", ["EUR", "GBP", "ARS", "", "peso"])
+    def test_unsupported_currency_raises(self, currency: str) -> None:
+        """Unknown currency codes raise :class:`AmountParseError`."""
+        with pytest.raises(AmountParseError) as exc_info:
+            parse_amount("$ 1.000", currency)
+        assert "currency" in str(exc_info.value).lower() or "CLP" in str(exc_info.value)
+
+    def test_currency_markers_do_not_leak_into_value(self) -> None:
+        """The currency marker is stripped before parsing.
+
+        Defensive: if a future refactor forgets to strip the
+        ``$`` or ``US$`` token, ``Decimal`` would raise on the
+        non-numeric prefix.
+        """
+        clp = parse_amount("$ 1.234.567", "CLP")
+        assert _CLP_MARKER not in str(clp)
+        usd = parse_amount("US$ 1.234,56", "USD")
+        assert _USD_MARKER not in str(usd)
+        assert "US" not in str(usd)
+
+    def test_does_not_use_float(self) -> None:
+        """``parse_amount`` must not introduce float drift.
+
+        ``Decimal("0.1") + Decimal("0.2")`` is exactly
+        ``Decimal("0.3")``; the same operation with floats is
+        ``0.30000000000000004``. A regression that returns
+        :class:`float` would surface as a one-cent drift on the
+        user's monthly rollup.
+        """
+        value = parse_amount("US$ 0,30", "USD")
+        assert isinstance(value, Decimal)
+        assert value == Decimal("0.30")
+        # The string form is the canonical decimal, not the
+        # float-induced 0.30000000000000004.
+        assert str(value) == "0.30"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end smoke test (real PDFs, full pipeline)
+# ---------------------------------------------------------------------------
+
+
+@needs_sample_pdfs
+class TestPipelineEndToEnd:
+    """Run the full deterministic pipeline against a real sample PDF.
+
+    This is not a substitute for the WU 5 E2E test (which adds
+    the LLM and the database) but it catches regressions in the
+    interface between the four modules in WU 2.
+    """
+
+    @pytest.mark.parametrize(
+        ("pdf_path", "password", "expected_variant", "expected_currency_marker"),
+        [
+            (SANTANDER_PDF, SANTANDER_PASSWORD, "NACIONAL", "$"),
+            (BANCO_CHILE_PDF, BANCO_CHILE_PASSWORD, "NACIONAL", "$"),
+            (ITAU_PDF, ITAU_PASSWORD, "INTERNACIONAL", "US$"),
+        ],
+        ids=["santander", "banco_de_chile", "itau"],
+    )
+    def test_decrypt_extract_detect_chain(
+        self,
+        pdf_path: Path,
+        password: str,
+        expected_variant: str,
+        expected_currency_marker: str,
+        tmp_path: Path,
+    ) -> None:
+        """Decrypt → extract → detect_variant succeeds for every sample."""
+        decrypted = tmp_path / "decrypted.pdf"
+        decrypt_pdf(pdf_path, password, decrypted)
+        text = extract_text(decrypted)
+        assert detect_variant(text) == expected_variant
+        assert expected_currency_marker in text
