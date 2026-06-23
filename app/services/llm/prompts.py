@@ -95,6 +95,14 @@ _NACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
                 "installment_value": "$ 89.900",
             },
         ],
+        "metadata": {
+            "card_number_masked": "XXXX XXXX XXXX 0951",
+            "cardholder": "LUIS SOTILLO AGUIAR",
+            "currency": "CLP",
+            "period_start": "01/05/2025",
+            "period_end": "31/05/2025",
+            "statement_date": "05/06/2025",
+        },
         "confidence": 0.96,
         "notes": "3 transactions, all in CLP.",
     },
@@ -142,6 +150,14 @@ _INTERNACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
                 "installment_value": None,
             },
         ],
+        "metadata": {
+            "card_number_masked": "XXXX XXXX XXXX 0951",
+            "cardholder": "LUIS SOTILLO AGUIAR",
+            "currency": "USD",
+            "period_start": "01/05/2025",
+            "period_end": "31/05/2025",
+            "statement_date": "05/06/2025",
+        },
         "confidence": 0.94,
         "notes": "3 transactions, all in USD.",
     },
@@ -190,8 +206,17 @@ copy the amount into ``installment_value``. Otherwise leave them null.
 5. Suggest a short category for each transaction (e.g. "Groceries", \
 "Transport", "Restaurants", "Shopping", "Subscriptions", "Travel"). \
 Use null if unsure.
-6. Estimate a ``confidence`` score between 0 and 1 for the whole extraction.
-7. Add optional ``notes`` summarising the call (e.g. "12 transactions, \
+6. Extract the statement header fields into the ``metadata`` object:
+   * ``card_number_masked`` — the masked PAN as printed on every \
+page (e.g. "XXXX XXXX XXXX 0951").
+   * ``cardholder`` — the printed cardholder name in uppercase \
+(e.g. "LUIS SOTILLO AGUIAR").
+   * ``currency`` — "CLP" for this NACIONAL section.
+   * ``period_start`` / ``period_end`` — the billing period in \
+DD/MM/YYYY (use DD/MM/YY if the statement omits the century).
+   * ``statement_date`` — the emission date in DD/MM/YYYY.
+7. Estimate a ``confidence`` score between 0 and 1 for the whole extraction.
+8. Add optional ``notes`` summarising the call (e.g. "12 transactions, \
 one installment plan detected").
 
 OUTPUT FORMAT
@@ -248,8 +273,17 @@ Do not normalise.
 copy the amount into ``installment_value``. Otherwise leave them null.
 5. Suggest a short category for each transaction (e.g. "Subscriptions", \
 "Travel", "Restaurants", "Shopping", "Transport"). Use null if unsure.
-6. Estimate a ``confidence`` score between 0 and 1 for the whole extraction.
-7. Add optional ``notes`` summarising the call (e.g. "5 transactions, \
+6. Extract the statement header fields into the ``metadata`` object:
+   * ``card_number_masked`` — the masked PAN as printed on every \
+page (e.g. "XXXX XXXX XXXX 0951").
+   * ``cardholder`` — the printed cardholder name in uppercase \
+(e.g. "LUIS SOTILLO AGUIAR").
+   * ``currency`` — "USD" for this INTERNACIONAL section.
+   * ``period_start`` / ``period_end`` — the billing period in \
+DD/MM/YYYY (use DD/MM/YY if the statement omits the century).
+   * ``statement_date`` — the emission date in DD/MM/YYYY.
+7. Estimate a ``confidence`` score between 0 and 1 for the whole extraction.
+8. Add optional ``notes`` summarising the call (e.g. "5 transactions, \
 all in USD, no installments detected").
 
 OUTPUT FORMAT
@@ -323,6 +357,14 @@ def _schema_json() -> str:
                 "installment_value": "string or null",
             }
         ],
+        "metadata": {
+            "card_number_masked": "string (e.g. 'XXXX XXXX XXXX 0951')",
+            "cardholder": "string (e.g. 'LUIS SOTILLO AGUIAR')",
+            "currency": "CLP or USD",
+            "period_start": "DD/MM/YYYY",
+            "period_end": "DD/MM/YYYY",
+            "statement_date": "DD/MM/YYYY",
+        },
         "confidence": "float between 0 and 1",
         "notes": "string or null",
     }

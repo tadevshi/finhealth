@@ -45,12 +45,12 @@ TRANSACTIONS_PATH = "/transactions"
 ROWS_PATH = "/transactions/rows"
 
 # Form-field test ids — pin the contract so the test catches a
-# template rename.
+# template rename. The card number, cardholder, and currency
+# are no longer in the form: they are read off the PDF by the
+# LLM. The form only ships the bank dropdown, the RUT
+# input, and the file picker.
 BANK_SELECT_TESTID = 'data-testid="bank-select"'
 RUT_INPUT_TESTID = 'data-testid="rut-input"'
-CARD_INPUT_TESTID = 'data-testid="card-input"'
-CARDHOLDER_TESTID = 'data-testid="cardholder-input"'
-CURRENCY_TESTID = 'data-testid="currency-select"'
 SUBMIT_TESTID = 'data-testid="upload-submit"'
 FILE_INPUT_TESTID = 'data-testid="file-input"'
 FILE_NAME_TESTID = 'data-testid="file-name"'
@@ -236,27 +236,34 @@ async def test_upload_page_extends_base_layout(client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_upload_page_has_required_form_fields(client: AsyncClient) -> None:
-    """Every form field and the submit button are present with their testids."""
+    """Every form field and the submit button are present with their testids.
+
+    Card number, cardholder, and currency are no longer in
+    the form: the LLM reads them off the PDF. The form ships
+    only the bank dropdown, the RUT input, and the file
+    picker.
+    """
     body = (await client.get(UPLOAD_PATH)).text
 
     assert BANK_SELECT_TESTID in body
     assert RUT_INPUT_TESTID in body
-    assert CARD_INPUT_TESTID in body
-    assert CARDHOLDER_TESTID in body
-    assert CURRENCY_TESTID in body
     assert SUBMIT_TESTID in body
     assert FILE_INPUT_TESTID in body
     assert FILE_NAME_TESTID in body
 
 
 @pytest.mark.asyncio
-async def test_upload_page_has_currency_options(
-    client: AsyncClient, seeded_banks: list[Bank]
-) -> None:
-    """The currency selector includes both CLP and USD."""
+async def test_upload_page_omits_removed_form_fields(client: AsyncClient) -> None:
+    """Card number, cardholder, and currency are no longer in the form.
+
+    Regression guard: a refactor that accidentally re-adds
+    them would break the UX goal of having the LLM populate
+    those fields.
+    """
     body = (await client.get(UPLOAD_PATH)).text
-    assert 'value="CLP"' in body
-    assert 'value="USD"' in body
+    assert 'name="card_number_masked"' not in body
+    assert 'name="cardholder"' not in body
+    assert 'name="currency"' not in body
 
 
 @pytest.mark.asyncio

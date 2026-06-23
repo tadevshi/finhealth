@@ -141,6 +141,14 @@ CANNED_NACIONAL_EXTRACTION: dict[str, object] = {
             "installment_value": "$ 89.900",
         },
     ],
+    "metadata": {
+        "card_number_masked": "XXXX XXXX XXXX 0463",
+        "cardholder": "LUIS SOTILLO",
+        "currency": "CLP",
+        "period_start": "01/04/2026",
+        "period_end": "30/04/2026",
+        "statement_date": "22/04/2026",
+    },
     "confidence": 0.95,
     "notes": "E2E test canned response.",
 }
@@ -276,9 +284,6 @@ async def test_upload_real_pdf_creates_completed_statement(
             data = {
                 "bank_name": "santander",
                 "rut": TEST_RUT,
-                "card_number_masked": "XXXX XXXX XXXX 0463",
-                "cardholder": "LUIS SOTILLO",
-                "currency": "CLP",
             }
             response = await client.post("/api/v1/statements/upload", files=files, data=data)
     finally:
@@ -358,17 +363,19 @@ async def test_upload_real_pdf_creates_completed_statement(
 
 @needs_sample_pdf
 @pytest.mark.asyncio
-async def test_wrong_rut_marks_statement_failed_and_returns_422(
+async def test_wrong_rut_returns_422_without_statement(
     test_settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
     upload_dir: Path,
 ) -> None:
-    """A wrong RUT decrypt fails → statement FAILED → endpoint returns 422.
+    """A wrong RUT decrypt fails → endpoint returns 422 with no statement row.
 
     The E2E test confirms the failure mode is observable: a bad
     RUT (which yields a wrong PDF password) makes the pipeline
-    fail, the statement is persisted as failed, and the upload
-    endpoint returns 422 with a useful error message.
+    fail and the upload endpoint returns 422 with a useful
+    error message. No statement row is created — pre-LLM
+    errors are fast-fail so the user can retry with a
+    corrected RUT without leaving a partial artifact behind.
     """
     from app.services.llm.schemas import ExtractionResponse
 
@@ -391,9 +398,6 @@ async def test_wrong_rut_marks_statement_failed_and_returns_422(
             data = {
                 "bank_name": "santander",
                 "rut": "11.111.111-1",  # wrong RUT → wrong password
-                "card_number_masked": "XXXX XXXX XXXX 0463",
-                "cardholder": "LUIS SOTILLO",
-                "currency": "CLP",
             }
             response = await client.post("/api/v1/statements/upload", files=files, data=data)
     finally:
@@ -404,13 +408,11 @@ async def test_wrong_rut_marks_statement_failed_and_returns_422(
     detail = response.json()["detail"]
     assert "password" in detail.lower()
 
-    # The statement row is persisted as FAILED with the error stored
+    # No statement row was created — pre-LLM errors are fast-fail
     async with session_factory() as session:
         result = await session.execute(select(Statement))
         statements = list(result.scalars().all())
-        assert len(statements) == 1
-        assert statements[0].status == StatementStatus.FAILED
-        assert "PDFPasswordError" in (statements[0].error_message or "")
+        assert len(statements) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -446,9 +448,6 @@ async def test_duplicate_upload_does_not_create_extra_transactions(
             data = {
                 "bank_name": "santander",
                 "rut": TEST_RUT,
-                "card_number_masked": "XXXX XXXX XXXX 0463",
-                "cardholder": "LUIS SOTILLO",
-                "currency": "CLP",
             }
             first = await client.post("/api/v1/statements/upload", files=files, data=data)
             second = await client.post("/api/v1/statements/upload", files=files, data=data)
@@ -514,9 +513,6 @@ async def test_patch_category_persists(
             data = {
                 "bank_name": "santander",
                 "rut": TEST_RUT,
-                "card_number_masked": "XXXX XXXX XXXX 0463",
-                "cardholder": "LUIS SOTILLO",
-                "currency": "CLP",
             }
             upload_resp = await client.post("/api/v1/statements/upload", files=files, data=data)
             assert upload_resp.status_code == 201

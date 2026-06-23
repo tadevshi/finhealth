@@ -28,11 +28,12 @@ round-trips are exercised separately by :mod:`tests.test_alembic`.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,11 @@ NACIONAL_EXTRACTION_PAYLOAD: dict[str, Any] = {
             "installment_value": "$ 89.900",
         },
     ],
+    "metadata": {
+        "period_start": "15/05/2025",
+        "period_end": "22/05/2025",
+        "statement_date": "01/06/2025",
+    },
     "confidence": 0.95,
     "notes": "3 transactions, one installment plan.",
 }
@@ -205,6 +211,11 @@ INTERNACIONAL_EXTRACTION_PAYLOAD: dict[str, Any] = {
             "installment_value": None,
         },
     ],
+    "metadata": {
+        "period_start": "03/05/2025",
+        "period_end": "18/05/2025",
+        "statement_date": "01/06/2025",
+    },
     "confidence": 0.92,
     "notes": "2 transactions, all USD.",
 }
@@ -386,9 +397,6 @@ class TestIngestStatementHappyPath:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         # Status and persisted state
@@ -420,9 +428,6 @@ class TestIngestStatementHappyPath:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         paris = next(t for t in statement.transactions if "PARIS" in t.description)
@@ -442,9 +447,6 @@ class TestIngestStatementHappyPath:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         by_desc = {t.description: t.amount for t in statement.transactions}
@@ -466,9 +468,6 @@ class TestIngestStatementHappyPath:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         lider = next(t for t in statement.transactions if "LIDER" in t.description)
@@ -478,31 +477,30 @@ class TestIngestStatementHappyPath:
         assert lider.raw_json["amount"] == "$ 12.450"
 
     @pytest.mark.asyncio
-    async def test_period_dates_default_to_current_month(
+    async def test_period_dates_come_from_llm_metadata(
         self,
         make_ingestion_service: Any,
     ) -> None:
-        """Default period covers the current month (start=1st, end=last day)."""
+        """The statement period and emission date come from the LLM metadata.
+
+        The orchestrator used to default the period to the
+        current calendar month. With the metadata extracted
+        from the PDF, the statement dates match the LLM's
+        output (15/05/2025 → 22/05/2025, emission 01/06/2025
+        in the canonical payload). This is the whole point of
+        the metadata extraction.
+        """
         llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
         async with make_ingestion_service(llm) as service:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
-        today = date.today()
-        assert statement.period_start == today.replace(day=1)
-        # Last day of the current month
-        if today.month == 12:
-            expected_end = today.replace(month=12, day=31)
-        else:
-            expected_end = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
-        assert statement.period_end == expected_end
-        assert statement.statement_date == today
+        assert statement.period_start == date(2025, 5, 15)
+        assert statement.period_end == date(2025, 5, 22)
+        assert statement.statement_date == date(2025, 6, 1)
 
     @pytest.mark.asyncio
     async def test_creates_new_credit_card_on_first_use(
@@ -517,14 +515,87 @@ class TestIngestStatementHappyPath:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         async with session_factory() as session:
             count = (await session.execute(text("SELECT COUNT(*) FROM credit_cards"))).scalar_one()
             assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_credit_card_populated_from_llm_metadata(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The :class:`CreditCard` row is built from the LLM's metadata block.
+
+        The user no longer types card_number_masked, cardholder,
+        or currency. The orchestrator reads them off the LLM
+        response and creates (or finds) the matching
+        :class:`CreditCard`.
+        """
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        # The credit card is populated from the LLM metadata,
+        # not from the now-removed user inputs.
+        assert statement.credit_card.card_number_masked == "XXXX XXXX XXXX 0463"
+        assert statement.credit_card.cardholder == "LUIS SOTILLO"
+        assert statement.credit_card.currency == "CLP"
+
+    @pytest.mark.asyncio
+    async def test_rejects_metadata_currency_mismatch(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A NACIONAL statement with USD metadata is rejected.
+
+        The LLM can read the variant directly from the text,
+        but the metadata currency must still match. A
+        mismatch is a strong signal that the LLM
+        hallucinated, so the orchestrator fails fast.
+        """
+        bad_payload = {
+            "transactions": [
+                {
+                    "date": "15/05/25",
+                    "description": "SUPERMERCADOS LIDER",
+                    "amount": "$ 12.450",
+                    "currency": "CLP",
+                    "category": "Groceries",
+                }
+            ],
+            "metadata": {
+                "card_number_masked": "XXXX XXXX XXXX 0463",
+                "cardholder": "LUIS SOTILLO",
+                "currency": "USD",  # wrong for a NACIONAL statement
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "01/06/2025",
+            },
+            "confidence": 0.5,
+            "notes": None,
+        }
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(bad_payload))
+        async with make_ingestion_service(llm) as service:
+            with pytest.raises(IngestionError, match="metadata currency"):
+                await service.ingest_statement(
+                    file_path=SANTANDER_PDF,
+                    bank_name="santander",
+                    rut=TEST_RUT,
+                )
+
+        # No statement was created — a metadata mismatch is
+        # a pre-transaction failure.
+        async with session_factory() as session:
+            count = (await session.execute(text("SELECT COUNT(*) FROM statements"))).scalar_one()
+            assert count == 0
 
     @pytest.mark.asyncio
     async def test_reuses_existing_credit_card(
@@ -542,9 +613,6 @@ class TestIngestStatementHappyPath:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         # Second upload: copy the PDF so the hash differs but the
@@ -563,9 +631,6 @@ class TestIngestStatementHappyPath:
                     file_path=second_pdf,
                     bank_name="santander",
                     rut=TEST_RUT,
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
             assert statement2.status == StatementStatus.COMPLETED
         finally:
@@ -600,9 +665,6 @@ class TestIngestStatementIdempotency:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         llm2 = FakeLLMClient(
@@ -613,9 +675,6 @@ class TestIngestStatementIdempotency:
                 file_path=SANTANDER_PDF,
                 bank_name="santander",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="CLP",
             )
 
         assert second.id == first.id
@@ -636,7 +695,19 @@ class TestIngestStatementIdempotency:
 @needs_sample_pdfs
 @needs_test_rut
 class TestIngestStatementErrors:
-    """Failure modes mark the statement as FAILED and surface the cause."""
+    """Failure modes surface the cause on the raised exception.
+
+    Pre-LLM errors (bad bank, bad RUT, wrong PDF password,
+    text-extraction failure, variant detection failure) fail
+    fast and never create a statement row. The orchestrator
+    raises :class:`IngestionError` (or a typed subclass) and
+    the HTTP layer maps it to a 422.
+
+    Per-transaction errors (an LLM-emitted amount that cannot
+    be parsed, or a wrong currency) happen *after* the
+    statement is created and are recorded as a FAILED row —
+    see :class:`TestIngestStatementAmountErrors` below.
+    """
 
     @pytest.mark.asyncio
     async def test_unknown_bank_raises(
@@ -651,9 +722,6 @@ class TestIngestStatementErrors:
                     file_path=SANTANDER_PDF,
                     bank_name="not_a_real_bank",
                     rut=TEST_RUT,
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
 
     @pytest.mark.asyncio
@@ -677,19 +745,22 @@ class TestIngestStatementErrors:
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
                     rut="not-a-rut",
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
         assert isinstance(exc_info.value.__cause__, InvalidRUTError)
 
     @pytest.mark.asyncio
-    async def test_wrong_password_creates_failed_statement(
+    async def test_wrong_password_returns_422(
         self,
         make_ingestion_service: Any,
         session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        """A wrong PDF password sets the statement to FAILED with a stored error."""
+        """A wrong PDF password surfaces as :class:`IngestionError` and creates no row.
+
+        Pre-LLM errors do not leave a statement behind — the
+        upload can be retried with a corrected RUT and the
+        same file. The HTTP layer maps the
+        :class:`IngestionError` to a 422.
+        """
         from app.services.pdf import PDFPasswordError
 
         llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
@@ -700,34 +771,33 @@ class TestIngestStatementErrors:
                     bank_name="santander",
                     # Wrong RUT → wrong password → decrypt fails
                     rut="11.111.111-1",
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
         # The underlying cause is the typed PDF error
         assert isinstance(exc_info.value.__cause__, PDFPasswordError)
 
-        # The statement row exists, marked FAILED, with the error stored
+        # No statement row was created — a pre-LLM error is
+        # always a fast-fail.
         async with session_factory() as session:
-            result = await session.execute(text("SELECT status, error_message FROM statements"))
-            row = result.first()
-            assert row is not None
-            assert row[0] == "failed"
-            assert row[1] is not None
-            assert "PDFPasswordError" in row[1]
+            count = (await session.execute(text("SELECT COUNT(*) FROM statements"))).scalar_one()
+            assert count == 0
 
     @pytest.mark.asyncio
-    async def test_llm_failure_creates_failed_statement(
+    async def test_llm_failure_returns_422(
         self,
         make_ingestion_service: Any,
         session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        """An :class:`LLMExtractionError` from the LLM is caught and persisted.
+        """An :class:`LLMExtractionError` from the LLM surfaces as :class:`IngestionError`.
 
         The LLM error is wrapped in :class:`IngestionError` so the
         HTTP layer can map it to a 422. The original LLM
         exception is preserved on ``__cause__`` for log
         inspection.
+
+        Pre-LLM errors do not leave a statement behind — only
+        per-transaction errors (covered by the next test class)
+        create a FAILED row, because the statement must exist
+        to attach transactions to.
         """
         from app.services.llm.schemas import LLMExtractionError
 
@@ -741,22 +811,14 @@ class TestIngestStatementErrors:
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
                     rut=TEST_RUT,
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
         # The LLM error is the cause of the typed IngestionError
         assert isinstance(exc_info.value.__cause__, LLMExtractionError)
         assert "LLM timed out" in str(exc_info.value.__cause__)
 
         async with session_factory() as session:
-            row = (
-                await session.execute(text("SELECT status, error_message FROM statements"))
-            ).first()
-            assert row is not None
-            assert row[0] == "failed"
-            assert "LLMExtractionError" in row[1]
-            assert "LLM timed out" in row[1]
+            count = (await session.execute(text("SELECT COUNT(*) FROM statements"))).scalar_one()
+            assert count == 0
 
     @pytest.mark.asyncio
     async def test_amount_parse_error_creates_failed_statement(
@@ -764,7 +826,13 @@ class TestIngestStatementErrors:
         make_ingestion_service: Any,
         session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
-        """An unparseable amount in the LLM response marks the statement FAILED."""
+        """An unparseable amount in the LLM response marks the statement FAILED.
+
+        Per-transaction errors happen *after* the statement
+        row is created (so it can carry the transactions), so
+        they are recorded on the row as FAILED with the
+        error_message set.
+        """
         bad_payload = {
             "transactions": [
                 {
@@ -776,6 +844,14 @@ class TestIngestStatementErrors:
                     "category": None,
                 }
             ],
+            "metadata": {
+                "card_number_masked": "XXXX XXXX XXXX 0463",
+                "cardholder": "LUIS SOTILLO",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "01/06/2025",
+            },
             "confidence": 0.5,
             "notes": None,
         }
@@ -786,9 +862,6 @@ class TestIngestStatementErrors:
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
                     rut=TEST_RUT,
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
 
         async with session_factory() as session:
@@ -812,6 +885,14 @@ class TestIngestStatementErrors:
                     "category": None,
                 }
             ],
+            "metadata": {
+                "card_number_masked": "XXXX XXXX XXXX 0463",
+                "cardholder": "LUIS SOTILLO",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "01/06/2025",
+            },
             "confidence": 0.5,
             "notes": None,
         }
@@ -822,9 +903,6 @@ class TestIngestStatementErrors:
                     file_path=SANTANDER_PDF,
                     bank_name="santander",
                     rut=TEST_RUT,
-                    card_number_masked="XXXX XXXX XXXX 0463",
-                    cardholder="LUIS SOTILLO",
-                    currency="CLP",
                 )
 
 
@@ -852,9 +930,6 @@ class TestIngestStatementInternacional:
                 file_path=ITAU_PDF,
                 bank_name="itau",
                 rut=TEST_RUT,
-                card_number_masked="XXXX XXXX XXXX 0463",
-                cardholder="LUIS SOTILLO",
-                currency="USD",
             )
 
         assert statement.status == StatementStatus.COMPLETED
@@ -927,9 +1002,6 @@ class TestUploadEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 response = await client.post("/api/v1/statements/upload", files=files, data=data)
         finally:
@@ -975,9 +1047,6 @@ class TestUploadEndpoint:
                 data = {
                     "bank_name": "itau",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "USD",
                 }
                 response = await client.post("/api/v1/statements/upload", files=files, data=data)
         finally:
@@ -1015,9 +1084,6 @@ class TestUploadEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 response = await client.post("/api/v1/statements/upload", files=files, data=data)
         finally:
@@ -1064,9 +1130,6 @@ class TestUploadEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 response = await client.post("/api/v1/statements/upload", files=files, data=data)
         finally:
@@ -1103,9 +1166,6 @@ class TestUploadEndpoint:
                 data = {
                     "bank_name": "unknown_bank",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 response = await client.post("/api/v1/statements/upload", files=files, data=data)
         finally:
@@ -1146,9 +1206,6 @@ class TestUploadEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 response = await client.post("/api/v1/statements/upload", files=files, data=data)
         finally:
@@ -1207,9 +1264,6 @@ class TestGetStatementEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 upload_resp = await client.post("/api/v1/statements/upload", files=files, data=data)
                 assert upload_resp.status_code == 201
@@ -1287,9 +1341,6 @@ class TestListTransactionsEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 resp = await client.post("/api/v1/statements/upload", files=files, data=data)
                 assert resp.status_code == 201
@@ -1501,9 +1552,6 @@ class TestUpdateTransactionEndpoint:
                 data = {
                     "bank_name": "santander",
                     "rut": TEST_RUT,
-                    "card_number_masked": "XXXX XXXX XXXX 0463",
-                    "cardholder": "LUIS SOTILLO",
-                    "currency": "CLP",
                 }
                 upload = await client.post("/api/v1/statements/upload", files=files, data=data)
                 assert upload.status_code == 201
@@ -1719,3 +1767,384 @@ def test_module_sanity() -> None:
     assert IngestionService is not None
     assert IngestionError is not None
     assert BankNotFoundError is not None
+
+
+# ---------------------------------------------------------------------------
+# _validate_metadata — unit tests that do not need a real PDF
+# ---------------------------------------------------------------------------
+
+
+class TestValidateMetadata:
+    """``IngestionService._validate_metadata`` is a pure function on the LLM response.
+
+    Split out from :meth:`ingest_statement` so the
+    validation logic can be exercised without the full PDF
+    pipeline. The method must reject unsupported currencies,
+    variant/currency mismatches, and unparseable dates.
+    """
+
+    def _build_extraction(
+        self,
+        *,
+        currency: str = "CLP",
+        period_start: str = "01/05/2025",
+        period_end: str = "31/05/2025",
+        statement_date: str = "05/06/2025",
+    ) -> ExtractionResponse:
+        """Build a minimal :class:`ExtractionResponse` for validation tests."""
+        return ExtractionResponse(
+            transactions=[],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": currency,
+                "period_start": period_start,
+                "period_end": period_end,
+                "statement_date": statement_date,
+            },
+            confidence=0.5,
+            notes=None,
+        )
+
+    def test_nacional_with_clp_metadata_succeeds(self) -> None:
+        """A NACIONAL variant with CLP metadata returns the expected tuple."""
+        from app.services.ingestion import IngestionService
+
+        result = IngestionService._validate_metadata(
+            extraction=self._build_extraction(), variant="NACIONAL"
+        )
+        expected_currency, period_start, period_end, statement_date = result
+        assert expected_currency == "CLP"
+        assert period_start == date(2025, 5, 1)
+        assert period_end == date(2025, 5, 31)
+        assert statement_date == date(2025, 6, 5)
+
+    def test_internacional_with_usd_metadata_succeeds(self) -> None:
+        """An INTERNACIONAL variant with USD metadata returns the expected tuple."""
+        from app.services.ingestion import IngestionService
+
+        result = IngestionService._validate_metadata(
+            extraction=self._build_extraction(currency="USD"), variant="INTERNACIONAL"
+        )
+        expected_currency, _ps, _pe, _sd = result
+        assert expected_currency == "USD"
+
+    def test_currency_mismatch_raises(self) -> None:
+        """A NACIONAL variant with USD metadata is rejected."""
+        from app.services.ingestion import IngestionService
+
+        with pytest.raises(IngestionError, match="metadata currency"):
+            IngestionService._validate_metadata(
+                extraction=self._build_extraction(currency="USD"), variant="NACIONAL"
+            )
+
+    def test_unsupported_currency_raises(self) -> None:
+        """A non-CLP/USD metadata currency is rejected."""
+        from app.services.ingestion import IngestionService
+
+        with pytest.raises(IngestionError, match="unsupported"):
+            IngestionService._validate_metadata(
+                extraction=self._build_extraction(currency="EUR"), variant="NACIONAL"
+            )
+
+    def test_unparseable_period_start_raises(self) -> None:
+        """An unparseable period_start date is rejected."""
+        from app.services.ingestion import IngestionService
+
+        with pytest.raises(IngestionError, match="unparseable"):
+            IngestionService._validate_metadata(
+                extraction=self._build_extraction(period_start="not-a-date"),
+                variant="NACIONAL",
+            )
+
+    def test_two_digit_year_is_expanded(self) -> None:
+        """A ``DD/MM/YY`` date is accepted and expanded to four-digit year."""
+        from app.services.ingestion import IngestionService
+
+        result = IngestionService._validate_metadata(
+            extraction=self._build_extraction(period_start="15/05/25"),
+            variant="NACIONAL",
+        )
+        _expected, period_start, _pe, _sd = result
+        assert period_start == date(2025, 5, 15)
+
+    def test_non_extraction_response_raises(self) -> None:
+        """Passing anything other than :class:`ExtractionResponse` raises."""
+        from app.services.ingestion import IngestionService
+
+        with pytest.raises(IngestionError, match="ExtractionResponse"):
+            IngestionService._validate_metadata(extraction="not a model", variant="NACIONAL")
+
+
+# ---------------------------------------------------------------------------
+# _build_transactions — unit tests for per-row validation
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTransactions:
+    """``IngestionService._build_transactions`` runs without a database or LLM.
+
+    The method takes a fully-populated
+    :class:`ExtractionResponse` and produces ready-to-add
+    :class:`Transaction` rows. It must validate amounts,
+    dates, and currency cross-checks.
+    """
+
+    def test_builds_one_transaction_per_llm_row(self) -> None:
+        """Each LLM-emitted transaction becomes one :class:`Transaction` row."""
+        from app.models.statement import Statement
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "X",
+                    "amount": "$ 12.450",
+                    "currency": "CLP",
+                    "category": "Groceries",
+                },
+                {
+                    "date": "22/05/25",
+                    "description": "Y",
+                    "amount": "$ 35.000",
+                    "currency": "CLP",
+                    "category": "Transport",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        # A stand-in statement: the model only reads ``.id``
+        # from this object, so a SimpleNamespace is enough.
+        from types import SimpleNamespace
+
+        statement = SimpleNamespace(id=uuid.uuid4())
+        # The real method is unbound, so we call it as a static-ish helper.
+        from app.services.ingestion import IngestionService as _Svc
+
+        transactions = _Svc._build_transactions(
+            self=_Svc.__new__(_Svc),
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        assert len(transactions) == 2
+        assert all(isinstance(t, Statement.__class__) for t in transactions) or all(
+            isinstance(t, type(transactions[0])) for t in transactions
+        )
+        assert transactions[0].description == "X"
+        assert transactions[0].amount == Decimal("12450")
+        assert transactions[1].amount == Decimal("35000")
+
+    def test_currency_mismatch_raises(self) -> None:
+        """A transaction whose currency does not match the variant raises."""
+        from types import SimpleNamespace
+
+        from app.services.ingestion import IngestionService as _Svc
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "X",
+                    "amount": "US$ 9,99",
+                    "currency": "USD",  # wrong for NACIONAL
+                    "category": None,
+                }
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        with pytest.raises(IngestionError, match="currency"):
+            _Svc._build_transactions(
+                self=_Svc.__new__(_Svc),
+                statement=statement,
+                extraction=extraction,
+                expected_currency="CLP",
+            )
+
+    def test_bad_amount_raises(self) -> None:
+        """An unparseable amount string raises an :class:`IngestionError`."""
+        from types import SimpleNamespace
+
+        from app.services.ingestion import IngestionService as _Svc
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "X",
+                    "amount": "garbage",
+                    "currency": "CLP",
+                    "category": None,
+                }
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        with pytest.raises(IngestionError):
+            _Svc._build_transactions(
+                self=_Svc.__new__(_Svc),
+                statement=statement,
+                extraction=extraction,
+                expected_currency="CLP",
+            )
+
+    def test_installment_value_is_parsed(self) -> None:
+        """An installment value string is coerced to :class:`Decimal`."""
+        from types import SimpleNamespace
+
+        from app.services.ingestion import IngestionService as _Svc
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "01/06/25",
+                    "description": "PARIS 03/06",
+                    "amount": "$ 89.900",
+                    "currency": "CLP",
+                    "category": "Shopping",
+                    "installment_number": 1,
+                    "installment_total": 6,
+                    "installment_value": "$ 89.900",
+                }
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        transactions = _Svc._build_transactions(
+            self=_Svc.__new__(_Svc),
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        assert transactions[0].installment_number == 1
+        assert transactions[0].installment_total == 6
+        assert transactions[0].installment_value == Decimal("89900")
+
+
+# ---------------------------------------------------------------------------
+# Helpers — pure functions that don't need the DB or PDF
+# ---------------------------------------------------------------------------
+
+
+class TestModuleHelpers:
+    """The module-level helpers are exercised in isolation."""
+
+    def test_truncate_error_short_message(self) -> None:
+        """A short error message is returned verbatim."""
+        from app.services.ingestion import _truncate_error
+
+        result = _truncate_error(ValueError("boom"))
+        assert result == "ValueError: boom"
+
+    def test_truncate_error_long_message(self) -> None:
+        """A message longer than the cap is truncated with an ellipsis."""
+        from app.services.ingestion import _truncate_error
+
+        long = "x" * 1000
+        result = _truncate_error(ValueError(long), limit=50)
+        assert len(result) == 50
+        assert result.endswith("…")
+
+    def test_truncate_error_replaces_newlines(self) -> None:
+        """Newlines in the error message are replaced with spaces."""
+        from app.services.ingestion import _truncate_error
+
+        result = _truncate_error(ValueError("line1\nline2\nline3"))
+        assert "\n" not in result
+        assert "line1 line2 line3" in result
+
+    def test_expand_two_digit_year_pivot_70(self) -> None:
+        """The year pivot at 70 keeps 21st-century dates as 2000s."""
+        from app.services.ingestion import _expand_two_digit_year
+
+        assert _expand_two_digit_year(0) == 2000
+        assert _expand_two_digit_year(25) == 2025
+        assert _expand_two_digit_year(69) == 2069
+        assert _expand_two_digit_year(70) == 1970
+        assert _expand_two_digit_year(99) == 1999
+
+    def test_parse_llm_date_accepts_dmy_long(self) -> None:
+        """``DD/MM/YYYY`` is parsed into a real :class:`date`."""
+        from app.services.ingestion import _parse_llm_date
+
+        assert _parse_llm_date("15/05/2025", index=0) == date(2025, 5, 15)
+
+    def test_parse_llm_date_accepts_dmy_short(self) -> None:
+        """``DD/MM/YY`` is parsed and the year is expanded to four digits."""
+        from app.services.ingestion import _parse_llm_date
+
+        assert _parse_llm_date("15/05/25", index=0) == date(2025, 5, 15)
+
+    def test_parse_llm_date_accepts_iso(self) -> None:
+        """``YYYY-MM-DD`` is also accepted (defensive parsing)."""
+        from app.services.ingestion import _parse_llm_date
+
+        assert _parse_llm_date("2025-05-15", index=0) == date(2025, 5, 15)
+
+    def test_parse_llm_date_rejects_garbage(self) -> None:
+        """An unparseable date string raises :class:`ValueError`."""
+        from app.services.ingestion import _parse_llm_date
+
+        with pytest.raises(ValueError, match="does not match"):
+            _parse_llm_date("not-a-date", index=0)
+
+    def test_parse_llm_date_rejects_out_of_range(self) -> None:
+        """A syntactically-valid but out-of-range date raises :class:`ValueError`."""
+        from app.services.ingestion import _parse_llm_date
+
+        with pytest.raises(ValueError, match="out of range"):
+            _parse_llm_date("32/13/2025", index=0)
+
+    def test_compute_sha256(self, tmp_path: Path) -> None:
+        """The SHA-256 helper matches :func:`hashlib.sha256` for the same content."""
+        from app.services.ingestion import _compute_sha256
+
+        target = tmp_path / "blob.bin"
+        target.write_bytes(b"hello world")
+        assert _compute_sha256(target) == hashlib.sha256(b"hello world").hexdigest()
+
+    def test_compute_sha256_streams_large_file(self, tmp_path: Path) -> None:
+        """The hash is computed in chunks — a 5 MB file produces the same digest."""
+        from app.services.ingestion import _compute_sha256
+
+        target = tmp_path / "big.bin"
+        # 5 MB of zeros
+        target.write_bytes(b"\x00" * (5 * 1024 * 1024))
+        assert _compute_sha256(target) == hashlib.sha256(b"\x00" * (5 * 1024 * 1024)).hexdigest()
