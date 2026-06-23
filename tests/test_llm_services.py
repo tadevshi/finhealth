@@ -42,6 +42,7 @@ from app.services.llm import (
     LLMProvider,
     OllamaClient,
     OpenCodeGoClient,
+    StatementMetadata,
     TransactionExtraction,
     create_llm_client,
 )
@@ -76,7 +77,10 @@ ESTADO DE CUENTA INTERNACIONAL
 """
 
 #: Canonical extraction payload used by the OpenCode Go and
-#: Ollama tests. Mirrors the format the LLM is asked to emit.
+#: Ollama tests. Mirrors the format the LLM is asked to emit,
+#: including the ``metadata`` block that carries the statement
+#: header fields (masked PAN, cardholder, currency, period,
+#: statement date).
 VALID_EXTRACTION_PAYLOAD: dict[str, Any] = {
     "transactions": [
         {
@@ -110,6 +114,14 @@ VALID_EXTRACTION_PAYLOAD: dict[str, Any] = {
             "installment_value": "$ 89.900",
         },
     ],
+    "metadata": {
+        "card_number_masked": "XXXX XXXX XXXX 0951",
+        "cardholder": "LUIS SOTILLO AGUIAR",
+        "currency": "CLP",
+        "period_start": "01/05/2025",
+        "period_end": "31/05/2025",
+        "statement_date": "05/06/2025",
+    },
     "confidence": 0.96,
     "notes": "3 transactions, one installment plan detected.",
 }
@@ -298,12 +310,35 @@ def test_extraction_response_validates_full_payload() -> None:
     assert response.confidence == pytest.approx(0.96)
     assert response.notes is not None
     assert response.transactions[2].installment_number == 1
+    # The metadata block is parsed and exposed
+    assert response.metadata.card_number_masked == "XXXX XXXX XXXX 0951"
+    assert response.metadata.cardholder == "LUIS SOTILLO AGUIAR"
+    assert response.metadata.currency == "CLP"
+    assert response.metadata.period_start == "01/05/2025"
+    assert response.metadata.period_end == "31/05/2025"
+    assert response.metadata.statement_date == "05/06/2025"
 
 
 def test_extraction_response_accepts_empty_transactions() -> None:
-    """A $0 period is valid data, not an error."""
+    """A $0 period is valid data, not an error.
+
+    The metadata block is still required (statements always
+    carry it) but the transaction list can be empty.
+    """
     response = ExtractionResponse.model_validate(
-        {"transactions": [], "confidence": 0.5, "notes": "No charges."}
+        {
+            "transactions": [],
+            "metadata": {
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "LUIS SOTILLO AGUIAR",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            "confidence": 0.5,
+            "notes": "No charges.",
+        }
     )
     assert response.transactions == []
 
@@ -314,14 +349,96 @@ def test_extraction_response_rejects_invalid_confidence() -> None:
         ExtractionResponse.model_validate({"transactions": [], "confidence": 1.5})
 
 
+def test_extraction_response_requires_metadata() -> None:
+    """The metadata block is mandatory — there is no default.
+
+    A response without ``metadata`` is almost always a partial
+    LLM generation and the orchestrator should fail fast.
+    """
+    with pytest.raises(ValidationError):
+        ExtractionResponse.model_validate(
+            {"transactions": [], "confidence": 0.5, "notes": "Missing metadata."}
+        )
+
+
 def test_extraction_response_rejects_extra_top_level_fields() -> None:
     """The envelope is closed: unknown top-level fields are rejected."""
     with pytest.raises(ValidationError):
         ExtractionResponse.model_validate(
             {
                 "transactions": [],
+                "metadata": {
+                    "card_number_masked": "XXXX XXXX XXXX 0951",
+                    "cardholder": "X",
+                    "currency": "CLP",
+                    "period_start": "01/01/2025",
+                    "period_end": "31/01/2025",
+                    "statement_date": "01/02/2025",
+                },
                 "confidence": 0.5,
                 "secret_field": "leaked",
+            }
+        )
+
+
+def test_statement_metadata_valid() -> None:
+    """A well-formed metadata block validates and round-trips correctly."""
+    metadata = StatementMetadata(
+        card_number_masked="XXXX XXXX XXXX 0951",
+        cardholder="LUIS SOTILLO AGUIAR",
+        currency="CLP",
+        period_start="01/05/2025",
+        period_end="31/05/2025",
+        statement_date="05/06/2025",
+    )
+    assert metadata.card_number_masked == "XXXX XXXX XXXX 0951"
+    assert metadata.cardholder == "LUIS SOTILLO AGUIAR"
+    assert metadata.currency_is_valid() is True
+
+
+def test_statement_metadata_rejects_unknown_currency() -> None:
+    """A currency that is not CLP/USD is rejected by ``currency_is_valid``."""
+    metadata = StatementMetadata(
+        card_number_masked="XXXX XXXX XXXX 0951",
+        cardholder="X",
+        currency="EUR",  # not allowed
+        period_start="01/01/2025",
+        period_end="31/01/2025",
+        statement_date="01/02/2025",
+    )
+    assert metadata.currency_is_valid() is False
+
+
+def test_statement_metadata_rejects_short_currency_code() -> None:
+    """The currency field is length-bounded to 3 chars by the Pydantic schema."""
+    with pytest.raises(ValidationError):
+        StatementMetadata(
+            card_number_masked="XXXX XXXX XXXX 0951",
+            cardholder="X",
+            currency="CL",  # too short
+            period_start="01/01/2025",
+            period_end="31/01/2025",
+            statement_date="01/02/2025",
+        )
+
+
+def test_statement_metadata_rejects_extra_fields() -> None:
+    """The metadata model is closed: extra fields are rejected.
+
+    The LLM is told the metadata shape; if it invents a new
+    field (e.g. ``card_expiration``), the boundary rejects it
+    so the orchestrator can flag the bad extraction.
+    """
+    with pytest.raises(ValidationError):
+        StatementMetadata.model_validate(
+            {
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/01/2025",
+                "period_end": "31/01/2025",
+                "statement_date": "01/02/2025",
+                "card_expiration": "12/29",  # not in the schema
             }
         )
 
@@ -343,6 +460,27 @@ def test_empty_response_helper() -> None:
     assert response.transactions == []
     assert response.confidence == 0.0
     assert response.notes is None
+    # The default metadata placeholder is exposed so the
+    # response is well-formed even when the helper is called
+    # without arguments.
+    assert response.metadata.currency == "CLP"
+
+
+def test_empty_response_helper_accepts_explicit_metadata() -> None:
+    """``empty_response`` lets callers supply real metadata when they have it."""
+    from app.services.llm.schemas import empty_response
+
+    metadata = StatementMetadata(
+        card_number_masked="XXXX XXXX XXXX 0951",
+        cardholder="LUIS SOTILLO AGUIAR",
+        currency="USD",
+        period_start="01/01/2025",
+        period_end="31/01/2025",
+        statement_date="01/02/2025",
+    )
+    response = empty_response(confidence=0.5, metadata=metadata)
+    assert response.metadata is metadata
+    assert response.metadata.currency == "USD"
 
 
 def test_parse_amount_safe_succeeds_for_valid_input() -> None:
@@ -424,6 +562,12 @@ def test_build_extraction_prompt_embeds_schema() -> None:
         "installment_number",
         "installment_total",
         "installment_value",
+        "metadata",
+        "card_number_masked",
+        "cardholder",
+        "period_start",
+        "period_end",
+        "statement_date",
         "confidence",
         "notes",
     ):

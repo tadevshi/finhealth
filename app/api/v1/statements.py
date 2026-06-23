@@ -132,11 +132,6 @@ async def upload_statement(
     file: Annotated[UploadFile, File(description="Encrypted bank statement PDF.")],
     bank_name: Annotated[str, Form(description="Short bank identifier (e.g. 'santander').")],
     rut: Annotated[str, Form(description="Cardholder RUT (e.g. '26.450.463-5').")],
-    card_number_masked: Annotated[
-        str, Form(description="Masked card number (e.g. 'XXXX XXXX XXXX 0951').")
-    ],
-    cardholder: Annotated[str, Form(description="Printed cardholder name (e.g. 'JOHN DOE').")],
-    currency: Annotated[str, Form(description="ISO-4217 currency code ('CLP' or 'USD').")],
     service: Annotated[IngestionService, Depends(get_ingestion_service)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> JSONResponse:
@@ -173,15 +168,14 @@ async def upload_statement(
 
     # 3. Hand off to the service. ``ingest_statement`` returns the
     #    resulting Statement — re-loaded with transactions on
-    #    success, marked FAILED on failure.
+    #    success, marked FAILED on failure. The card identity
+    #    (masked PAN, cardholder, currency) is read from the PDF
+    #    via the LLM; the user only types the bank and the RUT.
     try:
         statement = await service.ingest_statement(
             file_path=dest_path,
             bank_name=bank_name,
             rut=rut,
-            card_number_masked=card_number_masked,
-            cardholder=cardholder,
-            currency=currency,
         )
     except FileNotFoundError as exc:
         # The on-disk file disappeared between save and read.

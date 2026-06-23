@@ -56,6 +56,7 @@ from app.services.llm.protocol import LLMProvider
 from app.services.llm.schemas import (
     ExtractionResponse,
     LLMExtractionError,
+    StatementMetadata,
     TransactionExtraction,
 )
 
@@ -65,6 +66,7 @@ __all__ = [
     "LLMProvider",
     "OllamaClient",
     "OpenCodeGoClient",
+    "StatementMetadata",
     "TransactionExtraction",
     "create_llm_client",
 ]

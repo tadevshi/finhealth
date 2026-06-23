@@ -61,13 +61,7 @@ from app.models.credit_card import CreditCard
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
 from app.services.llm.protocol import LLMProvider
-from app.services.pdf import (
-    decrypt_pdf,
-    derive_password,
-    detect_variant,
-    extract_text,
-    parse_amount,
-)
+from app.services.pdf import decrypt_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -170,9 +164,6 @@ class IngestionService:
         file_path: Path,
         bank_name: str,
         rut: str,
-        card_number_masked: str,
-        cardholder: str,
-        currency: str,
     ) -> Statement:
         """Run the full ingestion pipeline on ``file_path``.
 
@@ -187,18 +178,8 @@ class IngestionService:
             (e.g. ``"santander"``, ``"itau"``, ``"banco_de_chile"``).
         rut:
             The cardholder's RUT in any of the formats accepted by
-            :func:`app.services.pdf.derive_password`.
-        card_number_masked:
-            Masked PAN (e.g. ``"XXXX XXXX XXXX 0951"``). Used to
-            look up or create the corresponding
-            :class:`app.models.credit_card.CreditCard`.
-        cardholder:
-            Printed name on the card (e.g. ``"JOHN DOE"``).
-        currency:
-            ISO-4217 code the *user* expects the card to operate in
-            (``"CLP"`` or ``"USD"``). The actual per-transaction
-            currency is read from the LLM response, which must match
-            the value implied by the detected variant.
+            :func:`app.services.pdf.derive_password`. The
+            per-bank PDF password is derived from this value.
 
         Returns
         -------
@@ -228,23 +209,97 @@ class IngestionService:
         DuplicateStatementError
             If a concurrent upload wins the race for the
             ``(credit_card_id, file_hash)`` unique constraint.
+        IngestionError
+            If the LLM did not return a valid
+            :class:`~app.services.llm.schemas.StatementMetadata`
+            (e.g. a hallucinated currency or an unparseable
+            statement date).
         """
         # 1. Look up the bank up front. A missing bank is a 400, not
         #    a 500, so we raise it before creating any rows.
         bank = await self._get_bank_by_name(bank_name)
 
-        # 2. Hash the file so we can dedup before doing any work.
+        # 2. Derive the password before hashing. We need the
+        #    password to decrypt the file, and the RUT validation
+        #    is a fast-fail path.
+        from app.services.pdf import derive_password
+
+        password = derive_password(bank, rut)
+
+        # 3. Decrypt the PDF to a temp file so the encrypted
+        #    upload on shared/ remains the long-lived artifact
+        #    (and the one we hash). Any failure here is wrapped
+        #    as :class:`IngestionError` so the HTTP layer can
+        #    map it to a 422 — pre-LLM errors are always
+        #    user-fixable and we want a clean error path.
+        try:
+            decrypted_path = _decrypt_to_temp(file_path, password)
+        except Exception as exc:
+            if isinstance(exc, IngestionError):
+                raise
+            from app.services.pdf import PDFPasswordError
+
+            if isinstance(exc, PDFPasswordError):
+                raise IngestionError(str(exc)) from exc
+            raise IngestionError(f"PDF decryption failed: {exc}") from exc
+
+        # 4. Extract text + variant up front. These two steps are
+        #    fast and have no DB side effects, so we do them
+        #    before any write.
+        try:
+            from app.services.pdf import detect_variant, extract_text
+
+            text = extract_text(decrypted_path)
+            variant = detect_variant(text)
+        except Exception as exc:
+            _safe_unlink(decrypted_path)
+            if isinstance(exc, IngestionError):
+                raise
+            raise IngestionError(str(exc)) from exc
+
+        # 5. Hash the file (after we know the encryption is
+        #    correct). The hash is the dedup key, and it must
+        #    match across uploads of the same encrypted file.
         file_hash = _compute_sha256(file_path)
 
-        # 3. Get-or-create the credit card. The unique constraint
-        #    on (bank_id, card_number_masked, cardholder) makes the
-        #    operation race-safe at the DB level.
-        card = await self._get_or_create_card(bank, card_number_masked, cardholder, currency)
+        try:
+            # 6. Call the LLM. ``LLMExtractionError`` is wrapped
+            #    in :class:`IngestionError` so the HTTP layer can
+            #    map it to a 422 via a single ``except`` clause.
+            extraction = await self._llm_client.extract_transactions(text, variant)
+        except Exception as exc:
+            _safe_unlink(decrypted_path)
+            if isinstance(exc, IngestionError):
+                raise
+            raise IngestionError(f"LLM extraction failed: {exc}") from exc
+        else:
+            _safe_unlink(decrypted_path)
 
-        # 4. Idempotency: a row with the same (card, file_hash) is
-        #    already in the database. Return it without re-running
-        #    the pipeline. This matches the spec's "duplicate
-        #    upload returns the existing statement" rule.
+        # 7. Validate the LLM's metadata and turn it into
+        #    :class:`date` objects the statement row can carry.
+        #    Split into a separate method so the validation
+        #    logic is unit-testable without a real PDF.
+        expected_currency, period_start, period_end, statement_date = self._validate_metadata(
+            extraction=extraction, variant=variant
+        )
+
+        # 9. Get-or-create the credit card. The unique constraint
+        #    on (bank_id, card_number_masked, cardholder) makes
+        #    the operation race-safe at the DB level. We use the
+        #    values the LLM read off the PDF — the user no longer
+        #    types them.
+        card = await self._get_or_create_card(
+            bank,
+            extraction.metadata.card_number_masked,
+            extraction.metadata.cardholder,
+            extraction.metadata.currency,
+        )
+
+        # 10. Idempotency: a row with the same (card, file_hash)
+        #     is already in the database. Return it without
+        #     re-running the pipeline. This matches the spec's
+        #     "duplicate upload returns the existing statement"
+        #     rule.
         existing = await self._find_statement_by_hash(card.id, file_hash)
         if existing is not None:
             logger.info(
@@ -255,14 +310,16 @@ class IngestionService:
             )
             return existing
 
-        # 5. Create the statement row up front so a failure later
-        #    in the pipeline can be recorded on it.
-        today = date.today()
+        # 11. Create the statement row up front so a failure
+        #     later in the pipeline can be recorded on it. The
+        #     period and emission dates come from the LLM, not
+        #     from the current month — that is the whole point
+        #     of the metadata extraction.
         statement = Statement(
             credit_card_id=card.id,
-            period_start=_first_of_month(today),
-            period_end=_last_of_month(today),
-            statement_date=today,
+            period_start=period_start,
+            period_end=period_end,
+            statement_date=statement_date,
             file_path=str(file_path),
             file_hash=file_hash,
             status=StatementStatus.PENDING,
@@ -270,24 +327,17 @@ class IngestionService:
         self._session.add(statement)
         await self._session.flush()  # populate statement.id without committing
 
-        # 6. Run the pipeline inside a try/except so any failure
-        #    becomes a FAILED statement with a stored error.
+        # 12. Build the transaction rows from the LLM payload.
+        #     Any per-transaction failure (bad amount, bad date,
+        #     currency mismatch) raises here and lands the
+        #     statement in FAILED with a stored error.
         try:
-            transactions = await self._ingest_pipeline(
+            transactions = self._build_transactions(
                 statement=statement,
-                bank=bank,
-                rut=rut,
-                cardholder=cardholder,
+                extraction=extraction,
+                expected_currency=expected_currency,
             )
         except Exception as exc:
-            # The pipeline raised a typed :class:`IngestionError`
-            # (e.g. ``BankNotFoundError``) or an untyped error
-            # (e.g. a PDF ``PDFPasswordError``, an LLM
-            # ``LLMExtractionError``, or a validation error from
-            # the Pydantic schema). The HTTP layer only catches
-            # :class:`IngestionError`, so non-typed errors are
-            # wrapped here — preserving the original on
-            # ``__cause__`` for log inspection.
             statement.status = StatementStatus.FAILED
             statement.error_message = _truncate_error(exc)
             await self._session.commit()
@@ -301,8 +351,8 @@ class IngestionService:
                 raise
             raise IngestionError(str(exc)) from exc
 
-        # 7. Persist the extracted transactions, mark the statement
-        #    complete, and commit.
+        # 13. Persist the extracted transactions, mark the
+        #     statement complete, and commit.
         self._session.add_all(transactions)
         statement.status = StatementStatus.COMPLETED
         await self._session.commit()
@@ -329,128 +379,169 @@ class IngestionService:
     # Pipeline
     # ------------------------------------------------------------------
 
-    async def _ingest_pipeline(
-        self,
+    @staticmethod
+    def _validate_metadata(
         *,
-        statement: Statement,
-        bank: Bank,
-        rut: str,
-        cardholder: str,  # Reserved for future per-card logic (e.g. password override).
-    ) -> list[Transaction]:
-        """Run decrypt → extract → LLM → parse, returning ready-to-add rows.
+        extraction: object,
+        variant: str,
+    ) -> tuple[str, date, date, date]:
+        """Validate the LLM's ``metadata`` block and return normalised values.
 
-        Split out from :meth:`ingest_statement` so the failure-handling
-        bookkeeping (commit + status flip) lives in exactly one
-        place. ``cardholder`` is accepted for future per-card logic
-        (e.g. a different password override per card) and is
-        intentionally unused for now.
-        """
-        # 1. Derive the password from the user's RUT and the bank's
-        #    stored formula. An invalid RUT or unknown formula
-        #    surfaces here as a typed exception.
-        password = derive_password(bank, rut)
-
-        # 2. Decrypt the PDF. The decrypted copy lives in a temp
-        #    directory so the encrypted upload on shared/ is the
-        #    long-lived artifact (and the one we hash).
-        decrypted_path = _decrypt_to_temp(Path(statement.file_path), password)
-
-        try:
-            # 3. Extract the text. A still-encrypted PDF would
-            #    raise ``TextExtractionError`` here.
-            text = extract_text(decrypted_path)
-
-            # 4. Detect the variant (NACIONAL vs INTERNACIONAL).
-            variant = detect_variant(text)
-
-            # 5. Call the LLM. ``LLMExtractionError`` propagates as-is.
-            extraction = await self._llm_client.extract_transactions(text, variant)
-        finally:
-            # Best-effort cleanup of the decrypted file. A failure
-            # here is logged but not raised — the upload directory
-            # may already be in a usable state.
-            _safe_unlink(decrypted_path)
-
-        expected_currency = _VARIANT_CURRENCY[variant]
-
-        # 6. Convert each LLM-emitted transaction into a model
-        #    instance, validating amounts and dates along the way.
-        transactions: list[Transaction] = []
-        for index, txn in enumerate(extraction.transactions):
-            parsed = self._build_transaction(
-                statement=statement,
-                index=index,
-                txn=txn,
-                expected_currency=expected_currency,
-                raw_extraction=txn.model_dump(),
-            )
-            transactions.append(parsed)
-
-        return transactions
-
-    def _build_transaction(
-        self,
-        *,
-        statement: Statement,
-        index: int,
-        txn: object,
-        expected_currency: str,
-        raw_extraction: dict[str, object],
-    ) -> Transaction:
-        """Validate one LLM-emitted transaction and build a model row.
+        Returns
+        -------
+        tuple[str, date, date, date]
+            ``(expected_currency, period_start, period_end,
+            statement_date)``. The first element is the
+            currency the *transactions* must use, derived from
+            the variant. The remaining three are the parsed
+            statement period and emission date.
 
         Raises
         ------
-        AmountParseError
-            If the amount cannot be parsed for the expected currency.
-        ValueError
-            If the date is missing or unparseable, or the currency
-            does not match the variant-implied one.
+        IngestionError
+            If the metadata is missing, the currency is not a
+            recognised CMF code, the currency does not match
+            the variant, or one of the dates is unparseable.
         """
-        # Local import: ``TransactionExtraction`` lives in the LLM
-        # subpackage; importing at module level would pull the LLM
-        # stack into every import of this module, even in tests that
-        # only need ``IngestionService`` for the database side.
-        from app.services.llm.schemas import TransactionExtraction
+        from app.services.llm.schemas import ExtractionResponse
 
-        if not isinstance(txn, TransactionExtraction):
+        if not isinstance(extraction, ExtractionResponse):
+            raise IngestionError(
+                f"Cannot validate metadata: expected ExtractionResponse, "
+                f"got {type(extraction).__name__}"
+            )
+
+        metadata = extraction.metadata
+
+        # The metadata's currency must be a supported CMF code.
+        # ``StatementMetadata.currency_is_valid`` is the same
+        # check used for transactions; an unsupported code is
+        # almost always a hallucination.
+        if not metadata.currency_is_valid():
+            raise IngestionError(
+                f"LLM emitted unsupported metadata currency "
+                f"{metadata.currency!r}; expected one of CLP/USD"
+            )
+
+        # The metadata's currency must match the variant. A
+        # mismatch means the LLM misread the section header.
+        expected_currency = _VARIANT_CURRENCY[variant]
+        if metadata.currency != expected_currency:
+            raise IngestionError(
+                f"Statement metadata currency {metadata.currency!r} does not match "
+                f"expected {expected_currency!r} for {variant} variant"
+            )
+
+        # Dates are strings in the LLM's output. Turn them
+        # into real :class:`date` objects so the statement row
+        # can carry them.
+        try:
+            period_start = _parse_llm_date(metadata.period_start, index=-1)
+            period_end = _parse_llm_date(metadata.period_end, index=-1)
+            statement_date = _parse_llm_date(metadata.statement_date, index=-1)
+        except ValueError as exc:
+            raise IngestionError(f"LLM emitted unparseable statement metadata date: {exc}") from exc
+
+        return expected_currency, period_start, period_end, statement_date
+
+    def _build_transactions(
+        self,
+        *,
+        statement: Statement,
+        extraction: object,
+        expected_currency: str,
+    ) -> list[Transaction]:
+        """Convert every LLM-emitted transaction into a :class:`Transaction` row.
+
+        Split out from :meth:`ingest_statement` so the
+        per-row validation logic (amount parsing, date parsing,
+        currency cross-check) lives in one place. The decrypt,
+        text-extract, and LLM-call steps happen inline in
+        :meth:`ingest_statement` so the temp file can be
+        cleaned up in a single ``finally`` block.
+
+        Raises
+        ------
+        TypeError
+            If ``extraction`` is not a validated
+            :class:`~app.services.llm.schemas.ExtractionResponse`.
+        ValueError
+            If any transaction's currency does not match the
+            variant-implied one.
+        AmountParseError
+            If any transaction's amount string cannot be
+            parsed for the expected currency.
+        """
+        # Local import: ``ExtractionResponse`` lives in the LLM
+        # subpackage; importing at module level would pull the
+        # LLM stack into every import of this module, even in
+        # tests that only need ``IngestionService`` for the
+        # database side.
+        from app.services.llm.schemas import ExtractionResponse, TransactionExtraction
+        from app.services.pdf import parse_amount
+
+        if not isinstance(extraction, ExtractionResponse):
             # Defensive: the LLM layer is typed to return
             # ``ExtractionResponse`` so this branch should be
-            # unreachable, but a custom LLM mock might bypass the
-            # schema. Surface a clear error instead of a cryptic
-            # AttributeError.
-            raise TypeError(
-                f"Expected TransactionExtraction at index {index}, got {type(txn).__name__}"
+            # unreachable, but a custom LLM mock might bypass
+            # the schema. Surface a clear error instead of a
+            # cryptic AttributeError.
+            raise IngestionError(
+                f"Cannot build transactions: expected ExtractionResponse, "
+                f"got {type(extraction).__name__}"
             )
 
-        # Currency must match the variant. The LLM is told this in
-        # the prompt, but a hallucinated currency is a real failure
-        # mode and we want to catch it before it lands in the DB.
-        if txn.currency != expected_currency:
-            raise ValueError(
-                f"Transaction {index} currency {txn.currency!r} does not match "
-                f"expected {expected_currency!r} for variant-derived statement"
+        transactions: list[Transaction] = []
+        for index, txn in enumerate(extraction.transactions):
+            if not isinstance(txn, TransactionExtraction):
+                raise IngestionError(
+                    f"Expected TransactionExtraction at index {index}, got {type(txn).__name__}"
+                )
+
+            # Currency must match the variant. The LLM is told
+            # this in the prompt, but a hallucinated currency is
+            # a real failure mode and we want to catch it before
+            # it lands in the DB.
+            if txn.currency != expected_currency:
+                raise IngestionError(
+                    f"Transaction {index} currency {txn.currency!r} does not match "
+                    f"expected {expected_currency!r} for variant-derived statement"
+                )
+
+            try:
+                amount = parse_amount(txn.amount, txn.currency)
+            except Exception as exc:
+                raise IngestionError(
+                    f"Transaction {index} has unparseable amount {txn.amount!r}: {exc}"
+                ) from exc
+            txn_date = _parse_llm_date(txn.date, index=index)
+
+            installment_value: Decimal | None = None
+            if txn.installment_value:
+                try:
+                    installment_value = parse_amount(txn.installment_value, txn.currency)
+                except Exception as exc:
+                    raise IngestionError(
+                        f"Transaction {index} has unparseable installment_value "
+                        f"{txn.installment_value!r}: {exc}"
+                    ) from exc
+
+            transactions.append(
+                Transaction(
+                    statement_id=statement.id,
+                    date=txn_date,
+                    description=txn.description,
+                    amount=amount,
+                    currency=txn.currency,
+                    category=txn.category,
+                    installment_number=txn.installment_number,
+                    installment_total=txn.installment_total,
+                    installment_value=installment_value,
+                    raw_json=txn.model_dump(),
+                )
             )
 
-        amount = parse_amount(txn.amount, txn.currency)
-        txn_date = _parse_llm_date(txn.date, index=index)
-
-        installment_value: Decimal | None = None
-        if txn.installment_value:
-            installment_value = parse_amount(txn.installment_value, txn.currency)
-
-        return Transaction(
-            statement_id=statement.id,
-            date=txn_date,
-            description=txn.description,
-            amount=amount,
-            currency=txn.currency,
-            category=txn.category,
-            installment_number=txn.installment_number,
-            installment_total=txn.installment_total,
-            installment_value=installment_value,
-            raw_json=raw_extraction,
-        )
+        return transactions
 
     # ------------------------------------------------------------------
     # Database helpers
@@ -612,27 +703,6 @@ def _expand_two_digit_year(two_digit: int) -> int:
     is the right pivot for our use case.
     """
     return 2000 + two_digit if two_digit < 70 else 1900 + two_digit
-
-
-def _first_of_month(today: date) -> date:
-    """Return the first day of the month containing ``today``."""
-    return today.replace(day=1)
-
-
-def _last_of_month(today: date) -> date:
-    """Return the last day of the month containing ``today``.
-
-    Uses the well-known "first of next month, minus one day" trick
-    so we do not have to encode month lengths in the function.
-    The :class:`datetime.timedelta` import is local because the
-    helper is only used in this single place.
-    """
-    from datetime import timedelta
-
-    if today.month == 12:
-        return today.replace(month=12, day=31)
-    next_month_first = today.replace(month=today.month + 1, day=1)
-    return next_month_first - timedelta(days=1)
 
 
 def _truncate_error(exc: BaseException, *, limit: int = 500) -> str:

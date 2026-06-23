@@ -3,10 +3,11 @@
 {# Upload page.
 
    Lets the user drag-and-drop (or click to pick) a bank statement
-   PDF, fill in the form fields the backend needs (bank, RUT, masked
-   PAN, cardholder, currency), and submit it to the ingestion
-   pipeline. The form posts to ``/api/v1/statements/upload`` via
-   plain ``fetch`` (not HTMX) so we can:
+   PDF, choose the issuing bank, type the cardholder RUT, and submit.
+   The masked PAN, cardholder name, currency, and statement period
+   are all extracted from the PDF by the LLM — the user no longer
+   has to type them. The form posts to ``/api/v1/statements/upload``
+   via plain ``fetch`` (not HTMX) so we can:
 
    1. Show fine-grained progress (idle → uploading → done | error).
    2. Render a structured success message with a link to
@@ -32,7 +33,8 @@
     </h1>
     <p class="mt-2 text-gray-600 dark:text-gray-300">
         Drop your encrypted PDF here, choose the issuing bank, and we'll
-        extract every line item via the configured LLM provider.
+        extract the card details and every line item via the configured
+        LLM provider.
     </p>
 
     {# --- Status banner (hidden until Alpine shows it) ------------------- #}
@@ -144,60 +146,10 @@
                           focus:ring-indigo-500 focus:border-indigo-500
                           sm:text-sm rounded-md px-3 py-2">
             <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                With or without dots and dash. The bank password is derived from this.
+                With or without dots and dash. The bank password is derived
+                from this. Card number, cardholder, currency, and statement
+                period are read from the PDF.
             </p>
-        </div>
-
-        <div>
-            <label for="card-masked"
-                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
-                Card number (masked)
-            </label>
-            <input id="card-masked"
-                   name="card_number_masked"
-                   type="text"
-                   required
-                   placeholder="XXXX XXXX XXXX 0951"
-                   data-testid="card-input"
-                   class="mt-1 block w-full border-gray-300 dark:border-gray-600
-                          dark:bg-gray-800 dark:text-gray-100
-                          focus:ring-indigo-500 focus:border-indigo-500
-                          sm:text-sm rounded-md px-3 py-2">
-        </div>
-
-        <div>
-            <label for="cardholder"
-                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
-                Cardholder name
-            </label>
-            <input id="cardholder"
-                   name="cardholder"
-                   type="text"
-                   required
-                   placeholder="JOHN DOE"
-                   data-testid="cardholder-input"
-                   class="mt-1 block w-full border-gray-300 dark:border-gray-600
-                          dark:bg-gray-800 dark:text-gray-100
-                          focus:ring-indigo-500 focus:border-indigo-500
-                          sm:text-sm rounded-md px-3 py-2">
-        </div>
-
-        <div>
-            <label for="currency"
-                   class="block text-sm font-medium text-gray-700 dark:text-gray-200">
-                Currency
-            </label>
-            <select id="currency"
-                    name="currency"
-                    required
-                    data-testid="currency-select"
-                    class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300
-                           dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100
-                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
-                           sm:text-sm rounded-md">
-                <option value="CLP">CLP — Chilean Peso</option>
-                <option value="USD">USD — US Dollar</option>
-            </select>
         </div>
 
         <div class="pt-2">

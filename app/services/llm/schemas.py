@@ -167,13 +167,92 @@ class TransactionExtraction(BaseModel):
         return self.currency in _CURRENCY_VALUES
 
 
+class StatementMetadata(BaseModel):
+    """Statement header metadata extracted by the LLM.
+
+    Chilean CMF-mandated bank statements all carry the same
+    header fields regardless of issuer:
+
+    * The masked PAN — printed on every page in the form
+      ``"XXXX XXXX XXXX NNNN"``.
+    * The cardholder name — the printed name on the card.
+    * The currency of the section being parsed (``CLP`` for
+      NACIONAL, ``USD`` for INTERNACIONAL).
+    * The statement period (start/end dates) and the
+      statement emission date.
+
+    All five fields are required by the schema. A
+    partially-populated metadata is a *bad* extraction — if
+    the LLM can read the transactions, it can read the
+    header, and a missing field is almost always a parse
+    failure rather than a real absence. The orchestrator
+    uses these values to populate :class:`CreditCard` and
+    :class:`Statement` rows so the user no longer has to
+    type them in the upload form.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    card_number_masked: str = Field(
+        min_length=1,
+        max_length=25,
+        description=("Masked PAN as it appears on the statement (e.g. 'XXXX XXXX XXXX 0951')."),
+    )
+    cardholder: str = Field(
+        min_length=1,
+        max_length=100,
+        description="Printed cardholder name (e.g. 'LUIS SOTILLO AGUIAR').",
+    )
+    currency: str = Field(
+        min_length=3,
+        max_length=3,
+        description="ISO-4217 currency code: 'CLP' for NACIONAL, 'USD' for INTERNACIONAL.",
+    )
+    period_start: str = Field(
+        min_length=8,
+        max_length=10,
+        description=(
+            "First day of the billing period. DD/MM/YYYY "
+            "(the orchestrator normalises from the LLM's "
+            "two-digit year variant)."
+        ),
+    )
+    period_end: str = Field(
+        min_length=8,
+        max_length=10,
+        description="Last day of the billing period. DD/MM/YYYY.",
+    )
+    statement_date: str = Field(
+        min_length=8,
+        max_length=10,
+        description="Date the bank issued the statement. DD/MM/YYYY.",
+    )
+
+    def currency_is_valid(self) -> bool:
+        """Return ``True`` when ``currency`` is a supported CMF code.
+
+        Same rule as :meth:`TransactionExtraction.currency_is_valid`
+        — the orchestrator calls it before creating the
+        :class:`CreditCard` so a hallucinated currency fails
+        fast with a clear error.
+        """
+        return self.currency in _CURRENCY_VALUES
+
+
 class ExtractionResponse(BaseModel):
     """The full LLM extraction envelope.
 
     The model is deliberately a single object with a
     ``transactions`` list — never a bare list — so the LLM has
     a stable shape to target, and so we can add metadata
-    (``confidence``, ``notes``) without changing the contract.
+    (``confidence``, ``notes``, ``metadata``) without changing
+    the contract.
+
+    ``metadata`` carries the statement header fields (masked
+    PAN, cardholder, currency, billing period, statement
+    date). It is extracted in the same LLM call as the
+    transactions, so the form no longer asks the user for
+    values that the LLM can read off the PDF.
 
     ``confidence`` is the LLM's self-reported certainty on a
     0-1 scale. The orchestrator does not use it to gate
@@ -187,6 +266,12 @@ class ExtractionResponse(BaseModel):
     transactions: list[TransactionExtraction] = Field(
         min_length=0,
         description="All transactions extracted from the statement text.",
+    )
+    metadata: StatementMetadata = Field(
+        description=(
+            "Statement header fields (masked PAN, cardholder, "
+            "currency, period, statement date) read off the PDF."
+        ),
     )
     confidence: float = Field(
         ge=0.0,
@@ -204,15 +289,34 @@ class ExtractionResponse(BaseModel):
     )
 
 
-def empty_response(confidence: float = 0.0) -> ExtractionResponse:
+def empty_response(
+    confidence: float = 0.0,
+    metadata: StatementMetadata | None = None,
+) -> ExtractionResponse:
     """Build an empty :class:`ExtractionResponse`.
 
     Used when the LLM is asked to extract from a statement with
     no transactions (e.g. a $0 period). Returning an empty
     model is a *success* — the absence of charges is valid
     data. An error here would be a false positive.
+
+    ``metadata`` is required by the schema, so callers that
+    build an empty response by hand must still supply it.
+    Tests and the LLM layer pass a real
+    :class:`StatementMetadata`; the default placeholder is
+    only useful for negative-path assertions where the
+    metadata contents do not matter.
     """
-    return ExtractionResponse(transactions=[], confidence=confidence, notes=None)
+    if metadata is None:
+        metadata = StatementMetadata(
+            card_number_masked="XXXX XXXX XXXX 0000",
+            cardholder="UNKNOWN",
+            currency="CLP",
+            period_start="01/01/1970",
+            period_end="01/01/1970",
+            statement_date="01/01/1970",
+        )
+    return ExtractionResponse(transactions=[], metadata=metadata, confidence=confidence, notes=None)
 
 
 def parse_amount_safe(value: str, currency: str) -> Decimal:
