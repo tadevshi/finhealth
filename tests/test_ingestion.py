@@ -38,6 +38,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pikepdf
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -57,7 +58,7 @@ from app.services.ingestion import (
     IngestionService,
 )
 from app.services.llm.protocol import LLMProvider
-from app.services.llm.schemas import ExtractionResponse
+from app.services.llm.schemas import ExtractionResponse, StatementMetadata
 
 # ---------------------------------------------------------------------------
 # Sample PDF paths and the TEST_RUT env var
@@ -1767,6 +1768,159 @@ def test_module_sanity() -> None:
     assert IngestionService is not None
     assert IngestionError is not None
     assert BankNotFoundError is not None
+
+
+# ---------------------------------------------------------------------------
+# markitdown smoke test — synthetic PDF through the full pipeline
+# ---------------------------------------------------------------------------
+
+
+def _build_and_encrypt_synthetic_pdf(
+    out_path: Path,
+    *,
+    password: str,
+) -> Path:
+    """Build a bank-statement-shaped PDF and encrypt it with ``password``.
+
+    The PDF is generated in-memory with :mod:`reportlab` (a
+    :mod:`dev` extra) and then re-saved through :mod:`pikepdf`
+    with the supplied password so the orchestrator's
+    decrypt-then-extract path is exercised exactly the way it is
+    on a real CMF statement.
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    plain = out_path.with_suffix(".plain.pdf")
+    doc = SimpleDocTemplate(str(plain), pagesize=letter)
+    styles = getSampleStyleSheet()
+    story: list = [
+        Paragraph("ESTADO DE CUENTA NACIONAL DE TARJETA DE CRÉDITO", styles["Heading1"]),
+        Paragraph("NOMBRE DEL TITULAR LUIS SOTILLO AGUIAR", styles["Normal"]),
+        Spacer(1, 12),
+    ]
+    data: list[list[str]] = [
+        ["Fecha", "Descripción", "Monto $"],
+        ["15/05/2025", "SUPERMERCADOS LIDER", "12.450"],
+        ["22/05/2025", "COMBUSTIBLE COPEC", "35.000"],
+    ]
+    table = Table(data)
+    table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ]
+        )
+    )
+    story.append(table)
+    doc.build(story)
+
+    with pikepdf.open(str(plain)) as pdf:
+        # Save with a per-user password so pikepdf's
+        # ``password=`` open path mirrors the real CMF flow.
+        pdf.save(str(out_path), encryption=pikepdf.Encryption(owner=password, user=password))
+
+    plain.unlink()
+    return out_path
+
+
+@pytest.mark.asyncio
+async def test_markitdown_smoke_extracts_structured_markdown(
+    seeded_engine: AsyncEngine,
+    make_ingestion_service: Any,
+    tmp_path: Path,
+) -> None:
+    """The full pipeline converts a real-shaped PDF into structured Markdown
+    that the LLM can parse.
+
+    This is the end-to-end smoke test for the markitdown switch:
+    it does **not** depend on the cardholder RUT or the real
+    sample PDFs (both are personal data the test suite does not
+    carry). It builds a synthetic bank-statement-shaped PDF,
+    encrypts it with a known password, and runs the full
+    :class:`IngestionService` orchestrator. The fake LLM
+    captures the text it received; the test asserts that the
+    captured text has the *markitdown-shaped* structure
+    (pipe-delimited table rows, ``ESTADO DE CUENTA`` heading
+    intact) that the LLM extraction step was upgraded to
+    consume.
+    """
+    import tempfile
+
+    # 1. Build a synthetic encrypted PDF.
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        enc_path = Path(f.name)
+    _build_and_encrypt_synthetic_pdf(enc_path, password="12345678")
+
+    # 2. The fake LLM records what it receives. We build a
+    #    self-contained :class:`ExtractionResponse` rather than
+    #    reusing the module-level ``NACIONAL_EXTRACTION_PAYLOAD``
+    #    so the test stays decoupled from its content.
+    llm = FakeLLMClient(
+        response=ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "SUPERMERCADOS LIDER",
+                    "amount": "$ 12.450",
+                    "currency": "CLP",
+                    "category": "Groceries",
+                },
+            ],
+            metadata=StatementMetadata(
+                card_number_masked="XXXX XXXX XXXX 1234",
+                cardholder="LUIS SOTILLO AGUIAR",
+                currency="CLP",
+                period_start="15/05/2025",
+                period_end="22/05/2025",
+                statement_date="01/06/2025",
+            ),
+            confidence=0.95,
+            notes="smoke test",
+        ),
+    )
+
+    # 3. The RUT we feed in is a fictional 8-digit one; the
+    #    password formula is the same ``rut_sin_dv`` the
+    #    Santander seed uses, so the password matches the one we
+    #    encrypted the PDF with.
+    synthetic_rut = "12.345.678-9"
+
+    # 4. Run the orchestrator. The seeded_engine fixture has the
+    #    three production banks (santander / itau / banco_de_chile)
+    #    pre-inserted, so ``bank_name="santander"`` resolves.
+    async with make_ingestion_service(llm) as service:
+        statement = await service.ingest_statement(
+            file_path=enc_path,
+            bank_name="santander",
+            rut=synthetic_rut,
+        )
+
+    enc_path.unlink(missing_ok=True)
+
+    # 5. The pipeline ran end-to-end.
+    assert statement.status == StatementStatus.COMPLETED
+    assert len(llm.calls) == 1
+
+    # 6. The text the LLM saw is *structured Markdown*: tables
+    #    are pipe-delimited and the cardholder's name (which
+    #    the variant detector uses) is preserved. A regression
+    #    that drops the Markdown structure — e.g. swapping back
+    #    to flat ``pdfplumber.extract_text`` — fails here.
+    text, variant = llm.calls[0]
+    assert variant == "NACIONAL"
+    assert "SOTILLO" in text
+    assert "|" in text, "markitdown output should contain pipe-delimited table rows"
+    assert "ESTADO DE CUENTA NACIONAL" in text
 
 
 # ---------------------------------------------------------------------------

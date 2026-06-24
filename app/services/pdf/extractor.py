@@ -1,67 +1,82 @@
-"""Extract plain text from a (decrypted) PDF with :mod:`pdfplumber`.
+"""Extract structured Markdown from a (decrypted) PDF with :mod:`markitdown`.
 
 The extraction step is the bridge between the binary PDF world and
-the structured LLM extraction that follows. We want a *clean,
-linear* text representation:
+the structured LLM extraction that follows. We previously used
+:func:`pdfplumber.Page.extract_text` here, which returns the
+character stream in visual order. That works for the deterministic
+*variant detector* and *amount parser* (they only need anchored
+substrings), but it produces a flat, dense wall of text that small
+LLMs (e.g. ``llama3.2:3b``) struggle to parse and tend to time out
+on: the model has to re-infer the table structure from arbitrary
+whitespace and column alignment that mean nothing in plain text.
 
-* one logical "line" per PDF text line (i.e. one per row of the
-  bank statement table),
-* concatenated across pages in document order, separated by a
-  single newline so downstream regexes like
-  ``r"ESTADO DE CUENTA INTERNACIONAL"`` see a single string.
+Microsoft's :mod:`markitdown` solves this by converting the PDF
+into **structured Markdown**:
 
-The temptation to call :func:`pdfplumber.Page.extract_tables` is
-strong — the statements *are* tables, after all — but the CMF
-layout is wide enough that ``pdfplumber`` misaligns columns on
-~30% of pages, producing rows where the date and the amount live
-in different cells than the visible PDF. :func:`Page.extract_text`
-returns the underlying character stream in visual order, which
-preserves column alignment implicitly. The cost is that the
-parser has to know about spacing, but the variant and amount
-detectors already do.
+* Tables become pipe-delimited ``| col | col |`` rows.
+* Multi-column layouts are resolved into a single reading order.
+* Headings, lists, and emphasis are preserved when the underlying
+  PDF exposes them.
+
+LLMs are trained on Markdown, so the model spends its context on
+*content* rather than re-deriving layout. Empirically (see the
+benchmark in the PR description) this drops extraction wall time
+on the same real statement PDF from >120s with ``llama3.2:3b`` to
+under 60s, and improves JSON output accuracy on multi-column
+statements.
+
+Architecture
+------------
+
+``markitdown`` itself uses ``pdfplumber`` for pages that contain
+form-style content (tables, aligned columns) and ``pdfminer.six``
+as a fallback for plain prose pages. We still depend on
+``pdfplumber`` because the variant detector and the tests in
+``tests/test_pdf_services.py`` inspect the raw character stream;
+we do not need to keep two implementations of the extraction step.
 
 Failure modes
 -------------
 
-* **Encrypted PDF** — :mod:`pdfplumber` raises
+* **Encrypted PDF** — :mod:`markitdown` re-raises
   ``pdfminer.pdfdocument.PDFPasswordIncorrect`` because it does
   not accept a password. We translate this to
   :class:`TextExtractionError`. The pipeline must decrypt first.
-* **Corrupted PDF** — :mod:`pdfplumber` raises
-  ``pdfminer.pdfdocument.PDFSyntaxError`` or simply returns empty
-  pages. We surface both as :class:`TextExtractionError` with a
-  clear message.
-* **Empty pages** — :func:`Page.extract_text` returns ``None`` for
-  a page with no extractable text (e.g. a scanned image). We
-  treat ``None`` as the empty string so the joined output stays
-  well-formed.
+* **Corrupted PDF** — :mod:`markitdown` raises
+  ``pdfminer.pdfdocument.PDFSyntaxError`` or a generic
+  :class:`markitdown.FileConversionException`. Both are surfaced as
+  :class:`TextExtractionError` with a clear message.
+* **Missing dependency** — :mod:`markitdown` raises
+  :class:`markitdown.MissingDependencyException` if the
+  ``[all]`` extra was not installed at install time. We translate
+  this to :class:`TextExtractionError` so the caller does not have
+  to know about markitdown's internal exception hierarchy.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import pdfplumber
-from pdfminer.pdfdocument import PDFPasswordIncorrect
-from pdfplumber.utils.exceptions import PdfminerException
+from markitdown import FileConversionException, MarkItDown, MissingDependencyException
 
 
 class TextExtractionError(Exception):
     """Raised when text cannot be extracted from a PDF.
 
     The base class covers all extraction failures — encrypted
-    input, syntax errors, missing pages. The ``__cause__`` always
-    carries the underlying library exception.
+    input, syntax errors, missing markitdown extras, missing pages.
+    The ``__cause__`` always carries the underlying library
+    exception.
     """
 
 
 def extract_text(pdf_path: Path) -> str:
-    """Return the full text content of ``pdf_path``, page by page.
+    """Return the full Markdown content of ``pdf_path``.
 
-    Pages are joined with a single newline. ``None`` returns from
-    :func:`pdfplumber.Page.extract_text` (typical for image-only
-    pages) become the empty string so the join is safe and the
-    caller never has to defend against ``None``.
+    The returned string is the markitdown ``text_content`` — i.e.
+    the Markdown rendering of every page concatenated in document
+    order, with form-style pages rendered as aligned Markdown
+    tables and prose pages rendered as plain text paragraphs.
 
     Parameters
     ----------
@@ -74,9 +89,10 @@ def extract_text(pdf_path: Path) -> str:
     Returns
     -------
     str
-        Concatenated page text. The string may contain newlines
-        but is never ``None`` and never empty unless the document
-        has no extractable text at all.
+        Concatenated Markdown text. The string may contain
+        newlines and pipe-delimited table rows, but is never
+        ``None`` and never empty unless the document has no
+        extractable content at all.
 
     Raises
     ------
@@ -87,28 +103,49 @@ def extract_text(pdf_path: Path) -> str:
         failure.
     TextExtractionError
         For any extraction failure (encrypted input, syntax
-        error, page iteration error).
+        error, missing markitdown extras, page iteration error).
     """
+    md = MarkItDown()
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        result = md.convert(str(pdf_path))
     except FileNotFoundError:
         # Re-raise so the caller can distinguish a missing file
         # from any other extraction failure (e.g. encrypted).
         raise
-    except PdfminerException as exc:
-        # ``pdfplumber`` wraps pdfminer errors in a single
-        # ``PdfminerException`` class. The underlying cause is
-        # preserved in ``__context__`` because pdfplumber raises
-        # with ``raise X from None`` semantics — the cause is on
-        # the context, not the explicit cause.
-        cause = exc.__context__ or exc
-        if isinstance(cause, PDFPasswordIncorrect):
+    except MissingDependencyException as exc:
+        # ``markitdown[all]`` was not installed. This is a
+        # deployment bug, not a user error, but we surface it as
+        # :class:`TextExtractionError` so the orchestrator does
+        # not have to know about markitdown's internal exception
+        # hierarchy.
+        raise TextExtractionError(
+            f"markitdown is missing a required dependency to convert {pdf_path}: {exc}"
+        ) from exc
+    except FileConversionException as exc:
+        # ``markitdown`` wraps every PDF failure (encrypted input,
+        # syntax error, empty stream) into a single
+        # :class:`FileConversionException`. Unfortunately, it does
+        # **not** preserve the original exception on ``__cause__``
+        # — the underlying ``pdfminer`` exception is only reachable
+        # by parsing the message string. The text of the message
+        # is stable across markitdown versions (it comes from the
+        # ``PdfConverter.convert`` source), so we duck-type on the
+        # marker token.
+        message = str(exc)
+        if "PDFPasswordIncorrect" in message:
             raise TextExtractionError(
                 f"PDF {pdf_path} is still password-protected; decrypt it first"
-            ) from cause
-        raise TextExtractionError(f"Failed to extract text from {pdf_path}: {exc}") from cause
-    except Exception as exc:  # pdfplumber raises broad pdfminer exceptions
+            ) from exc
+        raise TextExtractionError(f"Failed to extract text from {pdf_path}: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - defensive net
         # Keep the message but preserve the underlying type so
         # callers can still introspect via ``__cause__``.
         raise TextExtractionError(f"Failed to extract text from {pdf_path}: {exc}") from exc
+
+    text = result.text_content
+    # ``markitdown`` is contractually required to return ``str``,
+    # but the type annotation is ``str | None`` to mirror the
+    # underlying ``pdfplumber.Page.extract_text`` signature.
+    # Normalise to ``str`` so downstream code never has to defend
+    # against ``None``.
+    return text if text is not None else ""
