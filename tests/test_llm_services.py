@@ -1084,6 +1084,70 @@ async def test_ollama_accepts_native_message_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_strips_markdown_fences_from_response() -> None:
+    """Small local models (qwen2.5:1.5b) wrap JSON in ``` fences.
+
+    The parser must peel those off so the payload validates as
+    :class:`ExtractionResponse`. Without this, every extraction
+    from a small Ollama model fails with a JSONDecodeError on
+    the first line.
+    """
+    fenced = {
+        "message": {
+            "role": "assistant",
+            "content": '```json\n' + json.dumps(VALID_EXTRACTION_PAYLOAD) + '\n```',
+        }
+    }
+    client_http, _ = make_transport(lambda req: httpx.Response(200, json=fenced))
+    settings = make_settings()
+    llm = OllamaClient(settings, http_client=client_http)
+    try:
+        result = await llm.extract_transactions(INTERNACIONAL_SAMPLE_TEXT, "INTERNACIONAL")
+    finally:
+        await llm.aclose()
+    assert len(result.transactions) == 3
+    assert result.metadata.cardholder == "LUIS SOTILLO AGUIAR"
+
+
+@pytest.mark.asyncio
+async def test_ollama_strips_markdown_fences_no_language_hint() -> None:
+    """A plain ``` fence (no ``json`` hint) is also stripped."""
+    fenced = {
+        "message": {
+            "role": "assistant",
+            "content": '```\n' + json.dumps(VALID_EXTRACTION_PAYLOAD) + '\n```',
+        }
+    }
+    client_http, _ = make_transport(lambda req: httpx.Response(200, json=fenced))
+    settings = make_settings()
+    llm = OllamaClient(settings, http_client=client_http)
+    try:
+        result = await llm.extract_transactions(INTERNACIONAL_SAMPLE_TEXT, "INTERNACIONAL")
+    finally:
+        await llm.aclose()
+    assert len(result.transactions) == 3
+
+
+@pytest.mark.asyncio
+async def test_ollama_leaves_clean_json_alone() -> None:
+    """A response without fences is passed through unchanged."""
+    clean = {
+        "message": {
+            "role": "assistant",
+            "content": json.dumps(VALID_EXTRACTION_PAYLOAD),
+        }
+    }
+    client_http, _ = make_transport(lambda req: httpx.Response(200, json=clean))
+    settings = make_settings()
+    llm = OllamaClient(settings, http_client=client_http)
+    try:
+        result = await llm.extract_transactions(INTERNACIONAL_SAMPLE_TEXT, "INTERNACIONAL")
+    finally:
+        await llm.aclose()
+    assert len(result.transactions) == 3
+
+
+@pytest.mark.asyncio
 async def test_ollama_retries_on_500_and_succeeds() -> None:
     """A 500 on the first call is retried."""
     attempts = {"n": 0}

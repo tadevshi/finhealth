@@ -32,7 +32,10 @@ services:
     # Pull the model on startup
     entrypoint: ["ollama", "serve"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      # ollama/ollama image has no curl/wget. Use bash's /dev/tcp builtin
+      # (the image ships bash; only /bin/sh is dash, which lacks /dev/tcp).
+      # `/api/tags` returns 200 once the daemon is ready to serve models.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/11434 && printf 'GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
       interval: 10s
       timeout: 5s
       retries: 5
