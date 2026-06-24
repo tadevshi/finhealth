@@ -72,15 +72,15 @@ class Settings(BaseSettings):
         description="LLM provider identifier (e.g. 'opencode_go', 'ollama').",
     )
     LLM_API_ENDPOINT: str = Field(
-        default="http://localhost:11434",
-        description="Base URL for the LLM provider's HTTP API.",
+        ...,
+        description="Base URL for the LLM provider's HTTP API. Required - no default.",
     )
     LLM_API_KEY: str = Field(
         default="",
         description="API key for LLM provider authentication (optional for local providers like Ollama).",
     )
     LLM_MODEL: str = Field(
-        default="qwen3.7-max",
+        default="qwen2.5:1.5b",
         description="Model name sent to the LLM provider.",
     )
     LLM_TIMEOUT: int = Field(
