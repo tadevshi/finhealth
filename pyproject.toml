@@ -33,7 +33,10 @@ dependencies = [
     "python-multipart>=0.0.18",
     # Phase 1 — PDF statement ingestion pipeline
     "pikepdf>=9.0,<10.0",        # PDF decryption (password-protected statements)
-    "pdfplumber>=0.11,<1.0",     # Text extraction from decrypted PDFs
+    "markitdown[all]>=0.1.0",    # PDF -> structured Markdown for LLM extraction
+    "pdfplumber>=0.11,<1.0",     # Kept as transitive dep of markitdown; used by
+                                 # variant/amount detectors that need the raw
+                                 # character stream for regex anchors.
     "httpx>=0.28,<1.0",          # Outbound HTTP for the LLM extraction provider
 ]
 
@@ -46,6 +49,7 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.14",
     "pre-commit>=4.0",
+    "reportlab>=4.0",            # Build synthetic PDFs in unit tests
 ]
 
 [tool.hatch.build.targets.wheel]

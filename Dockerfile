@@ -67,6 +67,13 @@ WORKDIR /app
 #   * ``libglib2.0-0`` — runtime dependency of libcairo / pango
 #     (also pulled in by Pillow on some wheels).
 #
+# ``markitdown[all]`` (the new PDF-to-Markdown extractor) is
+# pure-Python plus ``magika`` (which vendors an ONNX model); it
+# does not introduce additional system-level shared libraries
+# beyond what ``pdfplumber`` already needed. If a future extra is
+# added (e.g. ``[audio]`` or ``[video]``), ``ffmpeg`` would have
+# to land here too.
+#
 # ``--no-install-recommends`` keeps the layer as small as possible;
 # ``rm -rf /var/lib/apt/lists/*`` drops the apt cache so it does not
 # bloat the final image.

@@ -21,9 +21,9 @@ the money actually goes.
 - **Server-rendered web shell** (Jinja2 + HTMX + Alpine.js + Tailwind CSS)
   with a dark-mode toggle
 - **PDF statement ingestion** — drop a Chilean bank statement PDF, the
-  pipeline decrypts (pikepdf), extracts text (pdfplumber), detects the
-  CMF NACIONAL / INTERNACIONAL variant, and parses transactions with the
-  configured LLM
+  pipeline decrypts (pikepdf), converts the PDF to structured
+  Markdown (markitdown), detects the CMF NACIONAL / INTERNACIONAL
+  variant, and parses transactions with the configured LLM
 - **Provider-agnostic LLM** — `opencode_go` (default, OpenAI-compatible),
   `ollama`, or `opencode_zen` (curated cloud models via the
   Anthropic-compatible endpoint). Selected by `LLM_PROVIDER`
@@ -173,7 +173,9 @@ Expected response:
    that matches the statement.
 6. Click **Upload statement**. The pipeline:
    - Decrypts the PDF with the bank-specific formula
-   - Extracts text with `pdfplumber`
+   - Converts the PDF to structured Markdown with `markitdown`
+     (Microsoft) — preserves table structure so small LLMs parse
+     it in a fraction of the time they need for raw text
    - Detects the CMF NACIONAL / INTERNACIONAL variant
    - Calls the configured LLM with bank+variant context
    - Parses amounts to `Decimal` and dates to the statement period
