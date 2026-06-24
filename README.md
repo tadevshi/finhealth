@@ -177,6 +177,11 @@ Expected response:
      (Microsoft) — preserves table structure so small LLMs parse
      it in a fraction of the time they need for raw text
    - Detects the CMF NACIONAL / INTERNACIONAL variant
+   - **Truncates the text to `LLM_MAX_INPUT_CHARS` (5000 by default)**
+     keeping the transactions section and dropping boilerplate.
+     Small local models (qwen2.5:1.5b) produce malformed JSON
+     on long prompts, so the truncator anchors the slice to the
+     `INFORMACIÓN DE TRANSACCIONES` / `PERÍODO ACTUAL` marker.
    - Calls the configured LLM with bank+variant context
    - Parses amounts to `Decimal` and dates to the statement period
    - Persists the statement (status `completed`) + every transaction
@@ -302,7 +307,7 @@ finhealth/
 │   ├── models/              #   SQLAlchemy ORM models (Bank, CreditCard, Statement, Transaction)
 │   ├── schemas/             #   Pydantic request/response models
 │   ├── services/            #   Domain services
-│   │   ├── pdf/             #     PDF pipeline (decrypt, extract, variant, amount)
+│   │   ├── pdf/             #     PDF pipeline (decrypt, extract, variant, amount, truncate)
 │   │   ├── llm/             #     LLM provider abstraction (opencode_go, ollama, opencode_zen)
 │   │   └── ingestion.py     #     Orchestrator (PDF + LLM + DB)
 │   ├── static/              #   Static assets served at /static
@@ -340,6 +345,7 @@ project root). See `.env.example` for the full list. Key entries:
 | `LLM_MODEL`         | `qwen3.7-max`                          | Model name sent to the LLM provider           |
 | `LLM_TIMEOUT`       | `60`                                   | Timeout (seconds) for one LLM call            |
 | `LLM_MAX_RETRIES`   | `3`                                    | Automatic retries on transient LLM errors     |
+| `LLM_MAX_INPUT_CHARS` | `5000`                               | Max chars of PDF text sent to the LLM         |
 | `PDF_UPLOAD_DIR`    | `shared`                               | Where uploaded PDFs are stored                |
 | `MAX_FILE_SIZE_MB`  | `10`                                   | Upload size cap (413 over the cap)            |
 
