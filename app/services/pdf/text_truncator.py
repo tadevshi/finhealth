@@ -14,18 +14,23 @@ Strategy
 --------
 
 1. If the text is already short enough, return it as-is.
-2. Look for section markers (PERÍODO ACTUAL, INFORMACIÓN DE
+2. If a ``variant`` is provided and the text contains BOTH
+   variants (some PDFs bundle NACIONAL + INTERNACIONAL in one
+   file), trim the text to the section that matches the variant
+   and drop the other section entirely. This prevents the small
+   LLM from reading transactions from the wrong currency section.
+3. Look for section markers (PERÍODO ACTUAL, INFORMACIÓN DE
    TRANSACCIONES, DETALLE) and prefer text starting at the first
    match. Markers within the first ~100 chars are ignored as header
    noise (the CMF statement repeats the period label in the header).
-3. If no section markers are found, return the first ``max_chars``
+4. If no section markers are found, return the first ``max_chars``
    characters (the cardholder / period info is always at the start
    of the statement).
 """
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, Literal
 
 #: Maximum number of characters to send to the LLM. Small local
 #: models start producing malformed JSON above this threshold.
@@ -59,8 +64,72 @@ _TRANSACTION_END_MARKERS: Final = (
 #: transactions section anchor.
 _HEADER_NOISE_OFFSET: Final = 100
 
+#: Markers that start the INTERNACIONAL (USD) section of a statement.
+#: Used to strip the INTERNACIONAL section when the variant we want
+#: is NACIONAL (so the LLM doesn't get confused by USD transactions).
+_INTERNACIONAL_SECTION_START: Final = (
+    "ESTADO DE CUENTA INTERNACIONAL",
+    "INTERNACIONAL",
+)
 
-def truncate_for_llm(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
+#: Markers that start the NACIONAL (CLP) section of a statement.
+#: Used to strip the NACIONAL section when the variant we want is
+#: INTERNACIONAL.
+_NACIONAL_SECTION_START: Final = (
+    "ESTADO DE CUENTA NACIONAL",
+)
+
+
+def _strip_other_variant(
+    text: str, variant: Literal["NACIONAL", "INTERNACIONAL"]
+) -> str:
+    """Drop the OTHER variant's section from ``text``.
+
+    Some Chilean bank statements bundle NACIONAL (CLP) and
+    INTERNACIONAL (USD) sections in a single PDF. When the
+    detector picks one variant but the LLM receives both, it
+    sometimes returns transactions from the wrong currency
+    section (e.g. USD rows when we asked for NACIONAL/CLP).
+    This helper trims the text so only the chosen variant's
+    section remains.
+
+    Returns
+    -------
+    str
+        ``text`` unchanged if no other-variant section is found,
+        or ``text`` with the other-variant section removed.
+    """
+    if variant == "NACIONAL":
+        # Drop everything from the start of the INTERNACIONAL section
+        # to the end of the document.
+        for marker in _INTERNACIONAL_SECTION_START:
+            idx = text.find(marker)
+            if idx > _HEADER_NOISE_OFFSET:
+                return text[:idx]
+    else:  # INTERNACIONAL
+        # Drop everything from the start of the document up to the
+        # INTERNACIONAL section. The NACIONAL section is at the
+        # start, so we keep text from the INTERNACIONAL marker onward.
+        # We still want the header info (cardholder, card number)
+        # from the NACIONAL section, so look for a header marker
+        # at the start of the document instead.
+        # The header (cardholder, card number, period) is in the
+        # first ~500 chars of every CMF statement. Keep that, then
+        # jump to the INTERNACIONAL section.
+        for marker in _INTERNACIONAL_SECTION_START:
+            idx = text.find(marker)
+            if idx > _HEADER_NOISE_OFFSET:
+                # Keep the header (first ~500 chars) + INTERNACIONAL section
+                header = text[:500]
+                return header + text[idx:]
+    return text
+
+
+def truncate_for_llm(
+    text: str,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    variant: Literal["NACIONAL", "INTERNACIONAL"] | None = None,
+) -> str:
     """Return a truncated excerpt of ``text`` suitable for LLM extraction.
 
     Parameters
@@ -69,6 +138,12 @@ def truncate_for_llm(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
         The full Markdown text extracted from the PDF.
     max_chars
         Maximum number of characters to return. Default 5000.
+    variant
+        The detected statement variant (``"NACIONAL"`` for CLP,
+        ``"INTERNACIONAL"`` for USD). When provided and the text
+        contains BOTH variants, only the matching section is
+        kept. When ``None``, the first transactions section is
+        used regardless of currency.
 
     Returns
     -------
@@ -79,6 +154,9 @@ def truncate_for_llm(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
         starts at the beginning of the text (so the cardholder /
         period info is preserved).
     """
+    if variant is not None:
+        text = _strip_other_variant(text, variant)
+
     if len(text) <= max_chars:
         return text
 

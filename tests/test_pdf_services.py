@@ -1104,6 +1104,67 @@ class TestTruncateForLLM:
         truncate_for_llm(text, max_chars=1000)
         assert text == snapshot
 
+    def test_variant_nacional_strips_internacional_section(self) -> None:
+        """A bundled NACIONAL+INTERNACIONAL PDF keeps only the CLP section
+        when ``variant="NACIONAL"``.
+
+        Some Chilean bank statements bundle both sections in one
+        PDF (notably Banco de Chile). When the detector picks
+        NACIONAL but the LLM receives both, it sometimes returns
+        USD transactions because the USD section appears later in
+        the document. Stripping the INTERNACIONAL section before
+        truncation prevents that confusion.
+        """
+        # Header + NACIONAL section + INTERNACIONAL section
+        header = "X" * 300  # cardholder, card number, period
+        nacional = "NACIONAL_DATA\n" + "y" * 5000
+        internacional = "ESTADO DE CUENTA INTERNACIONAL\n" + "z" * 10000
+        text = header + "\n" + nacional + "\n" + internacional
+
+        result = truncate_for_llm(text, max_chars=8000, variant="NACIONAL")
+
+        # The INTERNACIONAL marker must be gone
+        assert "ESTADO DE CUENTA INTERNACIONAL" not in result
+        # The NACIONAL data must be preserved
+        assert "NACIONAL_DATA" in result
+
+    def test_variant_internacional_keeps_header_and_int_section(self) -> None:
+        """A bundled NACIONAL+INTERNACIONAL PDF keeps the header (for
+        cardholder / card number) and the INTERNACIONAL section
+        when ``variant="INTERNACIONAL"``.
+
+        The LLM still needs the cardholder name and PAN from the
+        NACIONAL header, so the truncator keeps the first ~500
+        chars of the document and then jumps to the INTERNACIONAL
+        section. The bulk of the NACIONAL section (transactions,
+        tables) is dropped.
+        """
+        header = "H" * 500
+        # NACIONAL_DATA starts after the header is over so the test
+        # can assert the bulk of the section is dropped.
+        nacional = "y" * 100 + "\nNACIONAL_DATA\n" + "y" * 5000
+        internacional = "ESTADO DE CUENTA INTERNACIONAL\n" + "z" * 5000
+        text = header + "\n" + nacional + "\n" + internacional
+
+        result = truncate_for_llm(text, max_chars=8000, variant="INTERNACIONAL")
+
+        # The header is kept (cardholder info)
+        assert header in result
+        # The INTERNACIONAL section is kept
+        assert "ESTADO DE CUENTA INTERNACIONAL" in result
+        # The NACIONAL section data (the bulk, not the header) is dropped
+        assert "NACIONAL_DATA" not in result
+
+    def test_variant_none_falls_back_to_first_section(self) -> None:
+        """With ``variant=None``, the truncator picks the first section
+        regardless of currency — useful as a fallback when the
+        detector is uncertain.
+        """
+        text = "Header\n" + "x" * 200 + "\nINFORMACIÓN DE TRANSACCIONES\n" + "y" * 10000
+        result = truncate_for_llm(text, max_chars=1000, variant=None)
+        assert "INFORMACIÓN DE TRANSACCIONES" in result
+        assert len(result) <= 1000
+
 
 # ---------------------------------------------------------------------------
 # End-to-end smoke test (real PDFs, full pipeline)
