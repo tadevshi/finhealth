@@ -20,20 +20,17 @@ def test_settings_defaults() -> None:
     """Defaults match the documented values when no env is set."""
     # _env_file=None forces Settings to read only from the process env,
     # not from a local .env file (which may override defaults in dev).
-    settings = Settings(_env_file=None, LLM_API_ENDPOINT="http://localhost:11434")
+    settings = Settings(_env_file=None)
 
     assert settings.APP_NAME == "finhealth"
     assert settings.DEBUG is False
     assert settings.SECRET_KEY == "change-me-in-production"
     assert settings.DATABASE_URL == "sqlite+aiosqlite:///./finhealth.db"
     assert settings.CORS_ORIGINS == ["http://localhost:8000"]
-
-
-def test_settings_requires_llm_api_endpoint() -> None:
-    """LLM_API_ENDPOINT must be explicitly set — no implicit default."""
-    # _env_file=None ensures the .env file doesn't satisfy the field.
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None)
+    # LLM defaults: OpenCode Zen with a free model — no API key required to start.
+    assert settings.LLM_PROVIDER == "opencode_zen"
+    assert settings.LLM_API_ENDPOINT == "https://opencode.ai/zen/v1"
+    assert settings.LLM_MODEL == "deepseek-v4-flash-free"
 
 
 def test_settings_env_override(
@@ -47,6 +44,7 @@ def test_settings_env_override(
     monkeypatch.setenv(
         "CORS_ORIGINS", '["https://example.com","https://api.example.com"]'
     )
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
     monkeypatch.setenv("LLM_API_ENDPOINT", "http://test-llm:11434")
 
     settings = Settings(_env_file=None)
@@ -59,6 +57,7 @@ def test_settings_env_override(
         "https://example.com",
         "https://api.example.com",
     ]
+    assert settings.LLM_PROVIDER == "ollama"
     assert settings.LLM_API_ENDPOINT == "http://test-llm:11434"
 
 

@@ -68,20 +68,21 @@ class Settings(BaseSettings):
     # ``LLM_MAX_RETRIES`` is the number of automatic retries on
     # transient errors (network blips, 5xx responses, timeouts).
     LLM_PROVIDER: str = Field(
-        default="opencode_go",
-        description=("LLM provider identifier (e.g. 'opencode_go', 'ollama', 'opencode_zen')."),
+        default="opencode_zen",
+        description=("LLM provider identifier. 'opencode_zen' (default, free models available), "
+                     "'ollama' (self-hosted), 'opencode_go' (Go subscription)."),
     )
     LLM_API_ENDPOINT: str = Field(
-        ...,
-        description="Base URL for the LLM provider's HTTP API. Required - no default.",
+        default="https://opencode.ai/zen/v1",
+        description="Base URL for the LLM provider's HTTP API.",
     )
     LLM_API_KEY: str = Field(
         default="",
         description="API key for LLM provider authentication (optional for local providers like Ollama).",
     )
     LLM_MODEL: str = Field(
-        default="qwen2.5:1.5b",
-        description="Model name sent to the LLM provider.",
+        default="deepseek-v4-flash-free",
+        description="Model name sent to the LLM provider. Default is a free model on OpenCode Zen.",
     )
     LLM_TIMEOUT: int = Field(
         default=60,
