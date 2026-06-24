@@ -94,6 +94,16 @@ class Settings(BaseSettings):
         ge=0,
         description="Number of automatic retries on transient LLM errors.",
     )
+    LLM_MAX_INPUT_CHARS: int = Field(
+        default=5000,
+        ge=1000,
+        description=(
+            "Max characters of PDF text to send to the LLM. "
+            "Small local models (qwen2.5:1.5b) produce malformed JSON "
+            "on long prompts; the truncator keeps the transactions "
+            "section and drops boilerplate."
+        ),
+    )
 
     # PDF ingestion --------------------------------------------------------------
     # ``PDF_UPLOAD_DIR`` is resolved relative to the project root when

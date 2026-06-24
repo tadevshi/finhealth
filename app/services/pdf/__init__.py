@@ -23,6 +23,9 @@ Module map
 * :mod:`app.services.pdf.amount_parser` — converts a raw
   amount string (``"$ 1.234.567"`` or ``"US$ 1.234,56"``) to a
   :class:`decimal.Decimal` with no floating-point drift.
+* :mod:`app.services.pdf.text_truncator` — clips the extracted
+  text to a size small local LLMs can handle while keeping the
+  transactions section.
 
 Each module exposes a small set of pure functions or a single
 class with a few methods. No module here touches the database, the
@@ -38,6 +41,7 @@ from app.services.pdf.password_deriver import (
     InvalidRUTError,
     derive_password,
 )
+from app.services.pdf.text_truncator import DEFAULT_MAX_CHARS, truncate_for_llm
 from app.services.pdf.variant_detector import (
     Variant,
     VariantDetectionError,
@@ -45,6 +49,7 @@ from app.services.pdf.variant_detector import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_CHARS",
     "AmountParseError",
     "InvalidPasswordFormulaError",
     "InvalidRUTError",
@@ -58,4 +63,5 @@ __all__ = [
     "detect_variant",
     "extract_text",
     "parse_amount",
+    "truncate_for_llm",
 ]

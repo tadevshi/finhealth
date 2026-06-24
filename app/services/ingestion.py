@@ -257,6 +257,19 @@ class IngestionService:
                 raise
             raise IngestionError(str(exc)) from exc
 
+        # 4b. Truncate the text before sending it to the LLM.
+        #     Small local models (qwen2.5:1.5b) cannot handle
+        #     the full ~18k chars a CMF statement produces via
+        #     markitdown — they return generic chat instead of
+        #     valid JSON once the prompt exceeds ~5k chars. The
+        #     truncator keeps the transactions section marker
+        #     and drops boilerplate, so the LLM still gets the
+        #     rows it needs. Truncation happens *after* variant
+        #     detection so the detector sees the full text.
+        from app.services.pdf.text_truncator import truncate_for_llm
+
+        text = truncate_for_llm(text, max_chars=self._settings.LLM_MAX_INPUT_CHARS)
+
         # 5. Hash the file (after we know the encryption is
         #    correct). The hash is the dedup key, and it must
         #    match across uploads of the same encrypted file.

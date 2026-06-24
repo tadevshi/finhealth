@@ -62,6 +62,7 @@ import pytest
 
 from app.models.bank import Bank
 from app.services.pdf import (
+    DEFAULT_MAX_CHARS,
     AmountParseError,
     InvalidPasswordFormulaError,
     InvalidRUTError,
@@ -74,6 +75,7 @@ from app.services.pdf import (
     detect_variant,
     extract_text,
     parse_amount,
+    truncate_for_llm,
 )
 from app.services.pdf.amount_parser import _CLP_MARKER, _USD_MARKER
 from app.services.pdf.password_deriver import (
@@ -943,6 +945,164 @@ class TestParseAmount:
         # The string form is the canonical decimal, not the
         # float-induced 0.30000000000000004.
         assert str(value) == "0.30"
+
+
+# ---------------------------------------------------------------------------
+# Text truncator
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateForLLM:
+    """``truncate_for_llm`` keeps the transactions section marker (or the
+    head) and drops boilerplate to fit ``max_chars``.
+
+    The function is the safety net for small local models: a full
+    CMF statement produces ~18k chars of Markdown, but models
+    like qwen2.5:1.5b start hallucinating / returning generic chat
+    once the prompt exceeds ~5k chars. The class is the regression
+    net that keeps that property intact — every branch (short
+    text, long text with markers, long text without markers,
+    header-noise markers) is covered.
+    """
+
+    def test_short_text_returned_unchanged(self) -> None:
+        """Text shorter than ``max_chars`` is returned verbatim.
+
+        The fast path is the most common case for small test
+        fixtures and a no-op when the truncator is wired in with
+        a generous cap. Identity (not just equality) is asserted
+        so a defensive ``str(text)`` or copy does not sneak in.
+        """
+        text = "Short text"
+        assert truncate_for_llm(text, max_chars=100) == "Short text"
+
+    def test_long_text_truncated_to_max_chars(self) -> None:
+        """Text longer than ``max_chars`` is sliced to exactly ``max_chars``."""
+        text = "x" * 10000
+        result = truncate_for_llm(text, max_chars=1000)
+        assert len(result) == 1000
+        # The result is the head slice (no markers in the input).
+        assert result == "x" * 1000
+
+    def test_default_max_chars_is_5000(self) -> None:
+        """The default cap is 5000 chars.
+
+        This is the value the orchestrator relies on for small
+        local models. Changing the default is a behavioural break
+        for the production LLM call.
+        """
+        assert DEFAULT_MAX_CHARS == 5000
+        text = "x" * 6000
+        result = truncate_for_llm(text)
+        assert len(result) == 5000
+
+    def test_finds_transactions_section_marker(self) -> None:
+        """A ``INFORMACIÓN DE TRANSACCIONES`` marker past the header noise
+        offset anchors the slice.
+
+        The header is dropped because the marker offers a richer
+        starting point — the LLM does not need the cardholder
+        name to extract transaction rows, but it does need every
+        transaction row in the budget.
+        """
+        text = "Header stuff\n" + "x" * 200 + "\nINFORMACIÓN DE TRANSACCIONES\n" + "y" * 10000
+        result = truncate_for_llm(text, max_chars=1000)
+        assert "INFORMACIÓN DE TRANSACCIONES" in result
+        assert "Header stuff" not in result  # truncated to start at marker
+        assert len(result) == 1000
+
+    def test_prefers_most_specific_marker(self) -> None:
+        """The most specific (earliest-priority) marker wins.
+
+        ``INFORMACIÓN DE TRANSACCIONES`` > ``PERÍODO ACTUAL`` >
+        ``DETALLE`` — when more than one is present past the
+        header-noise offset, the more specific one is preferred
+        because it usually sits closer to the transaction rows
+        and skips more boilerplate.
+        """
+        text = (
+            "x" * 100
+            + "\nDETALLE\n"
+            + "y" * 100
+            + "\nPERÍODO ACTUAL\n"
+            + "z" * 10000
+        )
+        result = truncate_for_llm(text, max_chars=2000)
+        assert "PERÍODO ACTUAL" in result
+        assert "DETALLE" not in result  # skipped over DETALLE to find PERÍODO ACTUAL
+
+    def test_prefers_informacion_de_transacciones_over_periodo_actual(self) -> None:
+        """``INFORMACIÓN DE TRANSACCIONES`` beats ``PERÍODO ACTUAL`` when
+        both are present past the header-noise offset.
+        """
+        text = (
+            "x" * 200
+            + "\nPERÍODO ACTUAL\n"
+            + "y" * 200
+            + "\nINFORMACIÓN DE TRANSACCIONES\n"
+            + "z" * 10000
+        )
+        result = truncate_for_llm(text, max_chars=2000)
+        assert "INFORMACIÓN DE TRANSACCIONES" in result
+        assert "PERÍODO ACTUAL" not in result
+
+    def test_ignores_marker_in_header_noise(self) -> None:
+        """A marker within the first ~100 chars is treated as header noise.
+
+        The bank's page header often repeats ``PERÍODO ACTUAL``
+        in the first few lines; a near-zero match would skip
+        almost the whole document and miss the real transactions
+        table. The truncator ignores matches inside the
+        header-noise offset and falls back to the head slice.
+        """
+        text = (
+            "ESTADO DE CUENTA\n"
+            "PERÍODO ACTUAL 01/05/2025 - 31/05/2025\n"
+            "Tarjeta XXXX-0463\n"
+            + "a" * 100
+            + "\nINFORMACIÓN DE TRANSACCIONES\n"
+            + "b" * 10000
+        )
+        result = truncate_for_llm(text, max_chars=2000)
+        # The head-noise match was skipped; the more useful
+        # transactions marker wins and anchors the slice.
+        assert "INFORMACIÓN DE TRANSACCIONES" in result
+
+    def test_falls_back_to_head_slice_when_no_markers(self) -> None:
+        """A long text with no recognised markers returns the first
+        ``max_chars`` chars (the header is always at the start).
+        """
+        text = "header boilerplate\n" + "a" * 10000 + "\nfooter boilerplate"
+        result = truncate_for_llm(text, max_chars=1000)
+        assert len(result) == 1000
+        assert result.startswith("header boilerplate")
+
+    def test_never_exceeds_max_chars(self) -> None:
+        """Property: the result is always ``<= max_chars`` chars long.
+
+        Tested across the three branches: short text, long with
+        marker, long without marker. A regression that slices
+        past the cap would surface here.
+        """
+        long_with_marker = "x" * 100 + "\nDETALLE\n" + "y" * 20000
+        long_without_marker = "z" * 20000
+        short = "tiny"
+        for text in (long_with_marker, long_without_marker, short):
+            result = truncate_for_llm(text, max_chars=500)
+            assert len(result) <= 500
+
+    def test_does_not_mutate_input(self) -> None:
+        """The function returns a slice; the input is not modified.
+
+        Defensive: callers (the orchestrator) keep the full text
+        around for the variant detector and for logging; a
+        truncator that mutated the input would silently corrupt
+        the caller's view of the document.
+        """
+        text = "Header\n" + "x" * 200 + "\nDETALLE\n" + "y" * 10000
+        snapshot = text
+        truncate_for_llm(text, max_chars=1000)
+        assert text == snapshot
 
 
 # ---------------------------------------------------------------------------

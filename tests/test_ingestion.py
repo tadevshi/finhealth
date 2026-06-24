@@ -180,6 +180,9 @@ NACIONAL_EXTRACTION_PAYLOAD: dict[str, Any] = {
         },
     ],
     "metadata": {
+        "card_number_masked": "XXXX XXXX XXXX 1234",
+        "cardholder": "JUAN PEREZ",
+        "currency": "CLP",
         "period_start": "15/05/2025",
         "period_end": "22/05/2025",
         "statement_date": "01/06/2025",
@@ -213,6 +216,9 @@ INTERNACIONAL_EXTRACTION_PAYLOAD: dict[str, Any] = {
         },
     ],
     "metadata": {
+        "card_number_masked": "XXXX XXXX XXXX 5678",
+        "cardholder": "MARIA GONZALEZ",
+        "currency": "USD",
         "period_start": "03/05/2025",
         "period_end": "18/05/2025",
         "statement_date": "01/06/2025",
