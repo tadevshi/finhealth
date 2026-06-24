@@ -268,7 +268,11 @@ class IngestionService:
         #     detection so the detector sees the full text.
         from app.services.pdf.text_truncator import truncate_for_llm
 
-        text = truncate_for_llm(text, max_chars=self._settings.LLM_MAX_INPUT_CHARS)
+        text = truncate_for_llm(
+            text,
+            max_chars=self._settings.LLM_MAX_INPUT_CHARS,
+            variant=variant,
+        )
 
         # 5. Hash the file (after we know the encryption is
         #    correct). The hash is the dedup key, and it must
