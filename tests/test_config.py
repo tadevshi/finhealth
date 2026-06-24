@@ -18,7 +18,9 @@ def _clear_settings_cache() -> Iterator[None]:
 
 def test_settings_defaults() -> None:
     """Defaults match the documented values when no env is set."""
-    settings = Settings()
+    # _env_file=None forces Settings to read only from the process env,
+    # not from a local .env file (which may override defaults in dev).
+    settings = Settings(_env_file=None, LLM_API_ENDPOINT="http://localhost:11434")
 
     assert settings.APP_NAME == "finhealth"
     assert settings.DEBUG is False
@@ -27,15 +29,27 @@ def test_settings_defaults() -> None:
     assert settings.CORS_ORIGINS == ["http://localhost:8000"]
 
 
-def test_settings_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_requires_llm_api_endpoint() -> None:
+    """LLM_API_ENDPOINT must be explicitly set — no implicit default."""
+    # _env_file=None ensures the .env file doesn't satisfy the field.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_settings_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Environment variables override defaults."""
     monkeypatch.setenv("APP_NAME", "finhealth-test")
     monkeypatch.setenv("DEBUG", "true")
     monkeypatch.setenv("SECRET_KEY", "super-secret")
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./custom-test.db")
-    monkeypatch.setenv("CORS_ORIGINS", '["https://example.com","https://api.example.com"]')
+    monkeypatch.setenv(
+        "CORS_ORIGINS", '["https://example.com","https://api.example.com"]'
+    )
+    monkeypatch.setenv("LLM_API_ENDPOINT", "http://test-llm:11434")
 
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     assert settings.APP_NAME == "finhealth-test"
     assert settings.DEBUG is True
@@ -45,6 +59,7 @@ def test_settings_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
         "https://example.com",
         "https://api.example.com",
     ]
+    assert settings.LLM_API_ENDPOINT == "http://test-llm:11434"
 
 
 def test_get_settings_is_cached() -> None:
