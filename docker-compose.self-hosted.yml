@@ -1,0 +1,72 @@
+# Self-hosted deployment with Ollama as a sidecar
+# Optimized for CPU-only servers with limited RAM
+#
+# Quick start:
+#   1. (optional) Set LLM_MODEL in your .env to override the default
+#   2. docker compose -f docker-compose.self-hosted.yml up -d ollama
+#   3. ./scripts/pull-ollama-model.sh            # one-time model download
+#   4. docker compose -f docker-compose.self-hosted.yml up -d
+#   5. Open http://localhost:8000
+#
+# The finhealth container waits for Ollama to be healthy before
+# starting (depends_on + service_healthy), so a cold pull does not
+# race with the first LLM call.
+#
+# For cloud LLM providers (OpenAI, Anthropic, etc.) use the default
+# docker-compose.yml instead.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: finhealth-ollama
+    # CPU-only: no GPU passthrough
+    # Limit memory to prevent OOM
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    volumes:
+      - ollama_data:/root/.ollama
+    # Pull the model on startup
+    entrypoint: ["ollama", "serve"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  finhealth:
+    build: .
+    image: finhealth:local
+    container_name: finhealth
+    depends_on:
+      ollama:
+        condition: service_healthy
+    user: "${HOST_UID:-0}:${HOST_GID:-0}"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./shared:/app/shared
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/finhealth.db
+      - DEBUG=false
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      # Point to Ollama sidecar via Docker's internal DNS
+      - LLM_PROVIDER=ollama
+      - LLM_API_ENDPOINT=http://ollama:11434
+      # Default to a CPU-friendly model
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:1.5b}
+      - LLM_TIMEOUT=120  # CPU inference is slower
+      - LLM_MAX_RETRIES=3
+      - PDF_UPLOAD_DIR=/app/shared
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-10}
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+    # Persist pulled models across container restarts
