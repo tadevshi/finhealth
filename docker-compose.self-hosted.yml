@@ -59,12 +59,13 @@ services:
       - DATABASE_URL=sqlite+aiosqlite:////app/data/finhealth.db
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      # Point to Ollama sidecar via Docker's internal DNS
-      - LLM_PROVIDER=ollama
-      - LLM_API_ENDPOINT=http://ollama:11434
-      # Default to a CPU-friendly model
+      # LLM provider: defaults to ollama (sidecar), override via .env
+      # for cloud providers (opencode_zen, openai, anthropic, etc.)
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_API_ENDPOINT=${LLM_API_ENDPOINT:-http://ollama:11434}
+      - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:1.5b}
-      - LLM_TIMEOUT=120  # CPU inference is slower
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-300}  # CPU inference is slow; cloud is fast
       - LLM_MAX_RETRIES=3
       - PDF_UPLOAD_DIR=/app/shared
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-10}
