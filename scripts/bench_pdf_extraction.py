@@ -29,6 +29,8 @@ from pathlib import Path
 # Allow running the script from the repo root without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pdfplumber
+from markitdown import MarkItDown
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
@@ -41,15 +43,13 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from markitdown import MarkItDown
 
-import pdfplumber
-
-
-def build_synthetic_statement(out_path: Path, *, page_count: int = 8, rows_per_page: int = 40) -> Path:
+def build_synthetic_statement(
+    out_path: Path, *, page_count: int = 8, rows_per_page: int = 40
+) -> Path:
     """Build a multi-page bank-statement-shaped PDF on disk.
 
-    Eight pages × forty rows mirrors the size of a real Santander
+    Eight pages times forty rows mirrors the size of a real Santander
     statement closely enough that the conversion time is in the
     same order of magnitude; the LLM wall-time wins from
     markitdown scale with input size, so a representative shape
@@ -59,13 +59,22 @@ def build_synthetic_statement(out_path: Path, *, page_count: int = 8, rows_per_p
     doc = SimpleDocTemplate(str(out_path), pagesize=letter)
     story: list = []
     for page_idx in range(page_count):
-        story.append(Paragraph("ESTADO DE CUENTA NACIONAL DE TARJETA DE CRÉDITO", styles["Heading1"]))
+        story.append(
+            Paragraph("ESTADO DE CUENTA NACIONAL DE TARJETA DE CRÉDITO", styles["Heading1"])
+        )
         story.append(Paragraph("NOMBRE DEL TITULAR LUIS SOTILLO AGUIAR", styles["Normal"]))
         story.append(Spacer(1, 12))
-        data: list[list[str]] = [["Fecha", "Descripción", "Monto $"], *[
-            [f"15/0{((i % 9) + 1)}/2025", f"MERCHANT {i:03d}", f"{(i + 1) * 1000:,}".replace(",", ".")]
-            for i in range(rows_per_page)
-        ]]
+        data: list[list[str]] = [
+            ["Fecha", "Descripción", "Monto $"],
+            *[
+                [
+                    f"15/0{((i % 9) + 1)}/2025",
+                    f"MERCHANT {i:03d}",
+                    f"{(i + 1) * 1000:,}".replace(",", "."),
+                ]
+                for i in range(rows_per_page)
+            ],
+        ]
         table = Table(data)
         table.setStyle(
             TableStyle(
@@ -106,7 +115,7 @@ def main() -> None:
     build_synthetic_statement(pdf_path, page_count=8, rows_per_page=40)
     size_kb = pdf_path.stat().st_size / 1024
 
-    print(f"Synthetic PDF: {pdf_path} ({size_kb:.1f} KB, 8 pages × 40 rows)")
+    print(f"Synthetic PDF: {pdf_path} ({size_kb:.1f} KB, 8 pages x 40 rows)")
     print(f"Repeats: {runs}\n")
 
     pdfplumber_times: list[float] = []
@@ -124,17 +133,25 @@ def main() -> None:
         print(f"  run {i + 1}: pdfplumber={pp_t * 1000:6.1f} ms   markitdown={md_t * 1000:6.1f} ms")
 
     print()
-    print(f"pdfplumber: median={statistics.median(pdfplumber_times) * 1000:6.1f} ms   "
-          f"min={min(pdfplumber_times) * 1000:6.1f} ms")
-    print(f"markitdown: median={statistics.median(markitdown_times) * 1000:6.1f} ms   "
-          f"min={min(markitdown_times) * 1000:6.1f} ms")
+    print(
+        f"pdfplumber: median={statistics.median(pdfplumber_times) * 1000:6.1f} ms   "
+        f"min={min(pdfplumber_times) * 1000:6.1f} ms"
+    )
+    print(
+        f"markitdown: median={statistics.median(markitdown_times) * 1000:6.1f} ms   "
+        f"min={min(markitdown_times) * 1000:6.1f} ms"
+    )
 
     speedup = statistics.median(pdfplumber_times) / statistics.median(markitdown_times)
-    print(f"\nmarkitdown is {speedup:.2f}× {'faster' if speedup > 1 else 'slower'} than pdfplumber on this corpus.")
+    print(
+        f"\nmarkitdown is {speedup:.2f}x {'faster' if speedup > 1 else 'slower'} than pdfplumber on this corpus."
+    )
 
     print()
-    print(f"Output sizes: pdfplumber={len(pdfplumber_text):,} chars   "
-          f"markitdown={len(markitdown_text):,} chars")
+    print(
+        f"Output sizes: pdfplumber={len(pdfplumber_text):,} chars   "
+        f"markitdown={len(markitdown_text):,} chars"
+    )
     print(f"  pdfplumber has pipe-delimited tables: {'|' in pdfplumber_text}")
     print(f"  markitdown has pipe-delimited tables: {'|' in markitdown_text}")
     print(f"  markitdown has Markdown separators: {'---' in markitdown_text}")
