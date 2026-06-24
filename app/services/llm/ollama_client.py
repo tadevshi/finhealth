@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Final
 
 import httpx
@@ -210,6 +211,11 @@ class OllamaClient(LLMProvider):
         Same shape handling as the OpenCode Go client — see
         :meth:`OpenCodeGoClient._parse_response` for the
         rationale.
+
+        Small local models (e.g. qwen2.5:1.5b) frequently wrap
+        their JSON output in Markdown code fences (```json
+        ... ```). We strip those before parsing so the
+        validation step sees a clean JSON payload.
         """
         content = _extract_content(body)
         if content is None:
@@ -217,6 +223,9 @@ class OllamaClient(LLMProvider):
                 f"Ollama response did not include a content payload: {body!r}",
                 retryable=True,
             )
+
+        if isinstance(content, str):
+            content = _strip_markdown_fences(content)
 
         try:
             data: Any = content if isinstance(content, (dict, list)) else json.loads(content)
@@ -271,3 +280,37 @@ def _extract_content(body: dict[str, Any]) -> Any:
     if "transactions" in body or "notes" in body:
         return body
     return None
+
+
+#: Regex that matches a Markdown code fence optionally tagged with
+#: a language hint (``\`\`\`json``, ``\`\`\`JSON``, ``\`\`\` ``).
+#: Captures the body of the fence (group 1). Used by
+#: :func:`_strip_markdown_fences` to peel the fences off a model's
+#: reply before JSON parsing.
+_MARKDOWN_FENCE_RE = re.compile(
+    r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$",
+    re.DOTALL,
+)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Return ``text`` with a surrounding Markdown code fence removed.
+
+    Small local models (qwen2.5:1.5b, llama3.2:1b, etc.) often reply
+    to a "return JSON" instruction with a fenced block like::
+
+        ```json
+        {"transactions": [...]}
+        ```
+
+    even when the prompt explicitly forbids Markdown. Pydantic's
+    :class:`ValidationError` then fires on the ``` prefix and
+    the whole extraction is retried for no reason. This helper
+    recognises the common single-fence shape and returns the inner
+    payload verbatim; if the input is not a fenced block, it is
+    returned unchanged.
+    """
+    match = _MARKDOWN_FENCE_RE.match(text)
+    if match is not None:
+        return match.group(1)
+    return text
