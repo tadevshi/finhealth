@@ -25,6 +25,7 @@ import logging
 from app.core.config import Settings
 from app.services.llm.ollama_client import OllamaClient
 from app.services.llm.opencode_go_client import OpenCodeGoClient
+from app.services.llm.opencode_zen_client import OpenCodeZenClient
 from app.services.llm.protocol import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -34,11 +35,16 @@ logger = logging.getLogger(__name__)
 #: values match the strings accepted in ``Settings.LLM_PROVIDER``.
 PROVIDER_OPENCODE_GO: str = "opencode_go"
 PROVIDER_OLLAMA: str = "ollama"
+PROVIDER_OPENCODE_ZEN: str = "opencode_zen"
 
 #: Canonical list of supported providers. Exposed so the test
 #: suite can iterate over every value without hardcoding
 #: strings in two places.
-SUPPORTED_PROVIDERS: tuple[str, ...] = (PROVIDER_OPENCODE_GO, PROVIDER_OLLAMA)
+SUPPORTED_PROVIDERS: tuple[str, ...] = (
+    PROVIDER_OPENCODE_GO,
+    PROVIDER_OLLAMA,
+    PROVIDER_OPENCODE_ZEN,
+)
 
 
 class UnknownLLMProviderError(ValueError):
@@ -86,6 +92,10 @@ def create_llm_client(settings: Settings) -> LLMProvider:
     if provider == PROVIDER_OLLAMA:
         logger.info("Creating OllamaClient (endpoint=%s)", settings.LLM_API_ENDPOINT)
         return OllamaClient(settings)
+
+    if provider == PROVIDER_OPENCODE_ZEN:
+        logger.info("Creating OpenCodeZenClient (endpoint=%s)", settings.LLM_API_ENDPOINT)
+        return OpenCodeZenClient(settings)
 
     raise UnknownLLMProviderError(
         f"Unknown LLM provider {settings.LLM_PROVIDER!r}. "

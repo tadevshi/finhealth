@@ -23,6 +23,10 @@ Module map
   OpenCode Go daemon, the default provider.
 * :mod:`app.services.llm.ollama_client` — Client for a local
   Ollama daemon, used for offline / privacy-sensitive runs.
+* :mod:`app.services.llm.opencode_zen_client` — Client for
+  OpenCode Zen (curated cloud models with API key auth,
+  served via the Anthropic-compatible ``/v1/messages``
+  endpoint).
 * :mod:`app.services.llm.factory` — Single entry point
   :func:`create_llm_client` that the orchestrator uses to
   construct the provider from :class:`~app.core.config.Settings`.
@@ -41,17 +45,19 @@ is a one-line change in :mod:`app.services.llm.factory`.
 Retry policy
 ------------
 
-Both concrete clients retry on transient failures (network
-timeout, HTTP 429, malformed JSON) with exponential backoff
-(1 s, 2 s, 4 s) up to ``Settings.LLM_MAX_RETRIES`` times. The
-``max_retries=0`` case disables retries and any single failure
-propagates immediately — useful for tests and for tight
-deadlines in a request handler.
+All three concrete clients retry on transient failures
+(network timeout, HTTP 429, malformed JSON) with
+exponential backoff (1 s, 2 s, 4 s) up to
+``Settings.LLM_MAX_RETRIES`` times. The ``max_retries=0``
+case disables retries and any single failure propagates
+immediately — useful for tests and for tight deadlines in
+a request handler.
 """
 
 from app.services.llm.factory import create_llm_client
 from app.services.llm.ollama_client import OllamaClient
 from app.services.llm.opencode_go_client import OpenCodeGoClient
+from app.services.llm.opencode_zen_client import OpenCodeZenClient
 from app.services.llm.protocol import LLMProvider
 from app.services.llm.schemas import (
     ExtractionResponse,
@@ -66,6 +72,7 @@ __all__ = [
     "LLMProvider",
     "OllamaClient",
     "OpenCodeGoClient",
+    "OpenCodeZenClient",
     "StatementMetadata",
     "TransactionExtraction",
     "create_llm_client",

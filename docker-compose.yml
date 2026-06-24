@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
-# finhealth — docker-compose for CLOUD LLM providers (OpenAI, Anthropic, etc.).
+# finhealth — docker-compose for CLOUD LLM providers
+# (OpenCode Zen recommended, OpenAI, Anthropic, etc.).
 #
 # For self-hosted deployment with Ollama as a sidecar (CPU-only servers,
 # no API budget), use ``docker-compose.self-hosted.yml`` instead — this

@@ -59,7 +59,7 @@ class Settings(BaseSettings):
 
     # LLM provider --------------------------------------------------------------
     # ``LLM_PROVIDER`` selects the concrete client implementation
-    # (``opencode_go``, ``ollama``, ``openai_compat``). The provider is
+    # (``opencode_go``, ``ollama``, ``opencode_zen``). The provider is
     # intentionally a string, not an enum, so adding a new one is a
     # matter of code — not a schema migration. ``LLM_API_ENDPOINT`` is
     # the base URL the provider's client talks to (an Ollama daemon
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # transient errors (network blips, 5xx responses, timeouts).
     LLM_PROVIDER: str = Field(
         default="opencode_go",
-        description="LLM provider identifier (e.g. 'opencode_go', 'ollama').",
+        description=("LLM provider identifier (e.g. 'opencode_go', 'ollama', 'opencode_zen')."),
     )
     LLM_API_ENDPOINT: str = Field(
         ...,
