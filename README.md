@@ -25,7 +25,8 @@ the money actually goes.
   CMF NACIONAL / INTERNACIONAL variant, and parses transactions with the
   configured LLM
 - **Provider-agnostic LLM** — `opencode_go` (default, OpenAI-compatible),
-  `ollama`, or any `openai_compat` endpoint. Selected by `LLM_PROVIDER`
+  `ollama`, or `opencode_zen` (curated cloud models via the
+  Anthropic-compatible endpoint). Selected by `LLM_PROVIDER`
 - **Idempotent uploads** — re-uploading the same PDF for the same card is
   a no-op (SHA-256 dedup at the `(card, file_hash)` level)
 - **Filterable transactions list** — date range, amount range, description
@@ -300,7 +301,7 @@ finhealth/
 │   ├── schemas/             #   Pydantic request/response models
 │   ├── services/            #   Domain services
 │   │   ├── pdf/             #     PDF pipeline (decrypt, extract, variant, amount)
-│   │   ├── llm/             #     LLM provider abstraction (opencode_go, ollama)
+│   │   ├── llm/             #     LLM provider abstraction (opencode_go, ollama, opencode_zen)
 │   │   └── ingestion.py     #     Orchestrator (PDF + LLM + DB)
 │   ├── static/              #   Static assets served at /static
 │   ├── web/                 #   Server-rendered HTML routes
@@ -353,21 +354,50 @@ project root). See `.env.example` for the full list. Key entries:
 finhealth ships with two docker-compose profiles. Pick the one
 that matches your environment:
 
-### Option 1: Cloud LLM (recommended for production)
+### Option 1: OpenCode Zen (recommended, pay-as-you-go)
 
-Uses an external LLM provider (OpenAI, Anthropic, OpenAI-compatible
-APIs, etc.) — fastest inference, best quality, costs API credits.
+[OpenCode Zen](https://opencode.ai/zen) is a curated list of
+LLM models (Claude, Qwen, Gemini, etc.) with transparent
+per-token pricing and a single API key. Most recommended
+models for finhealth are served through Zen's
+Anthropic-compatible `/v1/messages` endpoint.
 
-```bash
-cp .env.example .env
-# Edit .env with your cloud provider settings (LLM_PROVIDER,
-# LLM_API_ENDPOINT, LLM_API_KEY, LLM_MODEL)
-docker compose up -d
-```
+1. Sign up at <https://opencode.ai/auth> and copy your API
+   key.
+2. Set the following in `.env`:
 
-See the [Docker deployment](#docker-deployment) section below for
-the full operational reference (volumes, health checks, logs,
-updating).
+   ```bash
+   LLM_PROVIDER=opencode_zen
+   LLM_API_ENDPOINT=https://opencode.ai/zen/v1
+   LLM_API_KEY=your-key-here
+   LLM_MODEL=qwen3.7-plus
+   ```
+
+3. Start the app:
+
+   ```bash
+   docker compose up -d
+   ```
+
+**Recommended models for PDF parsing**:
+
+| Model              | Cost (1M tokens in/out) | Quality | Use case                          |
+| ------------------ | ----------------------- | ------- | --------------------------------- |
+| `qwen3.7-plus`     | $0.40 / $1.60           | Good    | Default, best value               |
+| `gemini-3-flash`   | $0.50 / $3.00           | Good    | Cheapest, good for simple statements |
+| `claude-haiku-4-5` | $1.00 / $5.00           | Better  | Complex layouts                    |
+| `qwen3.7-max`      | $2.50 / $7.50           | Best    | Premium quality                    |
+
+Start with `qwen3.7-plus` and switch up if you see extraction
+mistakes. The pricing is per-token and the model is
+re-evaluated on every call, so switching is a one-line
+`.env` change and a container restart.
+
+See the [Docker deployment](#docker-deployment) section below
+for the full operational reference (volumes, health checks,
+logs, updating).
+
+### Option 2: Self-hosted with Ollama (CPU-friendly, no API costs)
 
 ### Option 2: Self-hosted with Ollama (CPU-friendly, no API costs)
 
@@ -461,7 +491,7 @@ Docker deployment are:
 | ------------------- | --------------------------------------------- | --------------------------------------------- |
 | `DATABASE_URL`      | `sqlite+aiosqlite:////app/data/finhealth.db`  | Async SQLAlchemy URL. The path is *inside* the container — the host bind mount on `./data` makes it persistent. |
 | `SECRET_KEY`        | `change-me-in-production`                     | Set a real random value in `.env` for production. |
-| `LLM_PROVIDER`      | `opencode_go`                                 | LLM provider identifier (`opencode_go`, `ollama`, `openai_compat`). |
+| `LLM_PROVIDER`      | `opencode_go`                                 | LLM provider identifier (`opencode_go`, `ollama`, `opencode_zen`). |
 | `LLM_API_ENDPOINT`  | *(unset — required)*                          | Base URL for the LLM provider's HTTP API. No default in the cloud compose file; the app fails fast if it is unset. For self-hosted Ollama, use `docker-compose.self-hosted.yml` which points at `http://ollama:11434`. |
 | `LLM_API_KEY`       | *(unset)*                                     | Required for cloud providers. Optional for local providers like Ollama. |
 | `LLM_MODEL`         | `qwen3.7-max`                                 | Model name sent to the LLM provider. |

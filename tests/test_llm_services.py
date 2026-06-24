@@ -15,6 +15,9 @@ ingestion pipeline:
   (no real network), including retry and backoff.
 * :mod:`app.services.llm.ollama_client` — same coverage for
   :class:`OllamaClient`.
+* :mod:`app.services.llm.opencode_zen_client` — same coverage
+  for :class:`OpenCodeZenClient` (Anthropic-format ``/messages``
+  endpoint, ``x-api-key`` and ``Authorization: Bearer`` headers).
 * :mod:`app.services.llm.factory` — :func:`create_llm_client`
   dispatch and error model.
 
@@ -42,6 +45,7 @@ from app.services.llm import (
     LLMProvider,
     OllamaClient,
     OpenCodeGoClient,
+    OpenCodeZenClient,
     StatementMetadata,
     TransactionExtraction,
     create_llm_client,
@@ -49,6 +53,7 @@ from app.services.llm import (
 from app.services.llm.factory import (
     PROVIDER_OLLAMA,
     PROVIDER_OPENCODE_GO,
+    PROVIDER_OPENCODE_ZEN,
     UnknownLLMProviderError,
 )
 from app.services.llm.prompts import (
@@ -140,6 +145,23 @@ OPENAI_STYLE_RESPONSE: dict[str, Any] = {
     ]
 }
 
+#: Anthropic-style response body — what OpenCode Zen's
+#: ``/v1/messages`` endpoint returns for the recommended
+#: models. The payload is wrapped in a ``content`` array
+#: of typed blocks; we pick the ``"text"`` block and
+#: parse its ``text`` field as JSON.
+ANTHROPIC_STYLE_RESPONSE: dict[str, Any] = {
+    "id": "msg_01ABC",
+    "type": "message",
+    "role": "assistant",
+    "model": "qwen3.7-plus",
+    "content": [
+        {"type": "text", "text": json.dumps(VALID_EXTRACTION_PAYLOAD)},
+    ],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 123, "output_tokens": 456},
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -202,8 +224,10 @@ def test_protocol_is_runtime_checkable() -> None:
     settings = make_settings()
     oc = OpenCodeGoClient(settings)
     ollama = OllamaClient(settings)
+    zen = OpenCodeZenClient(settings)
     assert isinstance(oc, LLMProvider)
     assert isinstance(ollama, LLMProvider)
+    assert isinstance(zen, LLMProvider)
 
 
 def test_protocol_has_expected_method() -> None:
@@ -1239,6 +1263,343 @@ def test_ollama_acloses_owned_client() -> None:
 
 
 # ---------------------------------------------------------------------------
+# OpenCodeZenClient
+# ---------------------------------------------------------------------------
+
+
+def test_zen_url_is_messages_endpoint() -> None:
+    """The endpoint URL appends ``/messages`` to the base URL.
+
+    The Anthropic-format path is the one the recommended
+    Zen models use (``qwen3.7-plus``, ``claude-haiku-4-5``,
+    etc.). A trailing slash on the base URL is normalised.
+    """
+    settings = make_settings(LLM_API_ENDPOINT="https://opencode.ai/zen/v1/")
+    client = OpenCodeZenClient(settings)
+    assert client._endpoint_url() == "https://opencode.ai/zen/v1/messages"
+
+
+def test_zen_url_handles_no_trailing_slash() -> None:
+    """A base URL without a trailing slash still produces a clean URL."""
+    settings = make_settings(LLM_API_ENDPOINT="https://opencode.ai/zen/v1")
+    client = OpenCodeZenClient(settings)
+    assert client._endpoint_url() == "https://opencode.ai/zen/v1/messages"
+
+
+def test_zen_payload_uses_settings_model_and_anthropic_format() -> None:
+    """The request body is Anthropic-format: ``model``, ``max_tokens``, ``messages``.
+
+    Unlike the OpenCode Go client, there is no
+    ``response_format`` field — the Anthropic format does
+    not support it, and the prompt is what asks for JSON.
+    """
+    settings = make_settings(LLM_MODEL="qwen3.7-plus")
+    client = OpenCodeZenClient(settings)
+    payload = client._build_payload("hello world")
+    assert payload["model"] == "qwen3.7-plus"
+    assert payload["max_tokens"] == 4096
+    assert payload["messages"] == [{"role": "user", "content": "hello world"}]
+    assert "response_format" not in payload
+    assert "temperature" not in payload
+
+
+def test_zen_headers_include_anthropic_version() -> None:
+    """Every request advertises the pinned ``anthropic-version`` header.
+
+    Pinning the version keeps the wire format predictable
+    for the test suite and avoids a surprise when Zen
+    rolls out a new API version.
+    """
+    settings = make_settings()
+    client = OpenCodeZenClient(settings)
+    headers = client._build_headers()
+    assert headers["anthropic-version"] == "2023-06-01"
+
+
+def test_zen_headers_include_api_key_when_set() -> None:
+    """When ``LLM_API_KEY`` is set, both ``x-api-key`` and ``Authorization: Bearer`` are sent.
+
+    Zen's gateway accepts both authentication styles for
+    compatibility — the Anthropic ``x-api-key`` header
+    and the OpenAI ``Authorization: Bearer`` header. The
+    client sends both so the request works against any
+    Zen-compatible proxy.
+    """
+    settings = make_settings(LLM_API_KEY="sk-zen-test-key")
+    client = OpenCodeZenClient(settings)
+    headers = client._build_headers()
+    assert headers["x-api-key"] == "sk-zen-test-key"
+    assert headers["Authorization"] == "Bearer sk-zen-test-key"
+    assert headers["anthropic-version"] == "2023-06-01"
+
+
+def test_zen_headers_omit_auth_when_api_key_empty() -> None:
+    """An empty ``LLM_API_KEY`` produces no auth headers.
+
+    Useful for a local Zen-compatible mock that does not
+    require authentication.
+    """
+    settings = make_settings(LLM_API_KEY="")
+    client = OpenCodeZenClient(settings)
+    headers = client._build_headers()
+    assert "x-api-key" not in headers
+    assert "Authorization" not in headers
+    # ``anthropic-version`` is still sent.
+    assert headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.asyncio
+async def test_zen_successful_call_returns_extraction_response() -> None:
+    """A 200 with a valid Anthropic body produces a validated response.
+
+    The request URL is the ``/messages`` path (not
+    ``/chat/completions``), the request body is in
+    Anthropic format, and the auth headers are present.
+    """
+    client_http, seen = make_transport(
+        lambda req: httpx.Response(200, json=ANTHROPIC_STYLE_RESPONSE)
+    )
+    settings = make_settings(LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    try:
+        result = await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    finally:
+        await llm.aclose()
+
+    assert isinstance(result, ExtractionResponse)
+    assert len(result.transactions) == 3
+    assert result.confidence == pytest.approx(0.96)
+    # The request was sent to /messages, not /chat/completions.
+    assert seen[0].url.path == "/messages"
+    # The request body is Anthropic-format.
+    body = json.loads(seen[0].content)
+    assert body["model"] == settings.LLM_MODEL
+    assert body["max_tokens"] == 4096
+    assert body["messages"] == [{"role": "user", "content": body["messages"][0]["content"]}]
+    assert "SUPERMERCADOS LIDER" in body["messages"][0]["content"]
+    # The auth headers are present on the request.
+    assert seen[0].headers["x-api-key"] == "sk-zen-test-key"
+    assert seen[0].headers["Authorization"] == "Bearer sk-zen-test-key"
+    assert seen[0].headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.asyncio
+async def test_zen_concatenates_multiple_text_blocks() -> None:
+    """A response with multiple ``text`` blocks has them concatenated.
+
+    Some Anthropic-style models split their output across
+    multiple text blocks (a reasoning block + the answer,
+    for example). The parser must concatenate them, not
+    drop the answer block, so the extraction succeeds.
+    """
+    full_json = json.dumps(VALID_EXTRACTION_PAYLOAD)
+    # Split the JSON in two at the midpoint so the
+    # response has two text blocks, neither of which
+    # is a valid :class:`ExtractionResponse` on its own.
+    midpoint = len(full_json) // 2
+    split_response = {
+        "id": "msg_01ABC",
+        "type": "message",
+        "role": "assistant",
+        "model": "qwen3.7-plus",
+        "content": [
+            {"type": "text", "text": full_json[:midpoint]},
+            {"type": "text", "text": full_json[midpoint:]},
+        ],
+    }
+    client_http, _ = make_transport(lambda req: httpx.Response(200, json=split_response))
+    settings = make_settings(LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    try:
+        result = await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    finally:
+        await llm.aclose()
+
+    assert len(result.transactions) == 3
+    assert result.confidence == pytest.approx(0.96)
+
+
+@pytest.mark.asyncio
+async def test_zen_rejects_response_with_no_text_blocks() -> None:
+    """A body without any text content blocks triggers a retry, then a typed error."""
+    empty_response = {
+        "id": "msg_01ABC",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "x", "name": "y", "input": {}}],
+    }
+    client_http, _ = make_transport(lambda req: httpx.Response(200, json=empty_response))
+    settings = make_settings(LLM_MAX_RETRIES=0, LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    with (
+        patch("app.services.llm.opencode_zen_client.asyncio.sleep", new=_async_noop),
+        pytest.raises(LLMExtractionError) as exc_info,
+    ):
+        await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    # The retry layer wraps the underlying error — the
+    # original message lives on ``__cause__``.
+    assert "text content" in str(exc_info.value.__cause__)
+    await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_zen_retries_on_429_and_succeeds() -> None:
+    """A 429 on the first call is retried; success on the second."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, json={"error": "rate limited"})
+        return httpx.Response(200, json=ANTHROPIC_STYLE_RESPONSE)
+
+    client_http, _ = make_transport(handler)
+    settings = make_settings(LLM_MAX_RETRIES=3, LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    with patch("app.services.llm.opencode_zen_client.asyncio.sleep", new=_async_noop):
+        result = await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    await llm.aclose()
+    assert attempts["n"] == 2
+    assert len(result.transactions) == 3
+
+
+@pytest.mark.asyncio
+async def test_zen_does_not_retry_on_401() -> None:
+    """A 401 is non-retryable: a single attempt, then raise.
+
+    A 401 is a configuration error (wrong key, wrong
+    account). Retrying just amplifies the noise.
+    """
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    client_http, _ = make_transport(handler)
+    settings = make_settings(LLM_MAX_RETRIES=3, LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    with (
+        patch("app.services.llm.opencode_zen_client.asyncio.sleep", new=_async_noop),
+        pytest.raises(LLMExtractionError),
+    ):
+        await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    await llm.aclose()
+    assert attempts["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_zen_retries_on_schema_validation_and_succeeds() -> None:
+    """A schema-invalid body on the first call is retried."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(
+                200,
+                json={"content": [{"type": "text", "text": json.dumps({"wrong": "shape"})}]},
+            )
+        return httpx.Response(200, json=ANTHROPIC_STYLE_RESPONSE)
+
+    client_http, _ = make_transport(handler)
+    settings = make_settings(LLM_MAX_RETRIES=2, LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    with patch("app.services.llm.opencode_zen_client.asyncio.sleep", new=_async_noop):
+        result = await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    await llm.aclose()
+    assert attempts["n"] == 2
+    assert len(result.transactions) == 3
+
+
+@pytest.mark.asyncio
+async def test_zen_rejects_empty_text() -> None:
+    """An empty input raises immediately, without making any HTTP call."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(200, json=ANTHROPIC_STYLE_RESPONSE)
+
+    client_http, _ = make_transport(handler)
+    settings = make_settings(LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    with pytest.raises(LLMExtractionError, match="empty text"):
+        await llm.extract_transactions("", "NACIONAL")
+    await llm.aclose()
+    assert attempts["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_zen_backoff_uses_exponential_schedule() -> None:
+    """The retry loop calls ``asyncio.sleep`` with 1, 2, 4, ... seconds.
+
+    Verifying the backoff *durations* — not just the call
+    count — catches a regression that flattens the
+    schedule.
+    """
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"})
+
+    client_http, _ = make_transport(handler)
+    settings = make_settings(LLM_MAX_RETRIES=3, LLM_API_KEY="sk-zen-test-key")
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    with (
+        patch("app.services.llm.opencode_zen_client.asyncio.sleep", new=fake_sleep),
+        pytest.raises(LLMExtractionError),
+    ):
+        await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    await llm.aclose()
+    assert sleeps == [1, 2, 4]
+
+
+def test_zen_collect_text_blocks_branches() -> None:
+    """``_collect_text_blocks`` covers all four documented response shapes."""
+    from app.services.llm.opencode_zen_client import _collect_text_blocks
+
+    # Anthropic standard: list of typed blocks
+    body = {
+        "content": [
+            {"type": "text", "text": "alpha"},
+            {"type": "tool_use", "id": "x", "name": "y", "input": {}},
+            {"type": "text", "text": "beta"},
+        ]
+    }
+    assert _collect_text_blocks(body) == ["alpha", "beta"]
+    # Flat: a single string instead of a list
+    assert _collect_text_blocks({"content": "top-level"}) == ["top-level"]
+    # Bare payload
+    assert _collect_text_blocks({"transactions": [], "metadata": {"x": 1}}) == [
+        json.dumps({"transactions": [], "metadata": {"x": 1}})
+    ]
+    # Nothing matches
+    assert _collect_text_blocks({"unrelated": "shape"}) == []
+    # Empty list
+    assert _collect_text_blocks({"content": []}) == []
+
+
+def test_zen_acloses_owned_client() -> None:
+    """``aclosed`` semantics: owned clients are closed, injected ones are not."""
+    settings = make_settings()
+
+    owned = OpenCodeZenClient(settings)
+    internal = owned._get_client()
+    assert isinstance(internal, httpx.AsyncClient)
+    assert owned._owns_http_client is True
+
+    injected_http, _ = make_transport(
+        lambda req: httpx.Response(200, json=ANTHROPIC_STYLE_RESPONSE)
+    )
+    borrowed = OpenCodeZenClient(settings, http_client=injected_http)
+    assert borrowed._owns_http_client is False
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1255,6 +1616,19 @@ def test_factory_creates_ollama_client() -> None:
     settings = make_settings(LLM_PROVIDER=PROVIDER_OLLAMA)
     client = create_llm_client(settings)
     assert isinstance(client, OllamaClient)
+
+
+def test_factory_creates_opencode_zen_client() -> None:
+    """``LLM_PROVIDER='opencode_zen'`` produces an :class:`OpenCodeZenClient`."""
+    settings = make_settings(
+        LLM_PROVIDER=PROVIDER_OPENCODE_ZEN,
+        LLM_API_ENDPOINT="https://opencode.ai/zen/v1",
+        LLM_API_KEY="test-key",
+        LLM_MODEL="qwen3.7-plus",
+    )
+    client = create_llm_client(settings)
+    assert isinstance(client, OpenCodeZenClient)
+    assert isinstance(client, LLMProvider)
 
 
 def test_factory_accepts_case_insensitive_provider() -> None:
@@ -1279,7 +1653,7 @@ def test_factory_raises_for_unknown_provider() -> None:
 
 def test_factory_returns_protocol_compliant_object() -> None:
     """The factory's return value is always a valid :class:`LLMProvider`."""
-    for provider in (PROVIDER_OPENCODE_GO, PROVIDER_OLLAMA):
+    for provider in (PROVIDER_OPENCODE_GO, PROVIDER_OLLAMA, PROVIDER_OPENCODE_ZEN):
         client = create_llm_client(make_settings(LLM_PROVIDER=provider))
         assert isinstance(client, LLMProvider)
 
