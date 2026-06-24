@@ -348,12 +348,82 @@ project root). See `.env.example` for the full list. Key entries:
 
 ---
 
+## Deployment
+
+finhealth ships with two docker-compose profiles. Pick the one
+that matches your environment:
+
+### Option 1: Cloud LLM (recommended for production)
+
+Uses an external LLM provider (OpenAI, Anthropic, OpenAI-compatible
+APIs, etc.) — fastest inference, best quality, costs API credits.
+
+```bash
+cp .env.example .env
+# Edit .env with your cloud provider settings (LLM_PROVIDER,
+# LLM_API_ENDPOINT, LLM_API_KEY, LLM_MODEL)
+docker compose up -d
+```
+
+See the [Docker deployment](#docker-deployment) section below for
+the full operational reference (volumes, health checks, logs,
+updating).
+
+### Option 2: Self-hosted with Ollama (CPU-friendly, no API costs)
+
+For servers without a GPU or a budget for API costs. Runs Ollama
+as a sidecar container; the app talks to it over Docker's
+internal network. Optimized for CPU-only inference with limited
+RAM (2-4 GB).
+
+```bash
+# 1. Start the Ollama sidecar (waits for healthy state before
+#    finhealth starts)
+docker compose -f docker-compose.self-hosted.yml up -d ollama
+
+# 2. Pull a CPU-friendly model (one-time, ~1-3 GB download)
+./scripts/pull-ollama-model.sh qwen2.5:1.5b
+
+# 3. Start finhealth
+docker compose -f docker-compose.self-hosted.yml up -d
+```
+
+The compose file pins the LLM provider to `ollama` and points
+`LLM_API_ENDPOINT` at `http://ollama:11434` (Docker's internal DNS
+for the sidecar). Override `LLM_MODEL` in `.env` to pick a
+different model — the script reads it as the default.
+
+**Recommended models for CPU-only servers**:
+
+| Model | RAM | Speed | Quality | Use case |
+|-------|-----|-------|---------|----------|
+| `qwen2.5:1.5b` | ~1GB | Fast | Good | Default, JSON/structured output |
+| `llama3.2:3b` | ~2GB | Medium | Better | General purpose, good Spanish |
+| `phi3.5:3.8b` | ~3GB | Slow | Best | Complex parsing, highest accuracy |
+
+**Memory considerations**:
+- Each model needs RAM for weights + KV cache
+- 1.5b models: ~2GB total
+- 3b models: ~3-4GB total
+- Set `deploy.resources.limits.memory` in docker-compose accordingly
+
+Pulled models are persisted in the `ollama_data` named volume, so
+they survive `docker compose down` and container restarts. Use
+`docker compose -f docker-compose.self-hosted.yml down -v` only
+when you want a clean slate (it wipes the model cache too).
+
+---
+
 ## Docker deployment
 
 A self-hosted single-user app is the natural fit for a single
 container, so finhealth ships a multi-stage `Dockerfile` and a
 `docker-compose.yml` that mount the SQLite database and the
-upload directory as host bind mounts for persistence.
+upload directory as host bind mounts for persistence. The
+`docker-compose.yml` in this directory targets **cloud LLM
+providers**; for self-hosted Ollama see
+[Option 2](#option-2-self-hosted-with-ollama-cpu-friendly-no-api-costs)
+above.
 
 ### Quick start
 
@@ -362,7 +432,8 @@ upload directory as host bind mounts for persistence.
 
    ```bash
    cp .env.example .env
-   # Edit .env — at minimum set SECRET_KEY and the LLM endpoint.
+   # Edit .env — at minimum set SECRET_KEY, LLM_API_ENDPOINT,
+   # and LLM_API_KEY (for cloud providers).
    ```
 
 2. Build the image and start the container in the background:
@@ -391,7 +462,8 @@ Docker deployment are:
 | `DATABASE_URL`      | `sqlite+aiosqlite:////app/data/finhealth.db`  | Async SQLAlchemy URL. The path is *inside* the container — the host bind mount on `./data` makes it persistent. |
 | `SECRET_KEY`        | `change-me-in-production`                     | Set a real random value in `.env` for production. |
 | `LLM_PROVIDER`      | `opencode_go`                                 | LLM provider identifier (`opencode_go`, `ollama`, `openai_compat`). |
-| `LLM_API_ENDPOINT`  | `http://host.docker.internal:11434`           | Base URL for the LLM provider's HTTP API. `host.docker.internal` resolves to the Docker host — use a routable IP or hostname if the LLM runs elsewhere. |
+| `LLM_API_ENDPOINT`  | *(unset — required)*                          | Base URL for the LLM provider's HTTP API. No default in the cloud compose file; the app fails fast if it is unset. For self-hosted Ollama, use `docker-compose.self-hosted.yml` which points at `http://ollama:11434`. |
+| `LLM_API_KEY`       | *(unset)*                                     | Required for cloud providers. Optional for local providers like Ollama. |
 | `LLM_MODEL`         | `qwen3.7-max`                                 | Model name sent to the LLM provider. |
 | `LLM_TIMEOUT`       | `60`                                          | Timeout (seconds) for one LLM call. |
 | `LLM_MAX_RETRIES`   | `3`                                           | Automatic retries on transient LLM errors. |

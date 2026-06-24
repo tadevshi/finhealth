@@ -1,5 +1,10 @@
 # ---------------------------------------------------------------------------
-# finhealth — production docker-compose.
+# finhealth — docker-compose for CLOUD LLM providers (OpenAI, Anthropic, etc.).
+#
+# For self-hosted deployment with Ollama as a sidecar (CPU-only servers,
+# no API budget), use ``docker-compose.self-hosted.yml`` instead — this
+# file does NOT start an LLM and requires LLM_API_ENDPOINT to point at a
+# reachable provider.
 #
 # Quick start:
 #   1. ``cp .env.example .env`` and edit it (LLM endpoint, model, etc.)
@@ -57,11 +62,10 @@ services:
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
       - LLM_PROVIDER=${LLM_PROVIDER:-opencode_go}
-      # ``host.docker.internal`` resolves to the host machine from
-      # inside the container on Docker Desktop and on Linux Docker
-      # Engine 20.10+. If the LLM daemon is on another host,
-      # override ``LLM_API_ENDPOINT`` in ``.env``.
-      - LLM_API_ENDPOINT=${LLM_API_ENDPOINT:-http://host.docker.internal:11434}
+      # IMPORTANT: For self-hosted Ollama, use docker-compose.self-hosted.yml
+      # instead. This file targets a CLOUD provider, so LLM_API_ENDPOINT
+      # has no default — the app fails fast if it is unset.
+      - LLM_API_ENDPOINT=${LLM_API_ENDPOINT:-}
       # API key for LLM provider authentication. Optional for local
       # providers like Ollama (leave empty). Required for cloud
       # providers. Set in ``.env`` to avoid committing secrets.
