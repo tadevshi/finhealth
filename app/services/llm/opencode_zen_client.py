@@ -256,6 +256,13 @@ class OpenCodeZenClient(LLMProvider):
                 f"OpenCode Zen content was not valid JSON: {exc}", retryable=True
             ) from exc
 
+        # Drop empty transaction rows and sanitise metadata
+        # fields (None → "", bad currency → dropped). The
+        # orchestrator fills empty metadata from the detected
+        # variant.
+        if isinstance(data, dict):
+            data = _drop_empty_transactions(data)
+
         try:
             return ExtractionResponse.model_validate(data)
         except ValidationError as exc:
@@ -330,3 +337,58 @@ def _strip_markdown_fences(text: str) -> str:
     if match is not None:
         return match.group(1)
     return text
+
+
+def _drop_empty_transactions(data: dict[str, Any]) -> dict[str, Any]:
+    """Return ``data`` with rows that have empty fields removed
+    and metadata sanitised.
+
+    Small local models occasionally emit rows with empty fields
+    when a chunk contains only the statement header, a fee
+    block without a real transaction, or a section the model
+    could not parse. Pydantic's
+    :class:`ValidationError` would then fail the entire
+    extraction even though the rest of the chunk is fine.
+
+    We drop the bad rows here so the validation step sees a
+    clean payload. Empty strings, whitespace-only strings, and
+    ``None`` are all treated as "empty". The ``metadata`` block
+    is also sanitised: any date / cardholder field that comes
+    back as ``None`` is converted to an empty string, and a
+    bad ``currency`` value (``"CLP or USD"`` from a model that
+    copies the schema description into the value, or anything
+    other than ``"CLP"`` / ``"USD"``) is dropped so the
+    orchestrator fills it from the detected variant.
+
+    The first chunk with valid metadata is kept canonical by
+    the orchestrator.
+
+    The function is a no-op for shapes that don't have a
+    ``transactions`` key (e.g. an error envelope from the
+    provider) so it cannot accidentally corrupt the input.
+    """
+    if not isinstance(data, dict):
+        return data
+    txns = data.get("transactions")
+    if isinstance(txns, list):
+        cleaned: list[dict[str, Any]] = []
+        for row in txns:
+            if not isinstance(row, dict):
+                continue
+            desc = (row.get("description") or "").strip()
+            amount = (row.get("amount") or "").strip()
+            if not desc or not amount:
+                continue
+            cleaned.append(row)
+        data["transactions"] = cleaned
+
+    # Sanitise metadata fields.
+    meta = data.get("metadata")
+    if isinstance(meta, dict):
+        for key in ("period_start", "period_end", "statement_date", "cardholder", "card_number_masked"):
+            if meta.get(key) is None:
+                meta[key] = ""
+        currency = meta.get("currency")
+        if not isinstance(currency, str) or currency not in ("CLP", "USD"):
+            meta.pop("currency", None)
+    return data

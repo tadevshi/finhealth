@@ -566,13 +566,22 @@ class IngestionService:
 
         # Dates are strings in the LLM's output. Turn them
         # into real :class:`date` objects so the statement row
-        # can carry them.
+        # can carry them. Empty strings (model could not read
+        # the date in this chunk) fall back to ``date.today()``
+        # so the statement is still persisted. The fallback
+        # shows up as an obviously-wrong date in the UI, which
+        # is better than a hard failure.
         try:
-            period_start = _parse_llm_date(metadata.period_start, index=-1)
-            period_end = _parse_llm_date(metadata.period_end, index=-1)
-            statement_date = _parse_llm_date(metadata.statement_date, index=-1)
+            period_start_raw = _parse_llm_date(metadata.period_start, index=-1)
+            period_end_raw = _parse_llm_date(metadata.period_end, index=-1)
+            statement_date_raw = _parse_llm_date(metadata.statement_date, index=-1)
         except ValueError as exc:
             raise IngestionError(f"LLM emitted unparseable statement metadata date: {exc}") from exc
+
+        today = date.today()
+        period_start = period_start_raw or today
+        period_end = period_end_raw or today
+        statement_date = statement_date_raw or today
 
         return expected_currency, period_start, period_end, statement_date
 
@@ -793,19 +802,24 @@ def _safe_unlink(path: Path) -> None:
         logger.warning("Failed to remove temp file %s: %s", path, exc)
 
 
-def _parse_llm_date(value: str, *, index: int) -> date:
+def _parse_llm_date(value: str, *, index: int) -> date | None:
     """Parse an LLM-emitted date into a :class:`date`.
 
     The LLM is told to use ``DD/MM/YYYY`` but defensive parsing
-    accepts the two-digit year and the ISO form. Anything else
-    raises :class:`ValueError` with the index of the offending row
-    so the operator can find it in the raw LLM output.
+    accepts the two-digit year and the ISO form. An empty
+    string returns ``None`` (the model could not extract a
+    date from a partial chunk) and the caller falls back to
+    a safe default. Anything else raises :class:`ValueError`
+    with the index of the offending row so the operator can
+    find it in the raw LLM output.
 
     Raises
     ------
     ValueError
         If the date is unparseable or out of range.
     """
+    if not value or not value.strip():
+        return None
     for pattern in (_DATE_PATTERN_DMY_LONG, _DATE_PATTERN_DMY_SHORT, _DATE_PATTERN_ISO):
         match = pattern.match(value)
         if match is None:

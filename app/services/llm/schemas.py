@@ -100,7 +100,7 @@ class TransactionExtraction(BaseModel):
     transactions.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     date: str = Field(
         min_length=1,
@@ -191,39 +191,40 @@ class StatementMetadata(BaseModel):
     type them in the upload form.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     card_number_masked: str = Field(
-        min_length=1,
+        default="",
         max_length=25,
-        description=("Masked PAN as it appears on the statement (e.g. 'XXXX XXXX XXXX 0951')."),
+        description=("Masked PAN as it appears on the statement (e.g. 'XXXX XXXX XXXX 0951'). Empty if the model did not read the header."),
     )
     cardholder: str = Field(
-        min_length=1,
+        default="",
         max_length=100,
-        description="Printed cardholder name (e.g. 'LUIS SOTILLO AGUIAR').",
+        description="Printed cardholder name. Empty if the model did not read the header from this chunk.",
     )
     currency: str = Field(
-        min_length=3,
+        default="",
         max_length=3,
-        description="ISO-4217 currency code: 'CLP' for NACIONAL, 'USD' for INTERNACIONAL.",
+        description="ISO-4217 currency code: 'CLP' for NACIONAL, 'USD' for INTERNACIONAL. Empty if the model did not emit it; the orchestrator fills it from the detected variant.",
     )
     period_start: str = Field(
-        min_length=8,
+        default="",
         max_length=10,
         description=(
             "First day of the billing period. DD/MM/YYYY "
             "(the orchestrator normalises from the LLM's "
-            "two-digit year variant)."
+            "two-digit year variant). Empty string if the model "
+            "could not extract a date from a partial chunk."
         ),
     )
     period_end: str = Field(
-        min_length=8,
+        default="",
         max_length=10,
         description="Last day of the billing period. DD/MM/YYYY.",
     )
     statement_date: str = Field(
-        min_length=8,
+        default="",
         max_length=10,
         description="Date the bank issued the statement. DD/MM/YYYY.",
     )
@@ -261,7 +262,7 @@ class ExtractionResponse(BaseModel):
     later review.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     transactions: list[TransactionExtraction] = Field(
         min_length=0,
