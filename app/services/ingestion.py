@@ -61,6 +61,11 @@ from app.models.credit_card import CreditCard
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
 from app.services.llm.protocol import LLMProvider
+from app.services.llm.schemas import (
+    ExtractionResponse,
+    StatementMetadata,
+    TransactionExtraction,
+)
 from app.services.pdf import decrypt_pdf
 
 logger = logging.getLogger(__name__)
@@ -257,21 +262,26 @@ class IngestionService:
                 raise
             raise IngestionError(str(exc)) from exc
 
-        # 4b. Truncate the text before sending it to the LLM.
+        # 4b. Chunk the text before sending it to the LLM.
         #     Small local models (qwen2.5:1.5b) cannot handle
         #     the full ~18k chars a CMF statement produces via
         #     markitdown — they return generic chat instead of
-        #     valid JSON once the prompt exceeds ~5k chars. The
-        #     truncator keeps the transactions section marker
-        #     and drops boilerplate, so the LLM still gets the
-        #     rows it needs. Truncation happens *after* variant
-        #     detection so the detector sees the full text.
-        from app.services.pdf.text_truncator import truncate_for_llm
+        #     valid JSON once the prompt exceeds ~5k chars.
+        #     The chunker splits the document into overlapping
+        #     windows of ``LLM_MAX_INPUT_CHARS`` (default 5000)
+        #     and the orchestrator calls the LLM once per
+        #     window. This means a 18k-char Santander PDF
+        #     produces 3-4 LLM calls instead of one truncated
+        #     call that only sees the first 27% of the document.
+        #     Chunking happens *after* variant detection so the
+        #     detector sees the full text.
+        from app.services.pdf.text_truncator import chunk_for_llm
 
-        text = truncate_for_llm(
+        chunks = chunk_for_llm(
             text,
             max_chars=self._settings.LLM_MAX_INPUT_CHARS,
             variant=variant,
+            overlap_chars=self._settings.LLM_CHUNK_OVERLAP_CHARS,
         )
 
         # 5. Hash the file (after we know the encryption is
@@ -279,11 +289,14 @@ class IngestionService:
         #    match across uploads of the same encrypted file.
         file_hash = _compute_sha256(file_path)
 
+        # 6. Call the LLM once per chunk and merge the responses.
+        #    A failure on any chunk fails the whole ingestion
+        #    (same semantics as the single-chunk path). The
+        #    temp file is cleaned up in a ``finally`` block so
+        #    a chunk-level failure does not leave a decrypted
+        #    PDF on disk.
         try:
-            # 6. Call the LLM. ``LLMExtractionError`` is wrapped
-            #    in :class:`IngestionError` so the HTTP layer can
-            #    map it to a 422 via a single ``except`` clause.
-            extraction = await self._llm_client.extract_transactions(text, variant)
+            extraction = await self._run_chunked_extraction(chunks, variant)
         except Exception as exc:
             _safe_unlink(decrypted_path)
             if isinstance(exc, IngestionError):
@@ -395,6 +408,108 @@ class IngestionService:
     # ------------------------------------------------------------------
     # Pipeline
     # ------------------------------------------------------------------
+
+    async def _run_chunked_extraction(
+        self,
+        chunks: list[str],
+        variant: str,
+    ) -> ExtractionResponse:
+        """Call the LLM once per chunk and merge the responses.
+
+        Each chunk produces its own :class:`ExtractionResponse`.
+        The orchestrator concatenates every transaction, takes
+        the first non-empty metadata as canonical, and
+        deduplicates rows that straddle a chunk boundary
+        (they appear in the overlap region of two consecutive
+        chunks). The result is a single
+        :class:`ExtractionResponse` whose shape matches the
+        one-call path, so the rest of the pipeline does not
+        have to know chunking happened.
+
+        Parameters
+        ----------
+        chunks
+            Non-empty list of text windows produced by
+            :func:`app.services.pdf.text_truncator.chunk_for_llm`.
+            The list contains exactly one element when the
+            source text fits in a single window, in which case
+            the LLM is called exactly once.
+        variant
+            ``"NACIONAL"`` or ``"INTERNACIONAL"``, forwarded to
+            the LLM client so it picks the right prompt template.
+
+        Returns
+        -------
+        ExtractionResponse
+            A single response with the deduped transaction
+            list, the canonical metadata (from the first
+            chunk), and the confidence / notes from the first
+            chunk. Subsequent chunks contribute their
+            transactions but do not overwrite the metadata.
+
+        Raises
+        ------
+        IngestionError
+            If the LLM raises on any chunk. The exception is
+            wrapped so the HTTP layer can map it to a 422; the
+            underlying ``LLMExtractionError`` is preserved on
+            ``__cause__``.
+        """
+        all_transactions: list[TransactionExtraction] = []
+        all_metadata: StatementMetadata | None = None
+        first_confidence: float = 0.0
+        first_notes: str | None = None
+
+        for index, chunk in enumerate(chunks):
+            logger.info(
+                "Processing chunk %d/%d (%d chars)",
+                index + 1,
+                len(chunks),
+                len(chunk),
+            )
+            try:
+                response = await self._llm_client.extract_transactions(chunk, variant)
+            except Exception as exc:
+                if isinstance(exc, IngestionError):
+                    raise
+                raise IngestionError(
+                    f"LLM extraction failed on chunk {index + 1}/{len(chunks)}: {exc}"
+                ) from exc
+
+            # First chunk: capture its confidence and notes as
+            # the canonical ones. The first chunk carries the
+            # document header, so its metadata is the real one;
+            # subsequent chunks may hallucinate or repeat.
+            if index == 0:
+                first_confidence = response.confidence
+                first_notes = response.notes
+
+            all_transactions.extend(response.transactions)
+
+            # Take the first metadata whose cardholder is set.
+            # Pydantic enforces min_length=1 on the field, so a
+            # populated cardholder is the strongest signal that
+            # the LLM actually read the document header rather
+            # than returning a placeholder.
+            if all_metadata is None and response.metadata.cardholder:
+                all_metadata = response.metadata
+
+        if all_metadata is None:
+            # Defensive: every chunk should have produced some
+            # metadata. If not, surface a clear error so the
+            # operator can investigate the LLM output.
+            raise IngestionError(
+                "LLM did not return a usable metadata block in any chunk"
+            )
+
+        deduped = _dedupe_transactions(all_transactions)
+
+        return ExtractionResponse(
+            transactions=deduped,
+            metadata=all_metadata,
+            confidence=first_confidence,
+            notes=first_notes,
+        )
 
     @staticmethod
     def _validate_metadata(
@@ -733,6 +848,36 @@ def _truncate_error(exc: BaseException, *, limit: int = 500) -> str:
     if len(message) > limit:
         message = message[: limit - 1] + "…"
     return message
+
+
+def _dedupe_transactions(
+    transactions: list[TransactionExtraction],
+) -> list[TransactionExtraction]:
+    """Drop duplicate transactions by ``(date, description, amount)``.
+
+    The chunked extraction path runs the LLM on overlapping
+    windows of the PDF, so a transaction that straddles a
+    chunk boundary appears in two chunks and would land on
+    the database twice without deduplication. Two transactions
+    are considered duplicates when their ``date``,
+    ``description`` (case-insensitive, whitespace-stripped),
+    and ``amount`` strings all match. The first occurrence
+    wins, so the LLM's first read of the row is the one that
+    gets persisted.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[TransactionExtraction] = []
+    for txn in transactions:
+        key = (
+            txn.date,
+            txn.description.strip().upper(),
+            txn.amount.strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(txn)
+    return deduped
 
 
 __all__ = [

@@ -62,6 +62,7 @@ import pytest
 
 from app.models.bank import Bank
 from app.services.pdf import (
+    DEFAULT_CHUNK_OVERLAP_CHARS,
     DEFAULT_MAX_CHARS,
     AmountParseError,
     InvalidPasswordFormulaError,
@@ -70,6 +71,7 @@ from app.services.pdf import (
     PDFPasswordError,
     TextExtractionError,
     VariantDetectionError,
+    chunk_for_llm,
     decrypt_pdf,
     derive_password,
     detect_variant,
@@ -1164,6 +1166,239 @@ class TestTruncateForLLM:
         result = truncate_for_llm(text, max_chars=1000, variant=None)
         assert "INFORMACIÓN DE TRANSACCIONES" in result
         assert len(result) <= 1000
+
+
+# ---------------------------------------------------------------------------
+# Chunk-for-LLM
+# ---------------------------------------------------------------------------
+
+
+class TestChunkForLLM:
+    """``chunk_for_llm`` splits a long PDF text into overlapping windows.
+
+    A full CMF bank statement produces ~18k chars of Markdown via
+    markitdown, but small local models (qwen2.5:1.5b, llama3.2:1b)
+    produce malformed JSON above ~5k chars. The chunker splits the
+    document into overlapping windows of ``max_chars`` so the LLM
+    sees every transaction in the budget; the orchestrator then
+    dedupes the merged transaction list. The class is the
+    regression net that keeps the chunking contract intact.
+    """
+
+    def test_default_overlap_is_200(self) -> None:
+        """The default overlap is 200 chars.
+
+        The default is the orchestrator's default
+        (``LLM_CHUNK_OVERLAP_CHARS``); changing the constant is a
+        behavioural break for the production pipeline.
+        """
+        assert DEFAULT_CHUNK_OVERLAP_CHARS == 200
+
+    def test_short_text_returns_single_chunk(self) -> None:
+        """Text that fits in a single window is returned as a one-element list.
+
+        The fast path is the common case for small test inputs
+        and for short statements. The result is the text
+        itself, wrapped in a list, so the consumer can iterate
+        uniformly regardless of chunk count.
+        """
+        text = "x" * 1000
+        chunks = chunk_for_llm(text, max_chars=5000)
+        assert chunks == [text]
+
+    def test_long_text_split_into_multiple_chunks(self) -> None:
+        """Text longer than ``max_chars`` is split into overlapping windows.
+
+        For a 12k-char input with ``max_chars=5000`` and the
+        default ``overlap_chars=200`` the result is 3 chunks:
+        5000 + 5000 + 2000-ish. The exact size of the last
+        chunk depends on the overlap, but the number of
+        windows and the upper bound on the non-last ones are
+        deterministic.
+        """
+        text = "x" * 12000
+        chunks = chunk_for_llm(text, max_chars=5000)
+        # 3 chunks: [0,5000), [4800,9800), [9600,12000)
+        assert len(chunks) == 3
+        # Each non-last chunk is at most max_chars
+        for chunk in chunks[:-1]:
+            assert len(chunk) <= 5000
+        # The last chunk holds the tail of the document
+        assert chunks[-1].endswith("x" * 50)
+
+    def test_chunks_overlap(self) -> None:
+        """Adjacent chunks overlap by exactly ``overlap_chars``.
+
+        The contract is what makes the dedup step work: a
+        transaction that straddles a chunk boundary is fully
+        present in the next chunk. The first ``overlap_chars``
+        characters of chunk ``N+1`` must equal the last
+        ``overlap_chars`` characters of chunk ``N``.
+        """
+        text = "x" * 10000
+        chunks = chunk_for_llm(text, max_chars=5000, overlap_chars=500)
+        # chunk 0: [0, 5000)
+        # chunk 1: [4500, 9500)
+        # chunk 2: [9000, 10000)
+        assert len(chunks) == 3
+        assert chunks[1][:500] == chunks[0][4500:5000]
+
+    def test_never_exceeds_max_chars(self) -> None:
+        """Property: every chunk is ``<= max_chars`` (last may be shorter).
+
+        Tested with both an exact-multiple and a remainder
+        length, with and without newlines. A regression that
+        overshoots the cap would surface here.
+        """
+        cases = [
+            ("x" * 10000, 5000),  # exact multiple
+            ("x" * 12000, 5000),  # remainder
+            ("a\n" * 5000, 1000),  # every 2nd char is a newline
+        ]
+        for text, max_chars in cases:
+            chunks = chunk_for_llm(text, max_chars=max_chars)
+            assert len(chunks) > 0
+            for chunk in chunks:
+                assert len(chunk) <= max_chars
+
+    def test_does_not_mutate_input(self) -> None:
+        """The function returns slices; the input is not modified."""
+        text = "Header\n" + "x" * 200 + "\nDETALLE\n" + "y" * 10000
+        snapshot = text
+        chunk_for_llm(text, max_chars=1000)
+        assert text == snapshot
+
+    def test_chunks_cover_full_text(self) -> None:
+        """The concatenation of the chunks covers the full input.
+
+        Property: every byte of the input appears in at least
+        one chunk. A regression that drops a section (e.g. by
+        anchoring to a marker the way ``truncate_for_llm``
+        does) would surface here. The test concatenates the
+        chunks and checks the first/last bytes are preserved.
+        """
+        text = "Header\n" + "x" * 200 + "\nDETALLE\n" + "y" * 10000
+        chunks = chunk_for_llm(text, max_chars=2000)
+        # The first chunk starts at the start of the document
+        assert text.index(chunks[0]) == 0
+        # The last chunk ends at the end of the document
+        last_start = text.rindex(chunks[-1])
+        assert last_start + len(chunks[-1]) == len(text)
+        # The first 100 chars are preserved (header is in chunk 0)
+        assert chunks[0].startswith("Header\n")
+        # The last 100 chars are preserved (footer is in last chunk)
+        assert chunks[-1].endswith("y" * 50)
+
+    def test_splits_on_newline_boundary(self) -> None:
+        """A chunk boundary past the raw ``max_chars`` snaps back to a newline.
+
+        For inputs with newlines, the chunker backs the end of
+        each chunk up to the most recent ``\n`` so we never
+        split a Markdown table row mid-line. For an input
+        with no newlines the snap is a no-op (tested
+        elsewhere) and the chunk ends exactly at max_chars.
+
+        Snapping backward is what keeps every chunk at most
+        ``max_chars`` long: any text we drop is picked up by
+        the next chunk because its start position is past the
+        snap point.
+        """
+        # 30 rows of 100 chars each, separated by '\n'.
+        # Total length = 30 * 101 = 3030 chars.
+        rows = [f"| row {i:02d} " + "x" * 80 + " |" for i in range(30)]
+        text = "\n".join(rows)
+        # max_chars=500: the first raw end is 500, which sits
+        # inside a row. The snap backs it up to the most
+        # recent '\n', keeping every chunk <= max_chars.
+        chunks = chunk_for_llm(text, max_chars=500, overlap_chars=100)
+        # No chunk ends mid-row: every chunk (except possibly
+        # the last) terminates at a '\n' that closes a row.
+        for chunk in chunks:
+            assert len(chunk) <= 500
+            # Every non-final chunk ends at a row boundary
+            if chunk is not chunks[-1]:
+                assert chunk.endswith("\n"), (
+                    f"chunk {chunk!r} should end at a newline to avoid mid-row splits"
+                )
+
+    def test_oversized_row_falls_back_to_hard_cut(self) -> None:
+        """A row longer than ``max_chars`` is hard-cut; the snap is skipped.
+
+        The snap-back is only applied when the aligned end is
+        at least ``max_chars // 2`` away from the start. A
+        longer row would leave a tiny chunk and stall the
+        loop, so the chunker cuts at ``max_chars`` instead and
+        the next chunk picks up where the row continued.
+        """
+        # One very long row (10x max_chars) — typical of a
+        # contiguous run of digits in a synthetic input.
+        text = "x" * 10000
+        chunks = chunk_for_llm(text, max_chars=500, overlap_chars=100)
+        # 20+ chunks of exactly 500 each (no snap because
+        # the row is uniform and the snap would be a no-op
+        # anyway; this just checks forward progress).
+        assert len(chunks) >= 20
+        for chunk in chunks:
+            assert len(chunk) <= 500
+
+    def test_zero_overlap_still_advances(self) -> None:
+        """An ``overlap_chars=0`` config still produces forward-progress chunks.
+
+        No-overlap is a degenerate case (transactions at
+        boundaries will be lost), but the chunker must not
+        infinite-loop. The result covers the whole document.
+        """
+        text = "x" * 10000
+        chunks = chunk_for_llm(text, max_chars=2000, overlap_chars=0)
+        # 5 chunks of exactly 2000 each
+        assert len(chunks) == 5
+        for chunk in chunks:
+            assert len(chunk) == 2000
+
+    def test_variant_nacional_strips_internacional_before_chunking(self) -> None:
+        """The variant-aware strip happens *before* chunking.
+
+        A bundled NACIONAL+INTERNACIONAL PDF keeps only the
+        CLP section when ``variant="NACIONAL"``. The strip
+        runs once on the full text, then the surviving text
+        is split into chunks — no chunk contains the
+        INTERNACIONAL section.
+        """
+        header = "X" * 300
+        nacional = "NACIONAL_DATA\n" + "y" * 5000
+        internacional = "ESTADO DE CUENTA INTERNACIONAL\n" + "z" * 10000
+        text = header + "\n" + nacional + "\n" + internacional
+
+        chunks = chunk_for_llm(text, max_chars=2000, variant="NACIONAL")
+
+        # No chunk carries the INTERNACIONAL marker
+        for chunk in chunks:
+            assert "ESTADO DE CUENTA INTERNACIONAL" not in chunk
+        # The NACIONAL data is preserved
+        assert any("NACIONAL_DATA" in chunk for chunk in chunks)
+
+    def test_variant_internacional_keeps_header_and_int_section(self) -> None:
+        """An INTERNACIONAL extraction keeps the header and the USD section.
+
+        Symmetric to the NACIONAL case: the truncator keeps
+        the first ~500 chars of the document (cardholder
+        info) and the INTERNACIONAL section, dropping the
+        bulk of the NACIONAL section.
+        """
+        header = "H" * 500
+        nacional = "y" * 100 + "\nNACIONAL_DATA\n" + "y" * 5000
+        internacional = "ESTADO DE CUENTA INTERNACIONAL\n" + "z" * 5000
+        text = header + "\n" + nacional + "\n" + internacional
+
+        chunks = chunk_for_llm(text, max_chars=2000, variant="INTERNACIONAL")
+
+        # No chunk carries the NACIONAL data marker
+        for chunk in chunks:
+            assert "NACIONAL_DATA" not in chunk
+        # The header is kept
+        assert any(header in chunk for chunk in chunks)
+        # The INTERNACIONAL section is kept
+        assert any("ESTADO DE CUENTA INTERNACIONAL" in chunk for chunk in chunks)
 
 
 # ---------------------------------------------------------------------------

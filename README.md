@@ -177,14 +177,20 @@ Expected response:
      (Microsoft) — preserves table structure so small LLMs parse
      it in a fraction of the time they need for raw text
    - Detects the CMF NACIONAL / INTERNACIONAL variant
-   - **Truncates the text to `LLM_MAX_INPUT_CHARS` (5000 by default)**
-     keeping the transactions section and dropping boilerplate.
-     Small local models (qwen2.5:1.5b) produce malformed JSON
-     on long prompts, so the truncator anchors the slice to the
-     `INFORMACIÓN DE TRANSACCIONES` / `PERÍODO ACTUAL` marker.
-   - Calls the configured LLM with bank+variant context
-   - Parses amounts to `Decimal` and dates to the statement period
-   - Persists the statement (status `completed`) + every transaction
+    - **Chunks the text into overlapping windows of `LLM_MAX_INPUT_CHARS`
+      chars (5000 by default) and calls the LLM once per chunk.** A
+      full CMF statement is ~18k chars of Markdown via markitdown,
+      but small local models (qwen2.5:1.5b) produce malformed JSON
+      on long prompts. The chunker walks the document with a sliding
+      window of `LLM_MAX_INPUT_CHARS` and `LLM_CHUNK_OVERLAP_CHARS`
+      (200 by default) so a transaction that straddles a chunk
+      boundary is still present in full in at least one chunk.
+      A single Santander upload typically produces 3-4 LLM calls;
+      the orchestrator dedupes the merged transaction list on
+      `(date, description, amount)`.
+    - Calls the configured LLM with bank+variant context
+    - Parses amounts to `Decimal` and dates to the statement period
+    - Persists the statement (status `completed`) + every transaction
 7. The success banner links to `/transactions` where the rows are
    filterable and each row's category can be edited in place.
 
@@ -307,7 +313,7 @@ finhealth/
 │   ├── models/              #   SQLAlchemy ORM models (Bank, CreditCard, Statement, Transaction)
 │   ├── schemas/             #   Pydantic request/response models
 │   ├── services/            #   Domain services
-│   │   ├── pdf/             #     PDF pipeline (decrypt, extract, variant, amount, truncate)
+│   │   ├── pdf/             #     PDF pipeline (decrypt, extract, variant, amount, chunk)
 │   │   ├── llm/             #     LLM provider abstraction (opencode_go, ollama, opencode_zen)
 │   │   └── ingestion.py     #     Orchestrator (PDF + LLM + DB)
 │   ├── static/              #   Static assets served at /static
@@ -345,7 +351,8 @@ project root). See `.env.example` for the full list. Key entries:
 | `LLM_MODEL`         | `qwen3.7-max`                          | Model name sent to the LLM provider           |
 | `LLM_TIMEOUT`       | `60`                                   | Timeout (seconds) for one LLM call            |
 | `LLM_MAX_RETRIES`   | `3`                                    | Automatic retries on transient LLM errors     |
-| `LLM_MAX_INPUT_CHARS` | `5000`                               | Max chars of PDF text sent to the LLM         |
+| `LLM_MAX_INPUT_CHARS` | `5000`                               | Max chars of PDF text per chunk sent to the LLM |
+| `LLM_CHUNK_OVERLAP_CHARS` | `200`                            | Overlap between consecutive PDF chunks         |
 | `PDF_UPLOAD_DIR`    | `shared`                               | Where uploaded PDFs are stored                |
 | `MAX_FILE_SIZE_MB`  | `10`                                   | Upload size cap (413 over the cap)            |
 
@@ -505,6 +512,8 @@ Docker deployment are:
 | `LLM_MODEL`         | `qwen3.7-max`                                 | Model name sent to the LLM provider. |
 | `LLM_TIMEOUT`       | `60`                                          | Timeout (seconds) for one LLM call. |
 | `LLM_MAX_RETRIES`   | `3`                                           | Automatic retries on transient LLM errors. |
+| `LLM_MAX_INPUT_CHARS` | `5000`                                     | Max chars of PDF text per chunk sent to the LLM. |
+| `LLM_CHUNK_OVERLAP_CHARS` | `200`                                  | Overlap between consecutive PDF chunks. |
 | `PDF_UPLOAD_DIR`    | `/app/shared`                                 | Where uploaded PDFs are stored *inside* the container. |
 | `MAX_FILE_SIZE_MB`  | `10`                                          | Upload size cap (returns 413 over the cap). |
 

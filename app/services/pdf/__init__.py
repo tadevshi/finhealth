@@ -41,7 +41,12 @@ from app.services.pdf.password_deriver import (
     InvalidRUTError,
     derive_password,
 )
-from app.services.pdf.text_truncator import DEFAULT_MAX_CHARS, truncate_for_llm
+from app.services.pdf.text_truncator import (
+    DEFAULT_CHUNK_OVERLAP_CHARS,
+    DEFAULT_MAX_CHARS,
+    chunk_for_llm,
+    truncate_for_llm,
+)
 from app.services.pdf.variant_detector import (
     Variant,
     VariantDetectionError,
@@ -49,6 +54,7 @@ from app.services.pdf.variant_detector import (
 )
 
 __all__ = [
+    "DEFAULT_CHUNK_OVERLAP_CHARS",
     "DEFAULT_MAX_CHARS",
     "AmountParseError",
     "InvalidPasswordFormulaError",
@@ -58,6 +64,7 @@ __all__ = [
     "TextExtractionError",
     "Variant",
     "VariantDetectionError",
+    "chunk_for_llm",
     "decrypt_pdf",
     "derive_password",
     "detect_variant",
