@@ -57,47 +57,47 @@ from app.services.llm.schemas import ExtractionResponse, TransactionExtraction
 
 _NACIONAL_EXAMPLE_INPUT: Final = """\
 ESTADO DE CUENTA NACIONAL
-15/05/25  SUPERMERCADOS LIDER        $ 12.450
-22/05/25  COMBUSTIBLE COPEC         $ 35.000
-01/06/25  PARIS 03/06               $ 89.900"""
+12/03/25  COMERCIO EJEMPLO UNO     $ 5.500
+18/03/25  OTRO COMERCIO SA         $ 12.300
+25/03/25  SERVICIO DEMO LTDA       $ 8.750"""
 
 _NACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
     {
         "transactions": [
             {
-                "date": "15/05/25",
-                "description": "SUPERMERCADOS LIDER",
-                "amount": "$ 12.450",
-                "currency": "CLP",
-                "category": "Groceries",
-                "installment_number": None,
-                "installment_total": None,
-                "installment_value": None,
-            },
-            {
-                "date": "22/05/25",
-                "description": "COMBUSTIBLE COPEC",
-                "amount": "$ 35.000",
-                "currency": "CLP",
-                "category": "Transport",
-                "installment_number": None,
-                "installment_total": None,
-                "installment_value": None,
-            },
-            {
-                "date": "01/06/25",
-                "description": "PARIS 03/06",
-                "amount": "$ 89.900",
+                "date": "12/03/25",
+                "description": "COMERCIO EJEMPLO UNO",
+                "amount": "$ 5.500",
                 "currency": "CLP",
                 "category": "Shopping",
-                "installment_number": 1,
-                "installment_total": 6,
+                "installment_number": None,
+                "installment_total": None,
+                "installment_value": None,
+            },
+            {
+                "date": "18/03/25",
+                "description": "OTRO COMERCIO SA",
+                "amount": "$ 12.300",
+                "currency": "CLP",
+                "category": "Food",
+                "installment_number": None,
+                "installment_total": None,
+                "installment_value": None,
+            },
+            {
+                "date": "25/03/25",
+                "description": "SERVICIO DEMO LTDA",
+                "amount": "$ 8.750",
+                "currency": "CLP",
+                "category": "Services",
+                "installment_number": None,
+                "installment_total": None,
                 "installment_value": "$ 89.900",
             },
         ],
         "metadata": {
-            "card_number_masked": "XXXX XXXX XXXX 0951",
-            "cardholder": "LUIS SOTILLO AGUIAR",
+            "card_number_masked": "XXXX XXXX XXXX 0000",
+            "cardholder": "NOMBRE EJEMPLO",
             "currency": "CLP",
             "period_start": "01/05/2025",
             "period_end": "31/05/2025",
@@ -112,27 +112,17 @@ _NACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
 
 _INTERNACIONAL_EXAMPLE_INPUT: Final = """\
 ESTADO DE CUENTA INTERNACIONAL
-03/05/25  SPOTIFY USA              US$ 9,99
-18/05/25  AMAZON.COM               US$ 42,30
-02/06/25  AIRBNB INC               US$ 312,00"""
+10/04/25  TIENDA ONLINE EJEMPLO   US$ 15,99
+22/04/25  STREAMING DEMO SRL      US$ 8,50
+05/05/25  SERVICIO WEB FICTICIO   US$ 42,00"""
 
 _INTERNACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
     {
         "transactions": [
             {
-                "date": "03/05/25",
-                "description": "SPOTIFY USA",
-                "amount": "US$ 9,99",
-                "currency": "USD",
-                "category": "Subscriptions",
-                "installment_number": None,
-                "installment_total": None,
-                "installment_value": None,
-            },
-            {
-                "date": "18/05/25",
-                "description": "AMAZON.COM",
-                "amount": "US$ 42,30",
+                "date": "10/04/25",
+                "description": "TIENDA ONLINE EJEMPLO",
+                "amount": "US$ 15,99",
                 "currency": "USD",
                 "category": "Shopping",
                 "installment_number": None,
@@ -140,19 +130,29 @@ _INTERNACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
                 "installment_value": None,
             },
             {
-                "date": "02/06/25",
-                "description": "AIRBNB INC",
-                "amount": "US$ 312,00",
+                "date": "22/04/25",
+                "description": "STREAMING DEMO SRL",
+                "amount": "US$ 8,50",
                 "currency": "USD",
-                "category": "Travel",
+                "category": "Subscriptions",
+                "installment_number": None,
+                "installment_total": None,
+                "installment_value": None,
+            },
+            {
+                "date": "05/05/25",
+                "description": "SERVICIO WEB FICTICIO",
+                "amount": "US$ 42,00",
+                "currency": "USD",
+                "category": "Services",
                 "installment_number": None,
                 "installment_total": None,
                 "installment_value": None,
             },
         ],
         "metadata": {
-            "card_number_masked": "XXXX XXXX XXXX 0951",
-            "cardholder": "LUIS SOTILLO AGUIAR",
+            "card_number_masked": "XXXX XXXX XXXX 0000",
+            "cardholder": "NOMBRE EJEMPLO",
             "currency": "USD",
             "period_start": "01/05/2025",
             "period_end": "31/05/2025",
@@ -208,9 +208,9 @@ copy the amount into ``installment_value``. Otherwise leave them null.
 Use null if unsure.
 6. Extract the statement header fields into the ``metadata`` object:
    * ``card_number_masked`` — the masked PAN as printed on every \
-page (e.g. "XXXX XXXX XXXX 0951").
+page (e.g. "XXXX XXXX XXXX 0000").
    * ``cardholder`` — the printed cardholder name in uppercase \
-(e.g. "LUIS SOTILLO AGUIAR").
+(e.g. "NOMBRE EJEMPLO").
    * ``currency`` — "CLP" for this NACIONAL section.
    * ``period_start`` / ``period_end`` — the billing period in \
 DD/MM/YYYY (use DD/MM/YY if the statement omits the century).
@@ -275,9 +275,9 @@ copy the amount into ``installment_value``. Otherwise leave them null.
 "Travel", "Restaurants", "Shopping", "Transport"). Use null if unsure.
 6. Extract the statement header fields into the ``metadata`` object:
    * ``card_number_masked`` — the masked PAN as printed on every \
-page (e.g. "XXXX XXXX XXXX 0951").
+page (e.g. "XXXX XXXX XXXX 0000").
    * ``cardholder`` — the printed cardholder name in uppercase \
-(e.g. "LUIS SOTILLO AGUIAR").
+(e.g. "NOMBRE EJEMPLO").
    * ``currency`` — "USD" for this INTERNACIONAL section.
    * ``period_start`` / ``period_end`` — the billing period in \
 DD/MM/YYYY (use DD/MM/YY if the statement omits the century).
@@ -358,8 +358,8 @@ def _schema_json() -> str:
             }
         ],
         "metadata": {
-            "card_number_masked": "string (e.g. 'XXXX XXXX XXXX 0951')",
-            "cardholder": "string (e.g. 'LUIS SOTILLO AGUIAR')",
+            "card_number_masked": "string (e.g. 'XXXX XXXX XXXX 0000')",
+            "cardholder": "string (e.g. 'NOMBRE EJEMPLO')",
             "currency": "CLP or USD",
             "period_start": "DD/MM/YYYY",
             "period_end": "DD/MM/YYYY",
