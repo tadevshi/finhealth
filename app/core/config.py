@@ -98,10 +98,25 @@ class Settings(BaseSettings):
         default=5000,
         ge=1000,
         description=(
-            "Max characters of PDF text to send to the LLM. "
+            "Max characters of PDF text per chunk sent to the LLM. "
             "Small local models (qwen2.5:1.5b) produce malformed JSON "
-            "on long prompts; the truncator keeps the transactions "
-            "section and drops boilerplate."
+            "on long prompts; the chunker splits the PDF into overlapping "
+            "windows of this size and calls the LLM once per window. "
+            "A full CMF bank statement is ~18k chars of Markdown via "
+            "markitdown; with this default it produces 3-4 chunks "
+            "instead of a single 5k-char head slice."
+        ),
+    )
+    LLM_CHUNK_OVERLAP_CHARS: int = Field(
+        default=200,
+        ge=0,
+        description=(
+            "Number of characters of overlap between consecutive PDF "
+            "chunks sent to the LLM. Helps avoid losing transactions "
+            "that straddle a chunk boundary. The default (200) is "
+            "large enough to cover a full transaction row in the "
+            "verbose Santander layout. Set to 0 to disable overlap "
+            "(transactions at boundaries will be lost)."
         ),
     )
 
