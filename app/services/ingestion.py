@@ -318,10 +318,21 @@ class IngestionService:
         #    the operation race-safe at the DB level. We use the
         #    values the LLM read off the PDF — the user no longer
         #    types them.
+        #
+        #    When the LLM could not read the header (no cardholder
+        #    or card number in the metadata), we fall back to
+        #    placeholders derived from the file hash so the row
+        #    is still creatable. The user can later fix the
+        #    placeholder by re-uploading the statement (the
+        #    file hash is the dedup key, so the new upload
+        #    would create a *new* row with the correct values).
+        file_hash_short = file_hash[:8]
+        card_number_masked = extraction.metadata.card_number_masked or f"UNKNOWN-{file_hash_short}"
+        cardholder = extraction.metadata.cardholder or f"UNKNOWN CARDHOLDER ({file_hash_short})"
         card = await self._get_or_create_card(
             bank,
-            extraction.metadata.card_number_masked,
-            extraction.metadata.cardholder,
+            card_number_masked,
+            cardholder,
             extraction.metadata.currency,
         )
 
@@ -486,12 +497,16 @@ class IngestionService:
 
             all_transactions.extend(response.transactions)
 
-            # Take the first metadata whose cardholder is set.
-            # Pydantic enforces min_length=1 on the field, so a
-            # populated cardholder is the strongest signal that
-            # the LLM actually read the document header rather
-            # than returning a placeholder.
-            if all_metadata is None and response.metadata.cardholder:
+            # Take the metadata from whichever chunk has the
+            # most fields populated. A small model often misses
+            # the header on the first chunk (which is mostly
+            # definitions and examples) and reads it better
+            # later when the actual statement body is in
+            # context. We compare by counting non-empty
+            # metadata fields, not just the cardholder, so a
+            # later chunk with cardholder + period + card wins
+            # over an earlier chunk with only cardholder.
+            if _metadata_completeness(response.metadata) > _metadata_completeness(all_metadata):
                 all_metadata = response.metadata
 
         if all_metadata is None:
@@ -800,6 +815,36 @@ def _safe_unlink(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError as exc:
         logger.warning("Failed to remove temp file %s: %s", path, exc)
+
+
+def _metadata_completeness(metadata: object | None) -> int:
+    """Score how complete an LLM-extracted metadata block is.
+
+    The orchestrator keeps the most complete metadata across
+    all chunks because a small model frequently misses the
+    header on the first chunk (which is mostly schema
+    definitions and few-shot examples) and reads it better
+    later when the actual statement body is in context.
+    Scoring is a simple count of non-empty fields; the
+    ``StatementMetadata`` has six string fields, so a
+    fully-populated block scores 6.
+    """
+    if metadata is None:
+        return 0
+    fields = (
+        "card_number_masked",
+        "cardholder",
+        "currency",
+        "period_start",
+        "period_end",
+        "statement_date",
+    )
+    score = 0
+    for field in fields:
+        value = getattr(metadata, field, None)
+        if value is not None and str(value).strip():
+            score += 1
+    return score
 
 
 def _parse_llm_date(value: str, *, index: int) -> date | None:
