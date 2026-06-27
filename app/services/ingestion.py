@@ -547,9 +547,7 @@ class IngestionService:
                     raise IngestionError(
                         "LLM did not return a usable metadata block in any chunk"
                     ) from last_chunk_exc
-                raise IngestionError(
-                    "LLM did not return a usable metadata block in any chunk"
-                )
+                raise IngestionError("LLM did not return a usable metadata block in any chunk")
 
             deduped = _dedupe_transactions(all_transactions)
 
