@@ -290,11 +290,12 @@ class IngestionService:
         file_hash = _compute_sha256(file_path)
 
         # 6. Call the LLM once per chunk and merge the responses.
-        #    A failure on any chunk fails the whole ingestion
-        #    (same semantics as the single-chunk path). The
-        #    temp file is cleaned up in a ``finally`` block so
-        #    a chunk-level failure does not leave a decrypted
-        #    PDF on disk.
+        #    A single chunk failure is tolerated and logged;
+        #    only all-chunk failures raise. See
+        #    ``_run_chunked_extraction`` for the per-chunk
+        #    policy. The temp file is cleaned up in a
+        #    ``finally`` block so a chunk-level failure does
+        #    not leave a decrypted PDF on disk.
         try:
             extraction = await self._run_chunked_extraction(chunks, variant)
         except Exception as exc:
@@ -461,15 +462,28 @@ class IngestionService:
         Raises
         ------
         IngestionError
-            If the LLM raises on any chunk. The exception is
-            wrapped so the HTTP layer can map it to a 422; the
-            underlying ``LLMExtractionError`` is preserved on
-            ``__cause__``.
+            If every chunk failed (zero transactions extracted).
+            Single-chunk failures are tolerated: the function
+            logs a warning and continues with the remaining
+            chunks, so a single bad section of the document
+            does not abort the whole ingestion. The underlying
+            ``LLMExtractionError`` is preserved on ``__cause__``
+            when the all-fail guard fires.
         """
         all_transactions: list[TransactionExtraction] = []
         all_metadata: StatementMetadata | None = None
         first_confidence: float = 0.0
         first_notes: str | None = None
+        successful_chunks: int = 0
+        failed_chunks: int = 0
+        last_chunk_exc: Exception | None = None
+        # Tracks whether the canonical confidence/notes have
+        # been captured from a successful chunk. We need a
+        # flag (not an index check) because chunk 0 may fail
+        # while a later chunk succeeds, and the contract is
+        # to surface the values from the first *successful*
+        # chunk — not the first index.
+        first_successful_chunk_seen: bool = False
 
         for index, chunk in enumerate(chunks):
             logger.info(
@@ -481,19 +495,36 @@ class IngestionService:
             try:
                 response = await self._llm_client.extract_transactions(chunk, variant)
             except Exception as exc:
-                if isinstance(exc, IngestionError):
-                    raise
-                raise IngestionError(
-                    f"LLM extraction failed on chunk {index + 1}/{len(chunks)}: {exc}"
-                ) from exc
+                # A single chunk failing should not abort the
+                # whole ingestion — the rest of the document
+                # may have parsed fine. Log the failure, count
+                # the chunk, and continue with the next one.
+                # We surface a clear error only if every chunk
+                # failed (handled in the try/finally below).
+                logger.warning(
+                    "Chunk %d/%d failed: %s. Continuing with remaining chunks.",
+                    index + 1,
+                    len(chunks),
+                    exc,
+                )
+                failed_chunks += 1
+                last_chunk_exc = exc
+                continue
 
-            # First chunk: capture its confidence and notes as
-            # the canonical ones. The first chunk carries the
-            # document header, so its metadata is the real one;
-            # subsequent chunks may hallucinate or repeat.
-            if index == 0:
+            successful_chunks += 1
+
+            # First successful chunk: capture its confidence
+            # and notes as the canonical ones. The first chunk
+            # *usually* carries the document header so its
+            # metadata is the real one, but chunk 0 may have
+            # failed — in that case a later successful chunk
+            # becomes the canonical source. Subsequent
+            # successful chunks must NOT overwrite these
+            # values.
+            if not first_successful_chunk_seen:
                 first_confidence = response.confidence
                 first_notes = response.notes
+                first_successful_chunk_seen = True
 
             all_transactions.extend(response.transactions)
 
@@ -509,22 +540,43 @@ class IngestionService:
             if _metadata_completeness(response.metadata) > _metadata_completeness(all_metadata):
                 all_metadata = response.metadata
 
-        if all_metadata is None:
-            # Defensive: every chunk should have produced some
-            # metadata. If not, surface a clear error so the
-            # operator can investigate the LLM output.
-            raise IngestionError(
-                "LLM did not return a usable metadata block in any chunk"
+        try:
+            # If every chunk failed, we have nothing to ingest.
+            # Raise so the operator knows the LLM is broken
+            # (vs. "a few chunks failed but we recovered").
+            if successful_chunks == 0 and failed_chunks > 0:
+                raise IngestionError(
+                    f"LLM extraction failed on all {len(chunks)} chunks"
+                ) from last_chunk_exc
+
+            if all_metadata is None:
+                # Defensive: every successful chunk should have
+                # produced some metadata. If not, surface a
+                # clear error so the operator can investigate
+                # the LLM output. When no chunk succeeded,
+                # chain to the original LLM error so log
+                # readers can find the root cause.
+                if failed_chunks > 0:
+                    raise IngestionError(
+                        "LLM did not return a usable metadata block in any chunk"
+                    ) from last_chunk_exc
+                raise IngestionError("LLM did not return a usable metadata block in any chunk")
+
+            deduped = _dedupe_transactions(all_transactions)
+
+            return ExtractionResponse(
+                transactions=deduped,
+                metadata=all_metadata,
+                confidence=first_confidence,
+                notes=first_notes,
             )
-
-        deduped = _dedupe_transactions(all_transactions)
-
-        return ExtractionResponse(
-            transactions=deduped,
-            metadata=all_metadata,
-            confidence=first_confidence,
-            notes=first_notes,
-        )
+        finally:
+            logger.info(
+                "Chunked extraction complete: %d successful, %d failed, %d transactions",
+                successful_chunks,
+                failed_chunks,
+                len(all_transactions),
+            )
 
     @staticmethod
     def _validate_metadata(
