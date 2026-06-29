@@ -3,6 +3,8 @@
 from app.schemas.domain import (
     BankCreate,
     BankResponse,
+    CategoryRenameRequest,
+    CategoryResponse,
     CreditCardCreate,
     CreditCardResponse,
     StatementCreate,
@@ -15,6 +17,8 @@ from app.schemas.health import HealthResponse
 __all__ = [
     "BankCreate",
     "BankResponse",
+    "CategoryRenameRequest",
+    "CategoryResponse",
     "CreditCardCreate",
     "CreditCardResponse",
     "HealthResponse",

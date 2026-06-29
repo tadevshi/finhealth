@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
-from app.models import Transaction
+from app.models import Category, Transaction
 from app.schemas.domain import TransactionResponse
 
 logger = logging.getLogger(__name__)
@@ -63,19 +63,48 @@ _MAX_OFFSET: Final = 10_000
 class TransactionCategoryUpdate(BaseModel):
     """Body of the ``PATCH /transactions/{id}`` endpoint.
 
-    Only the category is editable for now — the orchestrator
-    derives the description, amount, and date from the bank
-    statement and the LLM, so letting the user edit them
-    would let a typo silently rewrite history. Categories
-    are the one field that is intrinsically user-driven.
+    The endpoint accepts two fields:
+
+    * ``category_id`` — a UUID from the seeded closed set. The
+      endpoint writes the FK *and* the denormalized ``category``
+      string (the LLM-readable label) in a single transaction,
+      and marks the row ``low_confidence=False``. A 404 is
+      returned if the UUID does not match any row.
+    * ``category`` — a free-form string. **Deprecated**: the
+      field is kept working for backward compatibility with
+      clients that have not migrated to ``category_id`` yet.
+      When ``category_id`` is ``None`` and ``category`` is
+      supplied, the endpoint writes the string, leaves
+      ``category_id`` as ``NULL``, sets ``low_confidence=True``,
+      and emits exactly one ``logger.warning`` documenting
+      the deprecation. The deprecation log fires at most once
+      per request.
+
+    Only one of the two fields is typically supplied. Supplying
+    both with conflicting intent is rejected at the handler
+    level (the ``category_id`` path wins, the ``category``
+    string is ignored, and the deprecation log does not fire).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    category: str = Field(
+    category: str | None = Field(
+        default=None,
         min_length=1,
         max_length=50,
-        description="New category for the transaction. Empty string is rejected.",
+        description=(
+            "Deprecated. Free-form category string. Use category_id instead. "
+            "When supplied (and category_id is None) the row is marked "
+            "low_confidence=True and a deprecation log is emitted."
+        ),
+    )
+    category_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "UUID of a seeded Category row. When supplied, the FK and the "
+            "denormalized label are written in a single transaction and the "
+            "row is marked low_confidence=False."
+        ),
     )
 
 
@@ -197,7 +226,10 @@ async def list_transactions(
             "model": TransactionResponse,
         },
         status.HTTP_404_NOT_FOUND: {
-            "description": "No transaction with that UUID.",
+            "description": "No transaction with that UUID, or the supplied category_id is unknown.",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "The body is empty (neither category_id nor category supplied).",
         },
     },
 )
@@ -206,15 +238,40 @@ async def update_transaction(
     payload: TransactionCategoryUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> Transaction:
-    """Set the ``category`` field on a single transaction.
+    """Update a single transaction's category.
 
-    The endpoint is intentionally narrow: only ``category`` is
-    editable, and the body is rejected with 422 if it carries
-    any other field. The other transaction fields are derived
-    from the source PDF and the LLM extraction; letting the
-    user edit them in the same endpoint would let a typo
-    silently rewrite history.
+    Phase 2 — write-through semantics
+    ---------------------------------
+
+    Two fields drive the update, with a precedence order:
+
+    1. ``category_id`` (preferred). The endpoint looks up the
+       :class:`Category` row, writes the FK *and* the
+       denormalized ``category`` string in a single
+       transaction, and marks the row ``low_confidence=False``.
+       A 404 is returned if the UUID does not match any row.
+    2. ``category`` (legacy / deprecated). When ``category_id``
+       is ``None`` and ``category`` is set, the endpoint writes
+       the string, leaves ``category_id`` as ``NULL``, sets
+       ``low_confidence=True``, and emits exactly one
+       ``logger.warning`` documenting the deprecation. The log
+       fires at most once per request, so a noisy client
+       cannot flood the log stream.
+
+    Empty bodies (neither field supplied) are rejected with 422
+    so the caller knows the call was a no-op. The other
+    transaction fields are derived from the source PDF and the
+    LLM extraction; letting the user edit them in the same
+    endpoint would let a typo silently rewrite history, so the
+    body schema is closed (extra fields are rejected with 422
+    by the Pydantic layer).
     """
+    if payload.category_id is None and payload.category is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="At least one of `category_id` or `category` must be supplied",
+        )
+
     result = await session.execute(select(Transaction).where(Transaction.id == transaction_id))
     transaction = result.scalar_one_or_none()
     if transaction is None:
@@ -223,7 +280,37 @@ async def update_transaction(
             detail=f"Transaction {transaction_id} not found",
         )
 
-    transaction.category = payload.category
+    if payload.category_id is not None:
+        # Preferred path — closed-set tag with the canonical
+        # name. Look up the Category row (404 if missing),
+        # then write the FK and the denormalized string in
+        # the same commit.
+        category_result = await session.execute(
+            select(Category).where(Category.id == payload.category_id)
+        )
+        category = category_result.scalar_one_or_none()
+        if category is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Category {payload.category_id} not found",
+            )
+        transaction.category_id = category.id
+        transaction.category = category.name
+        transaction.low_confidence = False
+    elif payload.category is not None:
+        # Legacy path — free-form string. The user is
+        # bypassing the taxonomy, so the row is flagged. A
+        # single deprecation log line is emitted (per
+        # apply's risk note in ``tasks.md``).
+        transaction.category_id = None
+        transaction.category = payload.category
+        transaction.low_confidence = True
+        logger.warning(
+            "TransactionCategoryUpdate deprecation: legacy `category: str` field used; "
+            "client %s should migrate to `category_id` to keep `low_confidence=False`",
+            transaction_id,
+        )
+
     await session.commit()
     await session.refresh(transaction)
     return transaction

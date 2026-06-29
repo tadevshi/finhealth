@@ -238,9 +238,62 @@ class TransactionResponse(BaseModel):
     amount: Decimal
     currency: str
     category: str | None
+    category_id: uuid.UUID | None
+    low_confidence: bool
     installment_number: int | None
     installment_total: int | None
     installment_value: Decimal | None
     raw_json: dict[str, object] | list[object] | None
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Category
+# ---------------------------------------------------------------------------
+
+
+class CategoryResponse(BaseModel):
+    """Shape returned when reading a :class:`app.models.Category` row.
+
+    The 12 closed-set Y-NAB categories are listed by
+    ``GET /api/v1/categories`` ordered by ``sort_order``. The
+    response omits ``is_active`` because the GET endpoint only
+    returns active rows; the field is reserved on the model for
+    a future soft-disable use case.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    display_name: str
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class CategoryRenameRequest(BaseModel):
+    """Body of the ``POST /api/v1/categories/{id}`` rename endpoint.
+
+    Both fields are optional per design decision #6 — the UI can
+    rename the short identifier, the human-readable label, or
+    both in one call. The endpoint enforces "at least one field
+    supplied" at the handler level; a body with neither field is
+    rejected with 422 there.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+        description="New short stable identifier. Must not collide with another row.",
+    )
+    display_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="New human-readable label shown in the UI.",
+    )
