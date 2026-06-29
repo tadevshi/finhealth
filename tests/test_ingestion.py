@@ -756,9 +756,7 @@ class TestIngestStatementChunked:
         settings = _get_settings()
         max_chars = settings.LLM_MAX_INPUT_CHARS
 
-        llm = FakeLLMClient(
-            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
-        )
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
         async with make_ingestion_service(llm) as service:
             await service.ingest_statement(
                 file_path=SANTANDER_PDF,
@@ -787,9 +785,7 @@ class TestIngestStatementChunked:
         transactions — the final statement carries the
         original count.
         """
-        llm = FakeLLMClient(
-            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
-        )
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
         async with make_ingestion_service(llm) as service:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
@@ -822,9 +818,7 @@ class TestIngestStatementChunked:
         refactor that picks metadata from a different chunk
         fails loudly.
         """
-        llm = FakeLLMClient(
-            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
-        )
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
         async with make_ingestion_service(llm) as service:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
@@ -838,39 +832,28 @@ class TestIngestStatementChunked:
         assert statement.statement_date == date(2025, 6, 1)
 
     @pytest.mark.asyncio
-    async def test_chunk_failure_fails_whole_ingestion(
+    async def test_single_chunk_failure_still_raises(
         self,
         make_ingestion_service: Any,
         session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A failure on any chunk fails the whole ingestion.
+        """A 1-chunk PDF that fails still raises ``IngestionError``.
 
-        The chunker has no partial-success semantics: an
-        LLM error on chunk 2 means the statement is left
-        with no transactions (no statement row is created
-        because the failure is pre-transaction). The HTTP
-        layer maps the :class:`IngestionError` to a 422.
+        The chunker's partial-success semantics only help when
+        there are *multiple* chunks: a single bad chunk means
+        the whole PDF failed and we still raise. The HTTP layer
+        maps the :class:`IngestionError` to a 422.
         """
 
-        @dataclass
-        class _FailOnSecondChunk(FakeLLMClient):
-            """A fake that returns the payload for the first call and raises on the second."""
-
-            from app.services.llm.schemas import LLMExtractionError
-
-            async def extract_transactions(self, text: str, variant: str) -> ExtractionResponse:
-                self.calls.append((text, variant))
-                if len(self.calls) == 2:
-                    raise self.raise_exc or _FailOnSecondChunk.LLMExtractionError(
-                        "simulated chunk-2 outage"
-                    )
-                return self.response
+        _single_chunk(monkeypatch)
 
         from app.services.llm.schemas import LLMExtractionError
 
-        llm = _FailOnSecondChunk(
+        llm = _FailOnNthChunk(
             response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
-            raise_exc=LLMExtractionError("simulated chunk-2 outage"),
+            fail_on={0},
+            exc=LLMExtractionError("network timeout"),
         )
         async with make_ingestion_service(llm) as service:
             with pytest.raises(IngestionError) as exc_info:
@@ -882,14 +865,336 @@ class TestIngestStatementChunked:
         # The cause is the original LLM error so log readers
         # can find the root cause in the LLM client's logs.
         assert isinstance(exc_info.value.__cause__, LLMExtractionError)
-        assert "chunk-2 outage" in str(exc_info.value.__cause__)
+        assert "network timeout" in str(exc_info.value.__cause__)
 
-        # The first chunk's call happened, the second raised,
-        # and the statement was never created.
-        assert len(llm.calls) == 2
+        # Only the single chunk's call happened, and the
+        # statement was never created.
+        assert len(llm.calls) == 1
         async with session_factory() as session:
             count = (await session.execute(text("SELECT COUNT(*) FROM statements"))).scalar_one()
             assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_chunk_failure_tolerated(
+        self,
+        make_ingestion_service: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failure on one chunk of a multi-chunk PDF does not abort the run.
+
+        Surviving transactions are persisted, the statement
+        completes with ``status = COMPLETED``, and exactly one
+        ``logger.warning`` names the failed chunk. The
+        tolerance is the central contract of the change.
+        """
+        import logging
+
+        # Capture both WARNING (per-chunk) and INFO (summary)
+        # so the assertions below can target each level.
+        caplog.set_level(logging.INFO, logger="app.services.ingestion")
+
+        from app.services.llm.schemas import LLMExtractionError
+
+        llm = _FailOnNthChunk(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
+            fail_on={1},
+            exc=LLMExtractionError("chunk 2 outage"),
+        )
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        # Statement completed, transactions from surviving chunks persisted.
+        assert statement.status == StatementStatus.COMPLETED
+        assert len(statement.transactions) > 0
+
+        # One warning names the failed chunk. Filter by
+        # logger name so an unrelated warning from a
+        # dependency (SQLAlchemy, pikepdf, …) does not
+        # inflate the count.
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "app.services.ingestion" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "Chunk 2/" in warnings[0].getMessage()
+
+        # The summary log fires (mixed success/fail path).
+        summary_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "Chunked extraction complete" in r.getMessage()
+        ]
+        assert len(summary_records) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_typed_exception_tolerated(
+        self,
+        make_ingestion_service: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A bare ``KeyError`` (non-typed exception) is also tolerated.
+
+        The LLM client is allowed to raise anything; the
+        orchestrator's loop catches ``Exception`` and
+        continues. This guards against a custom LLM
+        client bug surfacing as a hard failure.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="app.services.ingestion")
+
+        llm = _FailOnNthChunk(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
+            fail_on={1},
+            exc=KeyError("malformed payload"),
+        )
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        assert statement.status == StatementStatus.COMPLETED
+        # Filter by logger name so an unrelated warning from
+        # a dependency (SQLAlchemy, pikepdf, …) does not
+        # inflate the count.
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "app.services.ingestion" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "Chunk 2/" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_all_chunks_fail_raises(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When every chunk fails, raise ``IngestionError`` with a distinct message.
+
+        Zero successful chunks means the LLM is broken; the
+        operator gets a 422 (via the HTTP layer) and the
+        summary log fires before the exception propagates.
+        The ``__cause__`` is the last chunk's original
+        exception so log readers can introspect it.
+        """
+        import logging
+
+        # Capture both WARNING (per-chunk) and INFO (summary)
+        # so the summary-log assertion is robust against the
+        # per-chunk warnings.
+        caplog.set_level(logging.INFO, logger="app.services.ingestion")
+
+        from app.services.llm.schemas import LLMExtractionError
+
+        llm = FakeLLMClient(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
+            raise_exc=LLMExtractionError("upstream timeout"),
+        )
+        async with make_ingestion_service(llm) as service:
+            with pytest.raises(IngestionError) as exc_info:
+                await service.ingest_statement(
+                    file_path=SANTANDER_PDF,
+                    bank_name="santander",
+                    rut=TEST_RUT,
+                )
+
+        # The message is the all-fail guard's message; it must
+        # differ from the per-chunk warning and include the
+        # chunk count. The Santander PDF produces several
+        # chunks, so we assert the message contains
+        # "all " and a digit count, not the exact number.
+        assert "all " in str(exc_info.value)
+        assert "chunks" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, LLMExtractionError)
+        assert "upstream timeout" in str(exc_info.value.__cause__)
+
+        # The summary INFO log fired before the exception
+        # propagated (try/finally semantics).
+        summary_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "Chunked extraction complete" in r.getMessage()
+        ]
+        assert len(summary_records) == 1
+
+        # No statement row was created.
+        async with session_factory() as session:
+            count = (await session.execute(text("SELECT COUNT(*) FROM statements"))).scalar_one()
+            assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_metadata_completeness_wins_after_partial_failure(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """After a partial failure, the most-complete metadata block still wins.
+
+        Regression-guard for PR #28. The tolerance change MUST
+        NOT introduce an alternative selection strategy (such
+        as "first cardholder wins"). When chunk 1 returns
+        metadata with only ``cardholder`` and chunk 3 returns
+        all six fields, the canonical statement metadata is
+        chunk 3's, even though chunk 2 failed in between.
+        """
+        from app.services.llm.schemas import LLMExtractionError
+
+        # Chunk 0: only cardholder populated.
+        partial_payload = {
+            "transactions": [
+                {
+                    "date": "15/05/25",
+                    "description": "PARTIAL MERCADO",
+                    "amount": "$ 1.000",
+                    "currency": "CLP",
+                    "category": "Groceries",
+                    "installment_number": None,
+                    "installment_total": None,
+                    "installment_value": None,
+                },
+            ],
+            "metadata": {
+                "card_number_masked": "",
+                "cardholder": "PARTIAL CARDHOLDER",
+                "currency": "CLP",
+                "period_start": "",
+                "period_end": "",
+                "statement_date": "",
+            },
+            "confidence": 0.5,
+            "notes": "partial chunk",
+        }
+        # Chunk 2: all six fields populated.
+        full_payload = {
+            "transactions": [
+                {
+                    "date": "22/05/25",
+                    "description": "FULL COMERCIO",
+                    "amount": "$ 2.000",
+                    "currency": "CLP",
+                    "category": "Shopping",
+                    "installment_number": None,
+                    "installment_total": None,
+                    "installment_value": None,
+                },
+            ],
+            "metadata": {
+                "card_number_masked": "XXXX XXXX XXXX 9999",
+                "cardholder": "FULL CARDHOLDER",
+                "currency": "CLP",
+                "period_start": "15/05/2025",
+                "period_end": "22/05/2025",
+                "statement_date": "01/06/2025",
+            },
+            "confidence": 0.9,
+            "notes": "full chunk",
+        }
+        llm = _FailOnNthChunk(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
+            fail_on={1},
+            exc=LLMExtractionError("chunk 2 outage"),
+            responses=[
+                ExtractionResponse.model_validate(partial_payload),
+                ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
+                ExtractionResponse.model_validate(full_payload),
+            ],
+        )
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        # Statement completed and the most-complete metadata won.
+        assert statement.status == StatementStatus.COMPLETED
+        async with session_factory() as session:
+            # ``cardholder`` and ``card_number_masked`` live on
+            # the ``credit_cards`` table (the statement carries
+            # a ``credit_card_id`` FK). The metadata test
+            # confirms the orchestrator's selection chose the
+            # card whose ``cardholder`` matches chunk 3's
+            # value, not chunk 1's.
+            #
+            # SQLite returns date columns as ``str`` (no native
+            # date type), so we parse the ISO strings back to
+            # :class:`date` for a clean assertion.
+            result = await session.execute(
+                text(
+                    "SELECT cc.cardholder, s.period_start, s.period_end, "
+                    "s.statement_date, cc.card_number_masked "
+                    "FROM statements s JOIN credit_cards cc ON s.credit_card_id = cc.id "
+                    "WHERE s.id = :sid"
+                ),
+                {"sid": str(statement.id)},
+            )
+            row = result.first()
+            assert row is not None
+            cardholder, period_start, period_end, statement_date, card_number = row
+            # Chunk 3's values:
+            assert cardholder == "FULL CARDHOLDER"
+            assert date.fromisoformat(period_start) == date(2025, 5, 15)
+            assert date.fromisoformat(period_end) == date(2025, 5, 22)
+            assert date.fromisoformat(statement_date) == date(2025, 6, 1)
+            assert card_number == "XXXX XXXX XXXX 9999"
+
+    @pytest.mark.asyncio
+    async def test_summary_log_on_success(
+        self,
+        make_ingestion_service: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The summary log fires on a happy-path run with ``failed_chunks=0``.
+
+        The ``try/finally`` block guarantees the summary on
+        every path; this test pins the success branch so a
+        future refactor that accidentally drops the log
+        fails loudly.
+        """
+        import logging
+        import re
+
+        caplog.set_level(logging.INFO, logger="app.services.ingestion")
+
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        assert statement.status == StatementStatus.COMPLETED
+        summary_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "Chunked extraction complete" in r.getMessage()
+        ]
+        assert len(summary_records) == 1
+        # Parse the format string
+        # "Chunked extraction complete: %d successful, %d failed, %d transactions"
+        # to verify the happy path reports ``failed_chunks=0``
+        # without depending on the literal string.
+        msg = summary_records[0].getMessage()
+        match = re.search(r"(\d+) successful, (\d+) failed, (\d+) transactions", msg)
+        assert match is not None, f"summary log format unexpected: {msg!r}"
+        successful, failed, _txns = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
+        assert successful >= 1
+        assert failed == 0
 
     @pytest.mark.asyncio
     async def test_uses_default_overlap_from_settings(
@@ -908,6 +1213,73 @@ class TestIngestStatementChunked:
 
         settings = _get_settings()
         assert settings.LLM_CHUNK_OVERLAP_CHARS == 200
+
+
+# ---------------------------------------------------------------------------
+# Chunked-extraction tolerance helpers (local to this test module)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FailOnNthChunk(FakeLLMClient):
+    """Fake LLM that raises on selected 0-indexed chunk calls.
+
+    Inherits call recording and the default response from
+    :class:`FakeLLMClient`. When the 0-indexed call number
+    is in ``fail_on``, raises ``self.exc``; otherwise returns
+    ``self.response`` (or, if ``responses`` is set, the
+    corresponding per-call response).
+
+    The ``responses`` list is consumed left-to-right and is
+    used by the ``_metadata_completeness`` regression-guard
+    test to return a different metadata block on each call.
+    After the list is exhausted the helper falls back to
+    ``self.response`` so a shorter list still keeps the
+    default payload for the remaining chunks.
+
+    The helper covers the three tolerance scenarios
+    (partial failure, all-fail, non-typed exception) with a
+    single declarative class — no per-test inline dataclass
+    needed.
+    """
+
+    fail_on: set[int] = field(default_factory=set)
+    exc: Exception | None = None
+    responses: list[ExtractionResponse] = field(default_factory=list)
+
+    async def extract_transactions(self, text: str, variant: str) -> ExtractionResponse:
+        self.calls.append((text, variant))
+        call_index = len(self.calls) - 1
+        if self.exc is not None and call_index in self.fail_on:
+            raise self.exc
+        if call_index < len(self.responses):
+            return self.responses[call_index]
+        return self.response
+
+
+def _single_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the PDF chunker to produce exactly one chunk for the test.
+
+    Patches the source location of :func:`chunk_for_llm`
+    (``app.services.pdf.text_truncator.chunk_for_llm``) rather
+    than the locally-imported binding inside
+    :mod:`app.services.ingestion`. The orchestrator's import
+    statement is ``from app.services.pdf.text_truncator
+    import chunk_for_llm``, so patching the source module
+    ensures the new function is picked up regardless of
+    import order. The patch is reverted automatically when
+    the test function exits (pytest's monkeypatch fixture).
+
+    This helper exists to drive the 1-chunk fail-fast
+    contract (``test_single_chunk_failure_still_raises``)
+    without depending on the real Santander PDF's chunking
+    behaviour, which can change if the chunker implementation
+    is refactored.
+    """
+    monkeypatch.setattr(
+        "app.services.pdf.text_truncator.chunk_for_llm",
+        lambda *args, **kwargs: ["only chunk"],
+    )
 
 
 # ---------------------------------------------------------------------------
