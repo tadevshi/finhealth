@@ -23,6 +23,7 @@ from app.models.base import Base
 from app.models.mixins import TimestampMixin, UUIDMixin, UUIDType
 
 if TYPE_CHECKING:
+    from app.models.category import Category
     from app.models.statement import Statement
 
 
@@ -54,6 +55,19 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
     category:
         Optional manual category. ``None`` until the user tags the
         row; the LLM never assigns categories.
+    category_id:
+        Optional FK to :class:`app.models.category.Category`. Set
+        by the ingestion layer when the LLM-emitted ``category``
+        string resolves to one of the seeded closed-set names.
+        ``NULL`` for rows tagged with an off-set label (e.g. a
+        free-form string from a PATCH) or untagged rows. Backed
+        by a B-tree index for ``WHERE category_id = ?`` filters.
+    low_confidence:
+        ``True`` when the row's category is uncertain: a miss
+        against the seeded closed set, a free-form string from
+        the legacy PATCH, or a row the LLM could not tag at all.
+        Always ``False`` for rows tagged with a known
+        :class:`Category`.
     installment_number, installment_total, installment_value:
         Installment plan data. ``None`` when the charge is a one-off.
         When set, ``1 <= installment_number <= installment_total``.
@@ -76,6 +90,13 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(15, 2))
     currency: Mapped[str] = mapped_column(String(3))
     category: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDType(),
+        ForeignKey("categories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    low_confidence: Mapped[bool] = mapped_column(default=False, nullable=False)
     installment_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     installment_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     installment_value: Mapped[Decimal | None] = mapped_column(
@@ -89,3 +110,7 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
 
     # Relationships ---------------------------------------------------------
     statement: Mapped[Statement] = relationship(back_populates="transactions", lazy="joined")
+    category_ref: Mapped[Category | None] = relationship(
+        back_populates="transactions",
+        lazy="joined",
+    )
