@@ -454,10 +454,13 @@ class IngestionService:
         -------
         ExtractionResponse
             A single response with the deduped transaction
-            list, the canonical metadata (from the first
-            chunk), and the confidence / notes from the first
-            chunk. Subsequent chunks contribute their
-            transactions but do not overwrite the metadata.
+            list, the most-complete metadata block across all
+            successful chunks (selected by
+            ``_metadata_completeness``), and the confidence /
+            notes captured from the first *successful* chunk.
+            Subsequent successful chunks contribute their
+            transactions but do not overwrite the metadata
+            or the canonical confidence / notes.
 
         Raises
         ------
@@ -546,7 +549,7 @@ class IngestionService:
             # (vs. "a few chunks failed but we recovered").
             if successful_chunks == 0 and failed_chunks > 0:
                 raise IngestionError(
-                    f"LLM extraction failed on all {len(chunks)} chunks"
+                    f"LLM extraction failed on all {len(chunks)} chunks: {last_chunk_exc}"
                 ) from last_chunk_exc
 
             if all_metadata is None:
