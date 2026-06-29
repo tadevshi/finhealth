@@ -79,7 +79,7 @@ _NACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
                 "description": "OTRO COMERCIO SA",
                 "amount": "$ 12.300",
                 "currency": "CLP",
-                "category": "Food",
+                "category": "Dining Out",
                 "installment_number": None,
                 "installment_total": None,
                 "installment_value": None,
@@ -89,7 +89,7 @@ _NACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
                 "description": "SERVICIO DEMO LTDA",
                 "amount": "$ 8.750",
                 "currency": "CLP",
-                "category": "Services",
+                "category": "Personal Care",
                 "installment_number": None,
                 "installment_total": None,
                 "installment_value": "$ 89.900",
@@ -144,7 +144,7 @@ _INTERNACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
                 "description": "SERVICIO WEB FICTICIO",
                 "amount": "US$ 42,00",
                 "currency": "USD",
-                "category": "Services",
+                "category": "Personal Care",
                 "installment_number": None,
                 "installment_total": None,
                 "installment_value": None,
@@ -179,6 +179,30 @@ _INTERNACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
 # The ``{{...}}`` are literal braces, escaped for
 # ``str.format`` so the LLM sees a real JSON snippet.
 
+# ---------------------------------------------------------------------------
+# Phase 2 — closed-set category names
+# ---------------------------------------------------------------------------
+#
+# The 12 names the LLM is told to emit verbatim. They mirror the
+# ``categories`` seed in migration ``0005_phase2_categories`` and
+# are the closed set the application accepts at the API boundary.
+#
+SEED_CATEGORY_NAMES: Final = (
+    "Groceries",
+    "Dining Out",
+    "Transportation",
+    "Bills",
+    "Entertainment",
+    "Shopping",
+    "Health",
+    "Travel",
+    "Personal Care",
+    "Subscriptions",
+    "Other",
+    "Uncategorized",
+)
+
+
 _NACIONAL_PROMPT_TEMPLATE: Final = """\
 You are a precise financial parser. Extract every transaction \
 from the Chilean bank statement below.
@@ -203,9 +227,12 @@ leading "$" and thousand separators). Do not normalise.
 4. If the description contains an "NN/NN" installment marker, set \
 ``installment_number`` and ``installment_total`` accordingly and \
 copy the amount into ``installment_value``. Otherwise leave them null.
-5. Suggest a short category for each transaction (e.g. "Groceries", \
-"Transport", "Restaurants", "Shopping", "Subscriptions", "Travel"). \
-Use null if unsure.
+5. Choose exactly one of the following 12 category names — the \
+closed set the application accepts: Groceries, Dining Out, \
+Transportation, Bills, Entertainment, Shopping, Health, Travel, \
+Personal Care, Subscriptions, Other, Uncategorized. Use ``Other`` \
+if the best match is not in the list. Use null if the description \
+is unreadable.
 6. Extract the statement header fields into the ``metadata`` object:
    * ``card_number_masked`` — the masked PAN as printed on every \
 page (e.g. "XXXX XXXX XXXX 0000").
@@ -271,8 +298,12 @@ Do not normalise.
 4. If the description contains an "NN/NN" installment marker, set \
 ``installment_number`` and ``installment_total`` accordingly and \
 copy the amount into ``installment_value``. Otherwise leave them null.
-5. Suggest a short category for each transaction (e.g. "Subscriptions", \
-"Travel", "Restaurants", "Shopping", "Transport"). Use null if unsure.
+5. Choose exactly one of the following 12 category names — the \
+closed set the application accepts: Groceries, Dining Out, \
+Transportation, Bills, Entertainment, Shopping, Health, Travel, \
+Personal Care, Subscriptions, Other, Uncategorized. Use ``Other`` \
+if the best match is not in the list. Use null if the description \
+is unreadable.
 6. Extract the statement header fields into the ``metadata`` object:
    * ``card_number_masked`` — the masked PAN as printed on every \
 page (e.g. "XXXX XXXX XXXX 0000").
@@ -351,7 +382,11 @@ def _schema_json() -> str:
                 "description": "string",
                 "amount": "string in the original visual format",
                 "currency": "CLP or USD",
-                "category": "string or null",
+                "category": (
+                    "one of the 12 closed-set names: "
+                    + ", ".join(SEED_CATEGORY_NAMES)
+                    + "; or null when the description is unreadable"
+                ),
                 "installment_number": "int or null",
                 "installment_total": "int or null",
                 "installment_value": "string or null",
