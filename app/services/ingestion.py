@@ -57,6 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models.bank import Bank
+from app.models.category import Category
 from app.models.credit_card import CreditCard
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
@@ -374,7 +375,7 @@ class IngestionService:
         #     currency mismatch) raises here and lands the
         #     statement in FAILED with a stored error.
         try:
-            transactions = self._build_transactions(
+            transactions = await self._build_transactions(
                 statement=statement,
                 extraction=extraction,
                 expected_currency=expected_currency,
@@ -655,7 +656,7 @@ class IngestionService:
 
         return expected_currency, period_start, period_end, statement_date
 
-    def _build_transactions(
+    async def _build_transactions(
         self,
         *,
         statement: Statement,
@@ -666,10 +667,27 @@ class IngestionService:
 
         Split out from :meth:`ingest_statement` so the
         per-row validation logic (amount parsing, date parsing,
-        currency cross-check) lives in one place. The decrypt,
-        text-extract, and LLM-call steps happen inline in
-        :meth:`ingest_statement` so the temp file can be
-        cleaned up in a single ``finally`` block.
+        currency cross-check, category closed-set validation)
+        lives in one place. The decrypt, text-extract, and
+        LLM-call steps happen inline in :meth:`ingest_statement`
+        so the temp file can be cleaned up in a single
+        ``finally`` block.
+
+        Phase 2 — closed-set category validation
+        --------------------------------------
+
+        The LLM is told (see :mod:`app.services.llm.prompts`) to
+        emit one of the 12 seeded Y-NAB category names. The
+        validation here resolves the emitted string against the
+        seed in a single SELECT at the start of the call and
+        builds a ``{name: Category}`` dict cache (per design
+        decision #3 — avoids N+1). A hit stamps
+        ``category_id=cat.id``, ``category=cat.name``,
+        ``low_confidence=False``; a miss preserves the LLM
+        string (or ``"Uncategorized"`` when the LLM emitted
+        ``None``), sets ``category_id=NULL``, and stamps
+        ``low_confidence=True`` so the row is recoverable for
+        the user via the PATCH endpoint.
 
         Raises
         ------
@@ -701,6 +719,18 @@ class IngestionService:
                 f"Cannot build transactions: expected ExtractionResponse, "
                 f"got {type(extraction).__name__}"
             )
+
+        # One query at the start of the call, used as a dict
+        # cache for the per-row lookup. Avoids an N+1 against
+        # ``categories`` for every transaction in a 30-row
+        # statement. The dict is keyed by ``name.lower()`` so
+        # the per-row match can be a case-insensitive lookup
+        # against ``txn.category.strip().lower()`` (per design
+        # decision #4).
+        categories_by_name: dict[str, Category] = {}
+        categories_result = await self._session.execute(select(Category))
+        for category in categories_result.scalars():
+            categories_by_name[category.name.lower()] = category
 
         transactions: list[Transaction] = []
         for index, txn in enumerate(extraction.transactions):
@@ -737,6 +767,25 @@ class IngestionService:
                         f"{txn.installment_value!r}: {exc}"
                     ) from exc
 
+            # Closed-set category resolution (Phase 2). The
+            # match is case-insensitive and whitespace-tolerant
+            # so an LLM that emits ``"Food "`` still hits
+            # ``"Food"``. A miss preserves the LLM string (or
+            # falls back to ``"Uncategorized"``) and stamps
+            # ``low_confidence=True`` so the user can re-tag
+            # the row by hand.
+            category_id: uuid.UUID | None = None
+            category_name: str | None = txn.category
+            low_confidence: bool = True
+            if txn.category:
+                match = categories_by_name.get(txn.category.strip().lower())
+                if match is not None:
+                    category_id = match.id
+                    category_name = match.name
+                    low_confidence = False
+            if category_id is None and not category_name:
+                category_name = "Uncategorized"
+
             transactions.append(
                 Transaction(
                     statement_id=statement.id,
@@ -744,7 +793,9 @@ class IngestionService:
                     description=txn.description,
                     amount=amount,
                     currency=txn.currency,
-                    category=txn.category,
+                    category=category_name,
+                    category_id=category_id,
+                    low_confidence=low_confidence,
                     installment_number=txn.installment_number,
                     installment_total=txn.installment_total,
                     installment_value=installment_value,
