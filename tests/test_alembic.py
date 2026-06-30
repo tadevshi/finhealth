@@ -343,8 +343,8 @@ def test_alembic_transactions_round_trip_category_columns(
             "'/tmp/alembic-test.pdf', 'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1', 'COMPLETED')"
         )
 
-        # Pick the seeded ``Food`` category by name so the test
-        # is independent of the random UUIDs the migration
+        # Pick the seeded ``Dining Out`` category by name so the
+        # test is independent of the random UUIDs the migration
         # generates.
         food_id = conn.exec_driver_sql(
             "SELECT id FROM categories WHERE name = 'Dining Out'"

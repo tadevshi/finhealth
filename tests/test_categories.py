@@ -149,8 +149,8 @@ async def test_category_name_must_be_unique(seeded_engine: AsyncEngine) -> None:
 
     The 12 seeded rows already cover the canonical names;
     a second insert for any of them hits the unique
-    index. The test uses ``Food`` (the first seed) as the
-    conflicting name.
+    index. The test uses ``Dining Out`` (the first seed)
+    as the conflicting name.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -226,16 +226,16 @@ async def test_rename_category_happy_path_propagates_to_transactions(
 ) -> None:
     """Renaming a category updates its name and the denormalized string on every tx.
 
-    The test seeds 3 transactions that point at ``Food`` and
-    renames ``Food`` to ``Dining``. The response carries the
-    new name and the 3 transactions' ``category`` column is
-    updated to ``"Dining"`` in the same commit.
+    The test seeds 3 transactions that point at ``Dining Out``
+    and renames ``Dining Out`` to ``Dining``. The response
+    carries the new name and the 3 transactions' ``category``
+    column is updated to ``"Dining"`` in the same commit.
     """
     factory = async_sessionmaker(seeded_engine, expire_on_commit=False)
     food_id: uuid.UUID
     statement_id: uuid.UUID
     async with factory() as session:
-        # Find the seeded Food row.
+        # Find the seeded Dining Out row.
         result = await session.execute(select(Category).where(Category.name == "Dining Out"))
         food = result.scalar_one()
         food_id = food.id
@@ -262,7 +262,7 @@ async def test_rename_category_happy_path_propagates_to_transactions(
             file_hash="a" * 64,
         )
         # 3 transactions tagged "Dining Out" (the legacy denormalized
-        # string) with the Food FK.
+        # string) with the Dining Out FK.
         txns = [
             Transaction(
                 statement=statement,
@@ -353,7 +353,7 @@ async def test_rename_category_422_on_name_collision(
     422 with a clear error, not a 500 from the unique
     constraint.
     """
-    # Find the seeded Food and Transport rows.
+    # Find the seeded Dining Out and Transportation rows.
     (food_id,) = await _find_category_ids(seeded_client, "Dining Out")
 
     response = await seeded_client.post(
@@ -395,7 +395,7 @@ async def test_rename_category_atomicity_on_collision(
     )
     assert response.status_code == 422
 
-    # The original Food row is unchanged.
+    # The original Dining Out row is unchanged.
     response = await seeded_client.get("/api/v1/categories")
     assert response.status_code == 200
     by_id = {row["id"]: row for row in response.json()}
