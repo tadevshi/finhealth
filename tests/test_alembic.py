@@ -259,6 +259,137 @@ def test_alembic_seeds_known_banks(alembic_config: AlembicConfig, sync_engine: E
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — Categories seed and new transactions columns
+# ---------------------------------------------------------------------------
+#
+# Migration ``0005_phase2_categories`` introduces the ``categories``
+# table and seeds the 12 closed-set Y-NAB rows. Migration
+# ``0006_phase2_merchants_transactions_alter`` (PR #2 portion) adds
+# the ``category_id`` FK and the ``low_confidence`` Boolean to
+# ``transactions``, plus the supporting index and FK constraint. The
+# tests below prove both halves of the foundation.
+
+
+def test_alembic_seeds_known_categories(alembic_config: AlembicConfig, sync_engine: Engine) -> None:
+    """``alembic upgrade head`` seeds the 12 Y-NAB categories.
+
+    The seed runs in the same transaction as the table create so a
+    fresh checkout running ``alembic upgrade head`` ends up with a
+    fully populated ``categories`` table. The test guards against
+    accidental removal of the seed rows and asserts the canonical
+    12 names are present.
+    """
+    alembic_upgrade(alembic_config, "head")
+
+    with sync_engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT name, display_name, sort_order FROM categories ORDER BY sort_order"
+        ).fetchall()
+
+    by_name = {name: (display, sort) for name, display, sort in rows}
+    # The canonical 12 names. The test asserts the closed set is
+    # present in full so a future PR that drops or renames a row
+    # is caught here.
+    expected = {
+        "Dining Out": ("Dining Out", 1),
+        "Groceries": ("Groceries", 2),
+        "Transportation": ("Transportation", 3),
+        "Shopping": ("Shopping", 4),
+        "Entertainment": ("Entertainment", 5),
+        "Bills": ("Bills & Utilities", 6),
+        "Health": ("Health & Medical", 7),
+        "Travel": ("Travel", 8),
+        "Subscriptions": ("Subscriptions", 9),
+        "Personal Care": ("Personal Care", 10),
+        "Uncategorized": ("Uncategorized", 11),
+        "Other": ("Other", 12),
+    }
+    assert by_name == expected
+
+
+def test_alembic_transactions_round_trip_category_columns(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """The new ``category_id`` / ``low_confidence`` columns round-trip cleanly.
+
+    Inserts a row with explicit values, then re-reads it, so a
+    regression in the migration's column types or default clauses
+    is caught at the boundary. ``category_id`` is verified to
+    accept ``NULL`` (the miss-path of the ingestion validator)
+    and a valid UUID (the hit-path), and ``low_confidence`` is
+    verified at both ``True`` and ``False`` so the
+    ``server_default=0`` clause is honoured.
+    """
+    alembic_upgrade(alembic_config, "head")
+
+    # Seed the parent rows so the FK resolves. The bank seed is
+    # already inserted by migration 0002, so the test only
+    # needs the card + statement + transaction chain.
+    with sync_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO banks (id, created_at, updated_at, name, display_name, password_formula, is_active) "
+            "VALUES ('11111111-1111-1111-1111-111111111111', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'alembic_test_bank', 'Alembic Test Bank', 'rut_sin_dv', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO credit_cards (id, created_at, updated_at, bank_id, card_number_masked, cardholder, currency, is_active) "
+            "VALUES ('22222222-2222-2222-2222-222222222222', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'11111111-1111-1111-1111-111111111111', 'XXXX XXXX XXXX 0001', 'TEST USER', 'CLP', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO statements (id, created_at, updated_at, credit_card_id, period_start, period_end, statement_date, file_path, file_hash, status) "
+            "VALUES ('33333333-3333-3333-3333-333333333333', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'22222222-2222-2222-2222-222222222222', '2026-05-01', '2026-05-31', '2026-06-01', "
+            "'/tmp/alembic-test.pdf', 'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1', 'COMPLETED')"
+        )
+
+        # Pick the seeded ``Dining Out`` category by name so the
+        # test is independent of the random UUIDs the migration
+        # generates.
+        food_id = conn.exec_driver_sql(
+            "SELECT id FROM categories WHERE name = 'Dining Out'"
+        ).scalar_one()
+        # Insert with a valid FK + ``low_confidence=0`` (the hit-path).
+        conn.exec_driver_sql(
+            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category) "
+            "VALUES ('44444444-4444-4444-4444-444444444441', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'33333333-3333-3333-3333-333333333333', '2026-05-05', 'HIT-PATH', 100.00, 'CLP', "
+            f"'{food_id}', 0, 'Dining Out')"
+        )
+        # Insert with ``category_id=NULL`` + ``low_confidence=1`` (the miss-path).
+        conn.exec_driver_sql(
+            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category) "
+            "VALUES ('44444444-4444-4444-4444-444444444442', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'33333333-3333-3333-3333-333333333333', '2026-05-06', 'MISS-PATH', 50.00, 'CLP', "
+            "NULL, 1, 'Coffee')"
+        )
+
+        # Re-read both rows and assert the columns round-trip
+        # through the schema exactly as written.
+        hit = conn.exec_driver_sql(
+            "SELECT category_id, low_confidence, category FROM transactions WHERE id = '44444444-4444-4444-4444-444444444441'"
+        ).fetchone()
+        miss = conn.exec_driver_sql(
+            "SELECT category_id, low_confidence, category FROM transactions WHERE id = '44444444-4444-4444-4444-444444444442'"
+        ).fetchone()
+
+    # Hit path: FK matches, ``low_confidence=0``, denormalized
+    # name matches the canonical spelling.
+    assert hit is not None
+    assert str(hit[0]) == food_id
+    assert hit[1] == 0
+    assert hit[2] == "Dining Out"
+
+    # Miss path: FK is NULL, ``low_confidence=1``, the LLM string
+    # is preserved verbatim (the ingestion layer keeps it so the
+    # user can re-tag the row by name).
+    assert miss is not None
+    assert miss[0] is None
+    assert miss[1] == 1
+    assert miss[2] == "Coffee"
+
+
+# ---------------------------------------------------------------------------
 # Timestamp server_default regression guard
 # ---------------------------------------------------------------------------
 #

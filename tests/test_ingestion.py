@@ -163,7 +163,7 @@ NACIONAL_EXTRACTION_PAYLOAD: dict[str, Any] = {
             "description": "COMBUSTIBLE COPEC",
             "amount": "$ 35.000",
             "currency": "CLP",
-            "category": "Transport",
+            "category": "Transportation",
             "installment_number": None,
             "installment_total": None,
             "installment_value": None,
@@ -2156,7 +2156,7 @@ class TestUpdateTransactionEndpoint:
                 # PATCH the category
                 patch = await client.patch(
                     f"/api/v1/transactions/{txn_id}",
-                    json={"category": "Food"},
+                    json={"category": "Dining Out"},
                 )
         finally:
             app.dependency_overrides.pop(get_ingestion_service, None)
@@ -2165,7 +2165,7 @@ class TestUpdateTransactionEndpoint:
         assert patch.status_code == 200
         body = patch.json()
         assert body["id"] == txn_id
-        assert body["category"] == "Food"
+        assert body["category"] == "Dining Out"
 
         # Round-trip: read it back via list
         app2 = create_app(test_settings)
@@ -2178,7 +2178,7 @@ class TestUpdateTransactionEndpoint:
             app2.dependency_overrides.pop(get_session, None)
         for t in list_resp.json():
             if t["id"] == txn_id:
-                assert t["category"] == "Food"
+                assert t["category"] == "Dining Out"
 
     @pytest.mark.asyncio
     async def test_update_returns_404_for_missing(
@@ -2242,7 +2242,7 @@ class TestUpdateTransactionEndpoint:
             async with AsyncClient(transport=transport, base_url="http://testserver") as client:
                 response = await client.patch(
                     f"/api/v1/transactions/{uuid.uuid4()}",
-                    json={"category": "Food", "amount": "0"},
+                    json={"category": "Dining Out", "amount": "0"},
                 )
         finally:
             app.dependency_overrides.pop(get_session, None)
@@ -2630,18 +2630,62 @@ class TestValidateMetadata:
 
 
 class TestBuildTransactions:
-    """``IngestionService._build_transactions`` runs without a database or LLM.
+    """``IngestionService._build_transactions`` validates per-row fields.
 
-    The method takes a fully-populated
-    :class:`ExtractionResponse` and produces ready-to-add
-    :class:`Transaction` rows. It must validate amounts,
-    dates, and currency cross-checks.
+    Phase 2 changed the contract: the method now reads the
+    ``categories`` table once at the start of the call to build
+    a name → :class:`Category` dict cache, then resolves the
+    LLM-emitted ``category`` string per row. The tests below
+    run against a real in-memory SQLite database (via the
+    ``engine`` fixture from :mod:`tests.conftest`) so the
+    cache lookup is exercised end-to-end.
     """
 
-    def test_builds_one_transaction_per_llm_row(self) -> None:
-        """Each LLM-emitted transaction becomes one :class:`Transaction` row."""
-        from app.models.statement import Statement
+    @pytest.fixture
+    async def session_with_categories(self, engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+        """Yield a session bound to a fresh schema with the 12 categories seeded.
 
+        The fixture creates the full schema (so :class:`Category` is
+        available) and inserts the 12 closed-set rows that
+        migration ``0005_phase2_categories`` would have inserted
+        in a real environment. The tests use these as the lookup
+        target — a hit on ``"Groceries"`` must resolve to the
+        seeded UUID.
+        """
+        from app.models.category import Category
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            seed = (
+                ("Dining Out", "Dining Out", 1),
+                ("Groceries", "Groceries", 2),
+                ("Transportation", "Transportation", 3),
+                ("Shopping", "Shopping", 4),
+                ("Entertainment", "Entertainment", 5),
+                ("Bills", "Bills & Utilities", 6),
+                ("Health", "Health & Medical", 7),
+                ("Travel", "Travel", 8),
+                ("Subscriptions", "Subscriptions", 9),
+                ("Personal Care", "Personal Care", 10),
+                ("Uncategorized", "Uncategorized", 11),
+                ("Other", "Other", 12),
+            )
+            for name, display, order in seed:
+                session.add(
+                    Category(
+                        name=name,
+                        display_name=display,
+                        sort_order=order,
+                    )
+                )
+            await session.commit()
+            yield session
+
+    @pytest.mark.asyncio
+    async def test_builds_one_transaction_per_llm_row(
+        self, session_with_categories: AsyncSession
+    ) -> None:
+        """Each LLM-emitted transaction becomes one :class:`Transaction` row."""
         extraction = ExtractionResponse(
             transactions=[
                 {
@@ -2656,7 +2700,7 @@ class TestBuildTransactions:
                     "description": "Y",
                     "amount": "$ 35.000",
                     "currency": "CLP",
-                    "category": "Transport",
+                    "category": "Transportation",
                 },
             ],
             metadata={
@@ -2670,33 +2714,33 @@ class TestBuildTransactions:
             confidence=0.5,
             notes=None,
         )
-        # A stand-in statement: the model only reads ``.id``
-        # from this object, so a SimpleNamespace is enough.
         from types import SimpleNamespace
 
-        statement = SimpleNamespace(id=uuid.uuid4())
-        # The real method is unbound, so we call it as a static-ish helper.
-        from app.services.ingestion import IngestionService as _Svc
+        from app.services.ingestion import IngestionService
 
-        transactions = _Svc._build_transactions(
-            self=_Svc.__new__(_Svc),
+        statement = SimpleNamespace(id=uuid.uuid4())
+        # ``__new__`` + manual ``_session`` is the documented
+        # pattern for unit-testing the orchestrator's helpers
+        # without a real LLM client or settings object.
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
             statement=statement,
             extraction=extraction,
             expected_currency="CLP",
         )
         assert len(transactions) == 2
-        assert all(isinstance(t, Statement.__class__) for t in transactions) or all(
-            isinstance(t, type(transactions[0])) for t in transactions
-        )
         assert transactions[0].description == "X"
         assert transactions[0].amount == Decimal("12450")
         assert transactions[1].amount == Decimal("35000")
 
-    def test_currency_mismatch_raises(self) -> None:
+    @pytest.mark.asyncio
+    async def test_currency_mismatch_raises(self, session_with_categories: AsyncSession) -> None:
         """A transaction whose currency does not match the variant raises."""
         from types import SimpleNamespace
 
-        from app.services.ingestion import IngestionService as _Svc
+        from app.services.ingestion import IngestionService
 
         extraction = ExtractionResponse(
             transactions=[
@@ -2720,19 +2764,22 @@ class TestBuildTransactions:
             notes=None,
         )
         statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
         with pytest.raises(IngestionError, match="currency"):
-            _Svc._build_transactions(
-                self=_Svc.__new__(_Svc),
+            await IngestionService._build_transactions(
+                service,
                 statement=statement,
                 extraction=extraction,
                 expected_currency="CLP",
             )
 
-    def test_bad_amount_raises(self) -> None:
+    @pytest.mark.asyncio
+    async def test_bad_amount_raises(self, session_with_categories: AsyncSession) -> None:
         """An unparseable amount string raises an :class:`IngestionError`."""
         from types import SimpleNamespace
 
-        from app.services.ingestion import IngestionService as _Svc
+        from app.services.ingestion import IngestionService
 
         extraction = ExtractionResponse(
             transactions=[
@@ -2756,19 +2803,22 @@ class TestBuildTransactions:
             notes=None,
         )
         statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
         with pytest.raises(IngestionError):
-            _Svc._build_transactions(
-                self=_Svc.__new__(_Svc),
+            await IngestionService._build_transactions(
+                service,
                 statement=statement,
                 extraction=extraction,
                 expected_currency="CLP",
             )
 
-    def test_installment_value_is_parsed(self) -> None:
+    @pytest.mark.asyncio
+    async def test_installment_value_is_parsed(self, session_with_categories: AsyncSession) -> None:
         """An installment value string is coerced to :class:`Decimal`."""
         from types import SimpleNamespace
 
-        from app.services.ingestion import IngestionService as _Svc
+        from app.services.ingestion import IngestionService
 
         extraction = ExtractionResponse(
             transactions=[
@@ -2795,8 +2845,10 @@ class TestBuildTransactions:
             notes=None,
         )
         statement = SimpleNamespace(id=uuid.uuid4())
-        transactions = _Svc._build_transactions(
-            self=_Svc.__new__(_Svc),
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
             statement=statement,
             extraction=extraction,
             expected_currency="CLP",
@@ -2804,6 +2856,246 @@ class TestBuildTransactions:
         assert transactions[0].installment_number == 1
         assert transactions[0].installment_total == 6
         assert transactions[0].installment_value == Decimal("89900")
+
+    # ------------------------------------------------------------------
+    # Phase 2 — closed-set category resolution
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_hit_on_closed_set_name(self, session_with_categories: AsyncSession) -> None:
+        """A category in the seed resolves to its UUID and ``low_confidence=False``.
+
+        Phase 2 — categories foundation. The LLM emits
+        ``"Groceries"`` (or any other name from the 12-row
+        seed); the ingestion layer stamps the matching
+        ``Category.id`` on the row, leaves the canonical
+        ``name`` in the denormalized column, and marks
+        ``low_confidence=False``.
+        """
+        from sqlalchemy import select
+
+        from app.models.category import Category
+        from app.services.ingestion import IngestionService
+
+        # Capture the seeded UUID for ``Groceries`` so the
+        # assertion can compare against the exact value.
+        result = await session_with_categories.execute(
+            select(Category).where(Category.name == "Groceries")
+        )
+        groceries = result.scalar_one()
+
+        from types import SimpleNamespace
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "LEADER",
+                    "amount": "$ 12.450",
+                    "currency": "CLP",
+                    "category": "Groceries",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.95,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        assert len(transactions) == 1
+        tx = transactions[0]
+        assert tx.category == "Groceries"
+        assert tx.category_id == groceries.id
+        assert tx.low_confidence is False
+
+    @pytest.mark.asyncio
+    async def test_miss_on_unknown_name(self, session_with_categories: AsyncSession) -> None:
+        """A category outside the seed gets ``NULL`` FK and ``low_confidence=True``.
+
+        The LLM emitted ``"Coffee"`` (an off-set label) — the
+        ingestion layer preserves the LLM string in
+        ``category`` so the user can re-tag the row by hand,
+        leaves ``category_id`` as ``NULL`` (no match), and
+        flags the row as low-confidence.
+        """
+        from types import SimpleNamespace
+
+        from app.services.ingestion import IngestionService
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/05",
+                    "description": "CAFE AROMAS",
+                    "amount": "$ 4.500",
+                    "currency": "CLP",
+                    "category": "Coffee",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        tx = transactions[0]
+        assert tx.category == "Coffee"
+        assert tx.category_id is None
+        assert tx.low_confidence is True
+
+    @pytest.mark.asyncio
+    async def test_miss_on_null_category(self, session_with_categories: AsyncSession) -> None:
+        """A ``None`` / empty category falls back to ``"Uncategorized"`` and ``low_confidence=True``.
+
+        The LLM did not emit a category (the description was
+        unreadable, per the prompt's null fallback). The
+        ingestion layer stamps the canonical placeholder
+        string and flags the row as low-confidence so the
+        user sees it in the "needs review" view.
+        """
+        from types import SimpleNamespace
+
+        from app.services.ingestion import IngestionService
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "UNREADABLE",
+                    "amount": "$ 1.000",
+                    "currency": "CLP",
+                    "category": None,
+                },
+                {
+                    "date": "16/05/25",
+                    "description": "ANOTHER UNREADABLE",
+                    "amount": "$ 2.000",
+                    "currency": "CLP",
+                    "category": "",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        assert transactions[0].category == "Uncategorized"
+        assert transactions[0].category_id is None
+        assert transactions[0].low_confidence is True
+        assert transactions[1].category == "Uncategorized"
+        assert transactions[1].category_id is None
+        assert transactions[1].low_confidence is True
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_match(self, session_with_categories: AsyncSession) -> None:
+        """The closed-set match is case-insensitive (``strip().lower()``).
+
+        An LLM that emits ``"GROCERIES"`` (uppercase) or
+        ``" Groceries "`` (with surrounding whitespace) still
+        hits the seeded row. This is the case-insensitive
+        contract from design decision #4.
+        """
+        from sqlalchemy import select
+
+        from app.models.category import Category
+        from app.services.ingestion import IngestionService
+
+        result = await session_with_categories.execute(
+            select(Category).where(Category.name == "Groceries")
+        )
+        groceries = result.scalar_one()
+
+        from types import SimpleNamespace
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "X",
+                    "amount": "$ 1.000",
+                    "currency": "CLP",
+                    "category": "GROCERIES",
+                },
+                {
+                    "date": "16/05/25",
+                    "description": "Y",
+                    "amount": "$ 2.000",
+                    "currency": "CLP",
+                    "category": "  Groceries  ",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.5,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        # Both rows hit; the denormalized ``category`` is
+        # the canonical spelling (``"Groceries"``), not the
+        # LLM-emitted variant.
+        assert transactions[0].category == "Groceries"
+        assert transactions[0].category_id == groceries.id
+        assert transactions[0].low_confidence is False
+        assert transactions[1].category == "Groceries"
+        assert transactions[1].category_id == groceries.id
+        assert transactions[1].low_confidence is False
 
 
 # ---------------------------------------------------------------------------
