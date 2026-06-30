@@ -20,7 +20,7 @@
 
 ### Phase 1 — Foundation
 
-- [ ] **1.1 Create migration 0005 (`alembic/versions/0005_phase2_categories.py`).**
+- [x] **1.1 Create migration 0005 (`alembic/versions/0005_phase2_categories.py`).**
   Revises `0004_timestamp_server_defaults`. Creates `categories` table with
   `id` (UUID PK, CHAR(36)), `created_at` / `updated_at` (timezone-aware, NOT
   NULL, `server_default=func.now()`), `name` (String(50), NOT NULL,
@@ -29,7 +29,7 @@
   via `op.bulk_insert` (see design §"Seeded Taxonomy"). Downgrade drops
   indexes + table.
 
-- [ ] **1.2 Create migration 0006 (`alembic/versions/0006_phase2_category_columns.py`).**
+- [x] **1.2 Create migration 0006 (`alembic/versions/0006_phase2_category_columns.py`).**
   Revises `0005_phase2_categories`. **Partial migration** — PR #4 will extend
   this file with `merchants`, `merchant_aliases`, and `Transaction.merchant_id`.
   Add a header comment documenting the extension point. Add to
@@ -39,14 +39,14 @@
   - `ix_transactions_category_id` (B-tree on `category_id`).
   Downgrade drops the index + both columns in reverse order.
 
-- [ ] **1.3 Add `Category` model (`app/models/category.py`) + extend
+- [x] **1.3 Add `Category` model (`app/models/category.py`) + extend
   `Transaction` (`app/models/transaction.py`).** `Category(UUIDMixin,
   TimestampMixin, Base)` mirrors `Bank`. Add `category_id` (UUIDType, FK,
   nullable, indexed) and `low_confidence` (Boolean, NOT NULL, default
   `False`) on `Transaction`. Add `category: Mapped[Category | None]` back-ref
   with `lazy="joined"`. Re-export `Category` in `app/models/__init__.py`.
 
-- [ ] **1.4 Add Pydantic schemas (`app/schemas/domain.py` + re-export in
+- [x] **1.4 Add Pydantic schemas (`app/schemas/domain.py` + re-export in
   `app/schemas/__init__.py`).** `CategoryResponse` (id, name, display_name,
   sort_order, timestamps, `from_attributes=True`). `CategoryRenameRequest`
   (`name?: str` min 1, max 50; `display_name?: str` min 1, max 100;
@@ -58,7 +58,7 @@
 
 ### Phase 2 — LLM + Ingestion
 
-- [ ] **2.1 Update prompts (`app/services/llm/prompts.py`).** Add a
+- [x] **2.1 Update prompts (`app/services/llm/prompts.py`).** Add a
   `SEED_CATEGORY_NAMES: Final = (...)` constant holding the 12 names. Update
   both NACIONAL and INTERNACIONAL prompt templates: the "INSTRUCTIONS"
   section adds an explicit "Use one of these 12 category names" paragraph
@@ -66,7 +66,7 @@
   (`_NACIONAL_EXAMPLE_OUTPUT`, `_INTERNACIONAL_EXAMPLE_OUTPUT`) so every
   `category` field is drawn from the set.
 
-- [ ] **2.2 Validate category in ingestion (`app/services/ingestion.py`).**
+- [x] **2.2 Validate category in ingestion (`app/services/ingestion.py`).**
   Add `from app.models.category import Category` import. In
   `_build_transactions`: at the top of the method, run
   `select(Category)` once, build `by_name: dict[str, Category]` keyed by
@@ -78,7 +78,7 @@
 
 ### Phase 3 — API
 
-- [ ] **3.1 New categories router (`app/api/v1/categories.py`).**
+- [x] **3.1 New categories router (`app/api/v1/categories.py`).**
   `router = APIRouter(prefix="/categories", tags=["categories"])`.
   `GET ""` returns `[CategoryResponse]` ordered by `sort_order.asc()`.
   `POST "/{category_id}"` accepts `CategoryRenameRequest`, validates
@@ -87,7 +87,7 @@
   `category_id`) in a single `session.commit()`. 404 when UUID is unknown.
   Re-export via `__all__ = ["router"]`. Wire into `app/api/v1/router.py`.
 
-- [ ] **3.2 Extend PATCH endpoint (`app/api/v1/transactions.py`).** Update
+- [x] **3.2 Extend PATCH endpoint (`app/api/v1/transactions.py`).** Update
   `update_transaction`: when `payload.category_id` is not None, look up
   the `Category` row (404 if missing), set `transaction.category_id` and
   `transaction.category = cat.name` and `low_confidence=False`. When
@@ -100,12 +100,12 @@
 
 ### Phase 4 — Verification
 
-- [ ] **4.1 Run the gates.** `pytest --no-cov` ≥381 passing + same 3 (or 22)
+- [x] **4.1 Run the gates.** `pytest --no-cov` ≥381 passing + same 3 (or 22)
   pre-existing failures; no new failures. `ruff check .` clean. `ruff
   format --check <modified files>` clean. `mypy --strict app/` clean.
   Coverage ≥91.74% (or the current env's floor, whichever is higher).
 
-- [ ] **4.2 Cherry-pick isolation gate.** `git diff main --stat` shows
+- [x] **4.2 Cherry-pick isolation gate.** `git diff main --stat` shows
   changes only in the files in the §"File Changes" list. `git diff main
   -- app/services/ingestion.py` shows ONLY the new `Category` import and
   the modified `_build_transactions` method. NONE of: chunk-loop
@@ -114,7 +114,7 @@
 
 ### Phase 5 — Commit Hygiene
 
-- [ ] **5.1 Atomic conventional commits, no `Co-Authored-By`, buildable
+- [x] **5.1 Atomic conventional commits, no `Co-Authored-By`, buildable
   at each commit.** Suggested commit order: migration 0005 + Category
   model + Transaction extension; migration 0006 + schemas; prompts;
   ingestion validation; categories router; transactions PATCH
