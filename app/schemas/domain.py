@@ -258,9 +258,11 @@ class CategoryResponse(BaseModel):
 
     The 12 closed-set Y-NAB categories are listed by
     ``GET /api/v1/categories`` ordered by ``sort_order``. The
-    response omits ``is_active`` because the GET endpoint only
-    returns active rows; the field is reserved on the model for
-    a future soft-disable use case.
+    response carries the stable identifier (``name``), the
+    human-readable label (``display_name``), the position in
+    the display order (``sort_order``), and the timestamp
+    columns. The endpoint does not filter — every row is
+    returned, in ``sort_order`` ascending.
     """
 
     model_config = ConfigDict(from_attributes=True)
