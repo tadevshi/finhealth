@@ -178,7 +178,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id", name="pk_categories"),
         sa.UniqueConstraint("name", name="uq_categories_name"),
     )
-    op.create_index("ix_categories_name", "categories", ["name"], unique=True)
     op.create_index("ix_categories_sort_order", "categories", ["sort_order"])
 
     # Seed rows ------------------------------------------------------------
@@ -223,5 +222,4 @@ def downgrade() -> None:
     runs.
     """
     op.drop_index("ix_categories_sort_order", table_name="categories")
-    op.drop_index("ix_categories_name", table_name="categories")
     op.drop_table("categories")
