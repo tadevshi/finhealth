@@ -112,8 +112,8 @@ async def rename_category(
     #11): no audit row, no history table, the rename is
     immediate.
 
-    The rename and the propagation are wrapped in a single
-    ``session.begin()`` block so the operation is atomic (per
+    The rename and the propagation share a single
+    ``session.commit()`` so the operation is atomic (per
     design decision #7). The propagation updates every
     :class:`Transaction` whose ``category_id`` matches the
     renamed category's UUID, setting ``Transaction.category``
@@ -140,76 +140,65 @@ async def rename_category(
             detail="At least one of `name` or `display_name` must be supplied",
         )
 
-    # Wrap the SELECT + UPDATE + UPDATE + COMMIT in a single
-    # ``begin`` block so the rename is atomic. If the
-    # transactions UPDATE fails (or anything else), the
-    # category UPDATE is rolled back too — the
-    # ``session.begin()`` context manager handles the
-    # commit / rollback boundary.
-    async with session.begin():
-        # 1. Look up the category to be renamed. 404 if the
-        #    UUID does not match any row.
-        result = await session.execute(select(Category).where(Category.id == category_id))
-        category = result.scalar_one_or_none()
-        if category is None:
+    # 1. Look up the category to be renamed. 404 if the
+    #    UUID does not match any row. The check happens
+    #    *before* any write so a bad UUID is a clean 404,
+    #    not a half-applied rename.
+    result = await session.execute(select(Category).where(Category.id == category_id))
+    category = result.scalar_one_or_none()
+    if category is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Category {category_id} not found",
+        )
+
+    # 2. Collision check on the proposed ``name`` (only
+    #    when the field is supplied *and* the value
+    #    actually changes). Compare against every
+    #    *other* row — the unique constraint is the
+    #    second line of defence, but the explicit check
+    #    gives a clean 422 instead of a 500 from a
+    #    constraint violation.
+    if payload.name is not None and payload.name != category.name:
+        collision = await session.execute(
+            select(Category.id).where(
+                Category.name == payload.name,
+                Category.id != category_id,
+            )
+        )
+        if collision.scalar_one_or_none() is not None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Category {category_id} not found",
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(f"Category name {payload.name!r} is already taken by another category"),
             )
+        # 3a. Apply the new ``name`` to the Category row.
+        category.name = payload.name
 
-        # 2. Collision check on the proposed ``name`` (only
-        #    when the field is supplied *and* the value
-        #    actually changes). Compare against every
-        #    *other* row — the unique constraint is the
-        #    second line of defence, but the explicit check
-        #    gives a clean 422 instead of a 500 from a
-        #    constraint violation.
-        if payload.name is not None and payload.name != category.name:
-            collision = await session.execute(
-                select(Category.id).where(
-                    Category.name == payload.name,
-                    Category.id != category_id,
-                )
-            )
-            if collision.scalar_one_or_none() is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=(f"Category name {payload.name!r} is already taken by another category"),
-                )
-            # 3a. Apply the new ``name`` to the Category row.
-            old_name = category.name
-            category.name = payload.name
+        # 3b. Propagate the new ``name`` to every
+        #     transaction whose ``category_id`` matches.
+        #     The UPDATE is scoped to the matching FK so
+        #     non-matching rows are left alone.
+        await session.execute(
+            update(Transaction)
+            .where(Transaction.category_id == category_id)
+            .values(category=payload.name)
+        )
 
-            # 3b. Propagate the new ``name`` to every
-            #     transaction whose ``category_id`` matches.
-            #     The UPDATE is scoped to the matching FK so
-            #     non-matching rows are left alone.
-            await session.execute(
-                update(Transaction)
-                .where(Transaction.category_id == category_id)
-                .values(category=payload.name)
-            )
-            # Reference the old name to keep the variable
-            # honest about what we replaced (useful for log
-            # lines and for a future audit-trail feature).
-            _ = old_name
+    if payload.display_name is not None:
+        category.display_name = payload.display_name
 
-        if payload.display_name is not None:
-            category.display_name = payload.display_name
-
-        # Flush so the ``updated_at`` on the category row
-        # gets the server-side ``CURRENT_TIMESTAMP`` value
-        # before the response is built. The ``refresh``
-        # pulls the post-flush state into the in-memory
-        # object so the Pydantic response model sees the
-        # new values without a second round-trip.
-        await session.flush()
-        await session.refresh(category)
-
-    # ``expire_on_commit`` is ``False`` on the production
-    # session factory, so ``category`` still holds the
-    # post-commit values. The Pydantic response model
-    # serialises it directly.
+    # Single ``commit`` covers the Category update and the
+    # transaction cascade. The commit implicitly flushes
+    # the pending object mutations on ``category``, so the
+    # explicit ``flush()`` the previous ``async with
+    # session.begin()`` block had is no longer needed.
+    await session.commit()
+    # ``refresh`` pulls the post-commit state into the
+    # in-memory object so the Pydantic response model sees
+    # the new ``updated_at`` (set by the server-side
+    # ``CURRENT_TIMESTAMP`` default) without a second
+    # round-trip.
+    await session.refresh(category)
     return category
 
 

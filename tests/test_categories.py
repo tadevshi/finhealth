@@ -384,9 +384,9 @@ async def test_rename_category_atomicity_on_collision(
 ) -> None:
     """A 422 (collision) leaves the original category unchanged.
 
-    The endpoint raises the 422 *inside* the ``session.begin()``
-    block, so the rollback covers every state change. This
-    test is the regression guard for that contract.
+    The endpoint raises the 422 *before* the commit, so the
+    rollback covers every state change. This test is the
+    regression guard for that contract.
     """
     (food_id,) = await _find_category_ids(seeded_client, "Dining Out")
     response = await seeded_client.post(
