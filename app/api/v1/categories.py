@@ -34,7 +34,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
@@ -127,12 +127,20 @@ async def rename_category(
 
     The proposed ``name`` (if supplied and different from
     the current value) is checked against every *other*
-    row's ``name`` before the UPDATE runs. A collision
-    returns 422 with a descriptive error so the client can
-    surface it before the user sees a half-applied state.
-    The explicit check gives a cleaner 422 than the
-    ``UNIQUE`` constraint on ``categories.name`` would (it
-    would surface as a 500 from the constraint violation).
+    row's ``name`` before the UPDATE runs. The check is
+    case-insensitive (``func.lower`` on both sides) to
+    mirror the ingestion layer's case-insensitive
+    ``name.lower()`` lookup (per design decision #4) — a
+    rename to a case-variant of an existing row would
+    otherwise slip through the explicit check and let
+    ingestion confuse the two names. A collision returns
+    422 with a descriptive error so the client can surface
+    it before the user sees a half-applied state. The
+    explicit check gives a cleaner 422 than the
+    ``UNIQUE`` constraint on ``categories.name`` would
+    (it would surface as a 500 from the constraint
+    violation, and it is case-sensitive so it would not
+    catch the variant either).
     """
     if payload.name is None and payload.display_name is None:
         raise HTTPException(
@@ -154,15 +162,19 @@ async def rename_category(
 
     # 2. Collision check on the proposed ``name`` (only
     #    when the field is supplied *and* the value
-    #    actually changes). Compare against every
-    #    *other* row — the unique constraint is the
-    #    second line of defence, but the explicit check
-    #    gives a clean 422 instead of a 500 from a
-    #    constraint violation.
+    #    actually changes). The check is case-insensitive
+    #    so a rename to ``"dining out"`` against an
+    #    existing ``"Dining Out"`` is still caught — the
+    #    ingestion layer resolves the closed set via
+    #    ``name.lower()`` and the rename would otherwise
+    #    land two rows in the same equivalence class.
+    #    The unique constraint on ``categories.name`` is
+    #    still case-sensitive, so the explicit check is
+    #    the *only* defence against the case variant.
     if payload.name is not None and payload.name != category.name:
         collision = await session.execute(
             select(Category.id).where(
-                Category.name == payload.name,
+                func.lower(Category.name) == payload.name.lower(),
                 Category.id != category_id,
             )
         )
