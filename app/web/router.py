@@ -40,6 +40,84 @@ web_router: APIRouter = APIRouter(tags=["web"])
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+async def _query_transactions(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    *,
+    statement_id: uuid.UUID | None,
+    date_from: date_typ | None,
+    date_to: date_typ | None,
+    min_amount: Decimal | None,
+    max_amount: Decimal | None,
+    description: str | None,
+    currency: str | None,
+) -> list[Transaction]:
+    """Build and execute the transactions list query for the web layer.
+
+    Centralised so :func:`transactions_page` and
+    :func:`transactions_rows_partial` produce identical results for
+    the same filter set — a refresh of the full page and an HTMX
+    partial request are guaranteed to agree. The Query
+    declarations stay on the route functions (FastAPI needs them
+    there to validate the wire format); the body of the query
+    lives here.
+
+    The function takes a session as its first positional argument
+    so the route handlers can stay trivial::
+
+        transactions = await _query_transactions(
+            session, statement_id=..., date_from=..., ...
+        )
+
+    Parameters mirror the route-level Query params one-to-one.
+    ``statement_id`` is the only filter added in this refactor
+    pass; the upcoming Category UI work will add two more
+    (``category_id`` and ``uncategorized``) without touching the
+    helper's signature, because they ride the same SQL builder.
+
+    Filters compose with ``AND``. A filter that is ``None`` is
+    not applied. ``description`` uses SQL ``ILIKE`` so the match
+    is case-insensitive — the only sensible default for a
+    free-text search box.
+    """
+    query = select(Transaction)
+    if statement_id is not None:
+        query = query.where(Transaction.statement_id == statement_id)
+    if date_from is not None:
+        query = query.where(Transaction.date >= date_from)
+    if date_to is not None:
+        query = query.where(Transaction.date <= date_to)
+    if min_amount is not None:
+        # ``amount`` is signed; bounding the *absolute* value
+        # means a refund of $1.000 and a charge of $1.000 both
+        # match ``min_amount=500``. ``InstrumentedAttribute``
+        # does not expose ``.abs()`` directly, so we use SQL's
+        # ``func.abs`` and compare in SQL rather than Python.
+        query = query.where(func.abs(Transaction.amount) >= min_amount)
+    if max_amount is not None:
+        query = query.where(func.abs(Transaction.amount) <= max_amount)
+    if description is not None:
+        # ``ilike`` is PostgreSQL-specific; SQLite's ``LIKE``
+        # is already case-insensitive for ASCII. We use
+        # ``func.lower`` on both sides so the SQL is portable.
+        needle = f"%{description.lower()}%"
+        query = query.where(func.lower(Transaction.description).like(needle))
+    if currency is not None:
+        query = query.where(Transaction.currency == currency)
+
+    # Stable order: oldest transaction first, with a
+    # tiebreaker on the primary key so two rows with the same
+    # date do not shift between pages.
+    query = query.order_by(Transaction.date.asc(), Transaction.id.asc())
+
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+# ---------------------------------------------------------------------------
 # Page routes
 # ---------------------------------------------------------------------------
 
@@ -159,31 +237,22 @@ async def transactions_page(
     that a single page of up to ``MAX_PAGE_SIZE`` rows is fine.
     A future WU will add cursor pagination and a footer.
 
-    The query is the same one the JSON API uses, inlined here
-    so the two endpoints stay obviously similar. If the
-    filter set grows, a small ``_query_transactions`` helper
-    belongs in this module (see also ``/transactions/rows``).
+    The query is delegated to :func:`_query_transactions` so
+    the full page and the HTMX partial see the same rows for
+    the same filter set. The Query declarations stay on the
+    route (FastAPI needs them there to validate the wire
+    format); the body of the query lives in the helper.
     """
-    query = select(Transaction)
-    if statement_id is not None:
-        query = query.where(Transaction.statement_id == statement_id)
-    if date_from is not None:
-        query = query.where(Transaction.date >= date_from)
-    if date_to is not None:
-        query = query.where(Transaction.date <= date_to)
-    if min_amount is not None:
-        query = query.where(func.abs(Transaction.amount) >= min_amount)
-    if max_amount is not None:
-        query = query.where(func.abs(Transaction.amount) <= max_amount)
-    if description is not None:
-        needle = f"%{description.lower()}%"
-        query = query.where(func.lower(Transaction.description).like(needle))
-    if currency is not None:
-        query = query.where(Transaction.currency == currency)
-
-    query = query.order_by(Transaction.date.asc(), Transaction.id.asc())
-    result = await session.execute(query)
-    transactions = list(result.scalars().all())
+    transactions = await _query_transactions(
+        session,
+        statement_id=statement_id,
+        date_from=date_from,
+        date_to=date_to,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        description=description,
+        currency=currency,
+    )
 
     app_name: str = request.app.state.settings.APP_NAME
     context: dict[str, Any] = {
@@ -258,30 +327,20 @@ async def transactions_rows_partial(
     into ``#transaction-list-body`` by HTMX — no full page
     reload, no client-side templating, no JSON-to-DOM.
 
-    The query is identical to :func:`transactions_page` so a
+    The query delegates to :func:`_query_transactions` so a
     refresh of the full page and a HTMX filter request are
     guaranteed to return the same rows.
     """
-    query = select(Transaction)
-    if statement_id is not None:
-        query = query.where(Transaction.statement_id == statement_id)
-    if date_from is not None:
-        query = query.where(Transaction.date >= date_from)
-    if date_to is not None:
-        query = query.where(Transaction.date <= date_to)
-    if min_amount is not None:
-        query = query.where(func.abs(Transaction.amount) >= min_amount)
-    if max_amount is not None:
-        query = query.where(func.abs(Transaction.amount) <= max_amount)
-    if description is not None:
-        needle = f"%{description.lower()}%"
-        query = query.where(func.lower(Transaction.description).like(needle))
-    if currency is not None:
-        query = query.where(Transaction.currency == currency)
-
-    query = query.order_by(Transaction.date.asc(), Transaction.id.asc())
-    result = await session.execute(query)
-    transactions = list(result.scalars().all())
+    transactions = await _query_transactions(
+        session,
+        statement_id=statement_id,
+        date_from=date_from,
+        date_to=date_to,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        description=description,
+        currency=currency,
+    )
 
     context: dict[str, Any] = {"transactions": transactions, "error": None}
     return templates.TemplateResponse(
