@@ -23,7 +23,7 @@ from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
@@ -157,6 +157,26 @@ async def list_transactions(
             description="Partial, case-insensitive match against the description.",
         ),
     ] = None,
+    category_id: Annotated[
+        list[uuid.UUID] | None,
+        Query(
+            description=(
+                "Repeatable filter — limit to transactions whose category_id "
+                "matches any of the supplied UUIDs. Combine with `uncategorized=true` "
+                "to also include untagged rows (NULL or low_confidence=True)."
+            ),
+        ),
+    ] = None,
+    uncategorized: Annotated[
+        bool,
+        Query(
+            description=(
+                "When true, also include transactions whose category_id is NULL or "
+                "whose low_confidence flag is true (i.e. tagged with a free-form "
+                "string by the legacy `category: str` field)."
+            ),
+        ),
+    ] = False,
     limit: Annotated[
         int,
         Query(
@@ -206,6 +226,32 @@ async def list_transactions(
         # on both sides so the SQL is portable.
         needle = f"%{description.lower()}%"
         query = query.where(func.lower(Transaction.description).like(needle))
+
+    # Category filters — the closed-set ``category_id`` UUID and
+    # the "untagged" sentinel compose as a parenthesized ``OR``:
+    #
+    # * both supplied  -> ``category_id IN (...) OR (IS NULL OR low_confidence=True)``
+    # * only UUIDs     -> ``category_id IN (...)``
+    # * only untagged  -> ``(category_id IS NULL OR low_confidence=True)``
+    # * neither        -> no WHERE clause
+    #
+    # Wrapping each branch in a parenthesized ``or_`` keeps the
+    # boolean precedence correct when combined with the AND
+    # filters above (otherwise the second branch would silently
+    # re-AND the closed-set UUIDs). Each branch is a single
+    # ``where`` call so the SQL stays one statement.
+    if category_id or uncategorized:
+        clauses = []
+        if category_id:
+            clauses.append(Transaction.category_id.in_(category_id))
+        if uncategorized:
+            clauses.append(
+                or_(
+                    Transaction.category_id.is_(None),
+                    Transaction.low_confidence.is_(True),
+                )
+            )
+        query = query.where(or_(*clauses))
 
     # Stable order: oldest transaction first, with a tiebreaker
     # on the primary key so two rows with the same date do not
