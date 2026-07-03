@@ -2,15 +2,20 @@
 
    Returned by ``GET /transactions/rows`` and swapped into the
    ``<tbody id="transaction-list-body">`` of ``transactions.html``
-   by HTMX. Kept as a separate template so the page template
+   by HTMX. Also re-rendered (as a single ``<tr>``) by the
+   ``PATCH /api/v1/transactions/{id}`` endpoint when the
+   browser sends ``Accept: text/html`` (HTMX swap), so the
+   server is the single source of truth for the category
+   picker. Kept as a separate template so the page template
    (``transactions.html``) and the partial can share the row
    markup via a Jinja ``include`` if it grows.
 
    The partial is rendered with the same context the page
-   template receives: ``transactions`` (list of ORM rows) and
-   ``error`` (optional human-readable error string). When the
-   query is empty the partial renders an empty-state row so the
-   table never collapses.                                                #}
+   template receives: ``transactions`` (list of ORM rows),
+   ``categories`` (list of Category rows sorted by
+   ``sort_order``), and ``error`` (optional human-readable
+   error string). When the query is empty the partial renders
+   an empty-state row so the table never collapses.                #}
 {% if error %}
     <tr>
         <td colspan="5"
@@ -45,20 +50,32 @@
             {{ txn.currency }}
         </td>
         <td class="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">
-            <input type="text"
-                   value="{{ txn.category or '' }}"
-                   placeholder="--"
-                   data-testid="category-input"
-                   data-transaction-id="{{ txn.id }}"
-                   class="w-32 px-2 py-1 text-sm border border-gray-300
-                          dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100
-                          rounded focus:outline-none focus:ring-1 focus:ring-indigo-500
-                          focus:border-indigo-500"
-                   hx-patch="/api/v1/transactions/{{ txn.id }}"
-                   hx-trigger="change"
-                   hx-target="closest tr"
-                   hx-swap="outerHTML"
-                   name="category">
+            {# Server-rendered <select> — 12 categories (sorted by
+               sort_order) + a blank "—" option. The current
+               category_id gets the `selected` attribute so the
+               swap after a PATCH shows the new pick. hx-patch
+               unchanged: the swap target is the enclosing <tr>,
+               so the server is the source of truth and we do
+               not have to mutate DOM state on the client.         #}
+            <select name="category_id"
+                    data-testid="category-select"
+                    data-transaction-id="{{ txn.id }}"
+                    class="w-40 px-2 py-1 text-sm border border-gray-300
+                           dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100
+                           rounded focus:outline-none focus:ring-1 focus:ring-indigo-500
+                           focus:border-indigo-500"
+                    hx-patch="/api/v1/transactions/{{ txn.id }}"
+                    hx-trigger="change"
+                    hx-target="closest tr"
+                    hx-swap="outerHTML">
+                <option value="" {% if txn.category_id is none %}selected{% endif %}>—</option>
+                {% for cat in categories %}
+                <option value="{{ cat.id }}"
+                        {% if txn.category_id is not none and txn.category_id == cat.id %}selected{% endif %}>
+                    {{ cat.display_name }}
+                </option>
+                {% endfor %}
+            </select>
         </td>
     </tr>
     {% endfor %}

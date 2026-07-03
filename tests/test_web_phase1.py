@@ -61,6 +61,13 @@ TABLE_TESTID = 'data-testid="transactions-table"'
 TBODY_TESTID = 'data-testid="transaction-list-body"'
 ROW_TESTID = 'data-testid="transaction-row"'
 CATEGORY_INPUT_TESTID = 'data-testid="category-input"'
+#: ``data-testid`` on the per-row category ``<select>``. The Phase 2
+#: PR #3 change replaces the legacy free-text ``<input>`` with a
+#: server-rendered ``<select>`` so the contract changes from
+#: ``category-input`` to ``category-select``. The old constant is
+#: kept above to make the rename visible in one place; the new
+#: contract uses ``category-select``.
+CATEGORY_SELECT_TESTID = 'data-testid="category-select"'
 DESCRIPTION_TESTID = 'data-testid="transaction-description"'
 AMOUNT_TESTID = 'data-testid="transaction-amount"'
 
@@ -391,9 +398,18 @@ async def test_transactions_page_uses_htmx_for_filtering(
 async def test_transactions_page_categories_have_htmx_patch(
     client: AsyncClient, seeded_transactions: list[Transaction]
 ) -> None:
-    """The category inputs are wired with ``hx-patch`` to update the row."""
+    """The per-row category pickers are wired with ``hx-patch`` to update the row.
+
+    Phase 2 PR #3 replaces the legacy free-text ``<input>`` with a
+    server-rendered ``<select>``; the contract marker changes from
+    ``category-input`` to ``category-select`` and the
+    ``hx-patch`` / ``hx-target`` / ``hx-swap`` wiring is preserved
+    so the existing client-side HTMX swap flow keeps working.
+    """
     body = (await client.get(TRANSACTIONS_PATH)).text
-    assert CATEGORY_INPUT_TESTID in body
+    assert CATEGORY_SELECT_TESTID in body
+    # The legacy free-text input is gone.
+    assert CATEGORY_INPUT_TESTID not in body
     # The hx-patch attribute appears at least once (one per row)
     assert 'hx-patch="/api/v1/transactions/' in body
 
