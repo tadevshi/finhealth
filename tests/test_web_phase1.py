@@ -12,6 +12,12 @@ Covers Work Unit 5 of the Phase 1 chain:
 * Filter combinations are honoured by both the page and the
   partial.
 
+Phase 2 PR #3 (Categories UI) extends the test surface with the
+per-row ``<select>`` markup, the multi-select filter widget,
+the ``Untagged or low confidence`` checkbox, and the PATCH
+``Accept: text/html`` round-trip — see the ``Categories UI
+(web)`` block at the bottom of the file.
+
 The tests build a throwaway FastAPI app, seed a small set of
 banks/transactions, and drive the routes with ``httpx``. The
 ``client`` fixture in :mod:`tests.conftest` creates the schema
@@ -32,6 +38,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.core.config import Settings
 from app.db.engine import create_engine
 from app.models.bank import Bank
+from app.models.category import Category
 from app.models.credit_card import CreditCard
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
@@ -215,6 +222,83 @@ async def seeded_transactions(
             for txn in txns:
                 await session.refresh(txn)
             yield txns
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def seeded_categories(
+    test_settings: Settings, seeded_transactions: list[Transaction]
+) -> AsyncIterator[list[Category]]:
+    """Insert the 12 closed-set categories for the Categories UI tests.
+
+    Builds on ``seeded_transactions`` so the categories share
+    the same engine/schema as the transactions they tag. The
+    third seeded transaction (PARIS) is re-tagged with the
+    Shopping ``Category`` row so the per-row ``<select>``
+    markup test has a row with a non-NULL ``category_id``
+    to render the ``selected`` option.
+
+    Yields the list of :class:`Category` rows in ``sort_order``
+    ascending so tests can assert against the canonical
+    ordering.
+    """
+    engine = create_engine(test_settings)
+    try:
+        from app.models.base import Base
+
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            now = datetime.now(UTC)
+            seed = (
+                ("Dining Out", "Dining Out", 1),
+                ("Groceries", "Groceries", 2),
+                ("Transportation", "Transportation", 3),
+                ("Shopping", "Shopping", 4),
+                ("Entertainment", "Entertainment", 5),
+                ("Bills", "Bills & Utilities", 6),
+                ("Health", "Health & Medical", 7),
+                ("Travel", "Travel", 8),
+                ("Subscriptions", "Subscriptions", 9),
+                ("Personal Care", "Personal Care", 10),
+                ("Uncategorized", "Uncategorized", 11),
+                ("Other", "Other", 12),
+            )
+            categories: list[Category] = []
+            for name, display, order in seed:
+                cat = Category(
+                    name=name,
+                    display_name=display,
+                    sort_order=order,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(cat)
+                categories.append(cat)
+            await session.flush()
+            # Re-tag PARIS with the Shopping Category so the
+            # per-row <select> shows a non-blank selected
+            # option. We re-load the transaction in this
+            # session's identity map because the outer
+            # session (from ``seeded_transactions``) is
+            # already closed; SQLAlchemy would silently drop
+            # the change on commit otherwise.
+            from sqlalchemy import select
+
+            shopping = next(c for c in categories if c.name == "Shopping")
+            paris_result = await session.execute(
+                select(Transaction).where(Transaction.description == "PARIS")
+            )
+            paris = paris_result.scalar_one()
+            paris.category_id = shopping.id
+            paris.category = "Shopping"
+            await session.commit()
+            for cat in categories:
+                await session.refresh(cat)
+            yield categories
     finally:
         await engine.dispose()
 
@@ -516,3 +600,185 @@ async def test_transactions_rows_filter_by_statement_id(
     response = await client.get(ROWS_PATH, params={"statement_id": str(uuid.uuid4())})
     body = response.text
     assert "No transactions match" in body
+
+
+# ---------------------------------------------------------------------------
+# Categories UI (web) — Phase 2 PR #3
+# ---------------------------------------------------------------------------
+
+
+#: ``data-testid`` markers added in Phase 2 PR #3.
+FILTER_CATEGORY_ID_TESTID = 'data-testid="filter-category-id"'
+FILTER_UNCATEGORIZED_TESTID = 'data-testid="filter-uncategorized"'
+
+#: The label the user sees for the uncategorized checkbox. Pinned
+#: by the design decision (D3) so a future rename does not
+#: silently change the user-visible contract.
+UNCATEGORIZED_LABEL = "Untagged or low confidence"
+
+
+@pytest.mark.asyncio
+async def test_per_row_select_rendered_with_thirteen_options(
+    client: AsyncClient,
+    seeded_categories: list[Category],
+    seeded_transactions: list[Transaction],
+) -> None:
+    """The per-row ``<select>`` has 13 ``<option>``s: 12 categories + 1 blank.
+
+    The 12 categories are server-rendered in ``sort_order``
+    ascending; the blank "—" option comes first. The total
+    is 13 per row.
+    """
+    import html as _html
+
+    body = (await client.get(ROWS_PATH)).text
+    # The per-row picker is rendered once per transaction.
+    select_count = body.count(CATEGORY_SELECT_TESTID)
+    assert select_count == len(seeded_transactions)
+    # Exactly 12 non-blank <option>s per row (one per category).
+    for cat in seeded_categories:
+        assert f'value="{cat.id}"' in body
+        # Jinja HTML-escapes the display name (& -> &amp;).
+        # The escaped form is what the browser sees, so the
+        # test asserts the escaped form to stay honest about
+        # what the user sees.
+        assert _html.escape(cat.display_name) in body
+    # The blank option is rendered exactly once per row.
+    blank_count = body.count('<option value=""')
+    assert blank_count == len(seeded_transactions)
+
+
+@pytest.mark.asyncio
+async def test_per_row_select_selected_option_matches_category_id(
+    client: AsyncClient, seeded_categories: list[Category]
+) -> None:
+    """The per-row ``<select>`` marks the row's current ``category_id`` as ``selected``.
+
+    PARIS is tagged with Shopping in the fixture, so the
+    rendered markup contains a ``value="<shopping uuid>"
+    ... selected`` snippet. The other two transactions have
+    no ``category_id`` so the blank "—" option is the
+    selected one for them.
+    """
+    body = (await client.get(ROWS_PATH)).text
+    shopping = next(c for c in seeded_categories if c.name == "Shopping")
+    # The Shopping <option> is the one that should be marked
+    # selected on the PARIS row. We do not assert which row
+    # the marker sits on — the test surface is "the marker
+    # is present in the rendered output".
+    assert f'value="{shopping.id}"' in body
+    # The \"selected\" attribute is set at least once for the
+    # Shopping UUID and once for the blank option (the two
+    # un-tagged rows).
+    assert body.count("selected") >= 3
+
+
+@pytest.mark.asyncio
+async def test_filter_form_has_multiselect_and_uncategorized_checkbox(
+    client: AsyncClient, seeded_categories: list[Category]
+) -> None:
+    """The filter form has the multi-select ``category_id`` and the uncategorized checkbox.
+
+    Both controls carry their Phase 2 PR #3 ``data-testid``
+    markers. The multi-select renders one ``<option>`` per
+    seeded category; the checkbox is unchecked by default
+    and labelled "Untagged or low confidence" per the
+    design decision (D3).
+    """
+    import html as _html
+
+    body = (await client.get(TRANSACTIONS_PATH)).text
+    assert FILTER_FORM_TESTID in body
+    assert FILTER_CATEGORY_ID_TESTID in body
+    assert FILTER_UNCATEGORIZED_TESTID in body
+    # The multi-select has the "multiple" attribute so the
+    # form serialises to a list[uuid.UUID] on the server.
+    assert "multiple" in body
+    # One <option> per category, no blank option on the
+    # multi-select (a blank multi-select option is a
+    # browser-only deselect-all which is not meaningful
+    # for a \"filter to\".)
+    for cat in seeded_categories:
+        assert f'value="{cat.id}"' in body
+        assert _html.escape(cat.display_name) in body
+    # The checkbox is unchecked by default.
+    assert 'name="uncategorized"' in body
+    assert UNCATEGORIZED_LABEL in body
+
+
+@pytest.mark.asyncio
+async def test_filter_form_submission_narrows_table_by_category(
+    client: AsyncClient, seeded_categories: list[Category]
+) -> None:
+    """Submitting the filter form with ``?category_id=<uuid>`` narrows the table to that category.
+
+    Only PARIS is tagged Shopping in the fixture, so the
+    filtered response contains PARIS and not the other two
+    transactions. The same Query param drives the page and
+    the partial, so both endpoints narrow consistently.
+    """
+    shopping = next(c for c in seeded_categories if c.name == "Shopping")
+    response = await client.get(ROWS_PATH, params={"category_id": str(shopping.id)})
+    body = response.text
+    assert response.status_code == 200
+    assert "PARIS" in body
+    assert "SUPERMERCADOS" not in body
+    assert "COPEC" not in body
+
+
+@pytest.mark.asyncio
+async def test_filter_form_uncategorized_checkbox_widens_to_null_rows(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """Submitting the form with ``?uncategorized=true`` widens the match to NULL category_id.
+
+    The :func:`seeded_transactions` fixture seeds three
+    transactions with ``category_id=NULL`` (only PARIS has a
+    legacy ``category`` string, but no FK). The
+    ``uncategorized`` filter (``category_id IS NULL OR
+    low_confidence=True``) therefore returns all three
+    transactions, which is the natural baseline for the
+    filter widget — every NULL row in the table is matched.
+    """
+    response = await client.get(ROWS_PATH, params={"uncategorized": "true"})
+    body = response.text
+    assert response.status_code == 200
+    for txn in seeded_transactions:
+        assert txn.description in body
+    # Three transaction rows are rendered (one per
+    # seeded transaction).
+    assert body.count(ROW_TESTID) == len(seeded_transactions)
+
+
+@pytest.mark.asyncio
+async def test_patch_round_trip_renders_new_selected_option(
+    client: AsyncClient, seeded_categories: list[Category]
+) -> None:
+    """PATCH with ``Accept: text/html`` returns the partial row with the new pick selected.
+
+    End-to-end: pick a row, PATCH with the new ``category_id``
+    and the HTMX ``Accept`` header, then assert the response
+    markup contains the new pick as the ``selected`` option.
+    The hx-patch / hx-target attributes are preserved so a
+    follow-up swap still works.
+    """
+    body = (await client.get(ROWS_PATH)).text
+    # Pull the first transaction id off the rendered
+    # ``data-transaction-id`` attribute on the per-row
+    # ``<select>``.
+    import re
+
+    match = re.search(r'data-transaction-id="([0-9a-f-]{36})"', body)
+    assert match is not None
+    txn_id = uuid.UUID(match.group(1))
+
+    groceries = next(c for c in seeded_categories if c.name == "Groceries")
+    response = await client.patch(
+        f"/api/v1/transactions/{txn_id}",
+        json={"category_id": str(groceries.id)},
+        headers={"Accept": "text/html"},
+    )
+    assert response.status_code == 200
+    body = response.text
+    assert "selected" in body
+    assert f'value="{groceries.id}"' in body

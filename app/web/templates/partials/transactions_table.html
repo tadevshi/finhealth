@@ -56,7 +56,16 @@
                swap after a PATCH shows the new pick. hx-patch
                unchanged: the swap target is the enclosing <tr>,
                so the server is the source of truth and we do
-               not have to mutate DOM state on the client.         #}
+               not have to mutate DOM state on the client.
+
+               When the row is in the legacy "free-form
+               category" path (category_id is NULL but
+               ``low_confidence=True``), the legacy string is
+               rendered next to the picker so the user can see
+               the row's current tag at a glance — the
+               ``<select>`` alone would just show the blank
+               option and the legacy text would be invisible.
+                                                                              #}
             <select name="category_id"
                     data-testid="category-select"
                     data-transaction-id="{{ txn.id }}"
@@ -68,7 +77,13 @@
                     hx-trigger="change"
                     hx-target="closest tr"
                     hx-swap="outerHTML">
-                <option value="" {% if txn.category_id is none %}selected{% endif %}>—</option>
+                <option value="" {% if txn.category_id is none %}selected{% endif %}>
+                    {%- if txn.category_id is none and txn.category and txn.low_confidence -%}
+                        {{ txn.category }}
+                    {%- else -%}
+                        —
+                    {%- endif -%}
+                </option>
                 {% for cat in categories %}
                 <option value="{{ cat.id }}"
                         {% if txn.category_id is not none and txn.category_id == cat.id %}selected{% endif %}>
