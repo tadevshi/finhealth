@@ -122,9 +122,15 @@ async def _query_transactions(
     # * neither        -> no WHERE clause
     from sqlalchemy import or_  # local import keeps the helper
     # import cluster small for the common no-filter case.
+    from sqlalchemy.sql.elements import ColumnElement
 
     if category_id or uncategorized:
-        clauses = []
+        # ``ColumnElement`` is the common supertype so the
+        # ``.in_(...)`` and ``.is_(...)`` calls (which return
+        # different SQL element types) compose into one
+        # list. ``BinaryExpression`` in the type stub is too
+        # narrow for the union.
+        clauses: list[ColumnElement[bool]] = []
         if category_id:
             clauses.append(Transaction.category_id.in_(category_id))
         if uncategorized:

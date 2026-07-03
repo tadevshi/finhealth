@@ -259,7 +259,14 @@ async def list_transactions(
     # re-AND the closed-set UUIDs). Each branch is a single
     # ``where`` call so the SQL stays one statement.
     if category_id or uncategorized:
-        clauses = []
+        # ``ColumnElement`` is the common supertype so the
+        # ``.in_(...)`` and ``.is_(...)`` calls (which return
+        # different SQL element types) compose into one
+        # list. ``BinaryExpression`` in the type stub is too
+        # narrow for the union.
+        from sqlalchemy.sql.elements import ColumnElement
+
+        clauses: list[ColumnElement[bool]] = []
         if category_id:
             clauses.append(Transaction.category_id.in_(category_id))
         if uncategorized:
