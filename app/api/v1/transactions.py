@@ -19,9 +19,12 @@ import logging
 import uuid
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +36,21 @@ from app.schemas.domain import TransactionResponse
 logger = logging.getLogger(__name__)
 
 router: APIRouter = APIRouter(prefix="/transactions", tags=["transactions"])
+
+
+# ---------------------------------------------------------------------------
+# Shared template renderer (for the PATCH HTML branch)
+# ---------------------------------------------------------------------------
+
+
+#: Templates directory resolved relative to this file so the
+#: router works regardless of the working directory the app is
+#: launched from. The same pattern is used by ``app.web.router``.
+#: The PATCH endpoint reuses the same partial template the web
+#: router renders for ``GET /transactions/rows`` so the markup
+#: stays single-sourced.
+_TEMPLATES_DIR: Path = Path(__file__).parent.parent.parent / "web" / "templates"
+_templates: Jinja2Templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +300,9 @@ async def list_transactions(
 async def update_transaction(
     transaction_id: uuid.UUID,
     payload: TransactionCategoryUpdate,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> Transaction:
+) -> Transaction | HTMLResponse:
     """Update a single transaction's category.
 
     Phase 2 — write-through semantics
@@ -311,6 +330,33 @@ async def update_transaction(
     endpoint would let a typo silently rewrite history, so the
     body schema is closed (extra fields are rejected with 422
     by the Pydantic layer).
+
+    Phase 2 PR #3 — Accept header negotiation
+    -----------------------------------------
+
+    The endpoint returns one of two shapes depending on the
+    ``Accept`` header:
+
+    * ``text/html`` — returns an :class:`HTMLResponse` with the
+      partial ``<tr>`` row (the same template the web router
+      uses for ``GET /transactions/rows``). This is the HTMX
+      swap path: the browser-side ``hx-patch`` triggers
+      ``outerHTML`` and the server is the single source of
+      truth for the new ``<select>`` state, so we do not have
+      to mutate DOM state on the client.
+    * everything else (the default; the JSON contract) —
+      returns a :class:`TransactionResponse` as before.
+
+    The ``response_model=TransactionResponse`` on the route
+    decorator is still correct: FastAPI uses it to validate
+    the *non-HTML* return value. The HTML branch returns
+    ``HTMLResponse`` directly, which is a ``Response``
+    subclass and is short-circuited by FastAPI without
+    re-serialisation.
+
+    Both branches execute the same write-through — the
+    Accept header only changes the response shape, not the
+    database mutation.
     """
     if payload.category_id is None and payload.category is None:
         raise HTTPException(
@@ -359,6 +405,28 @@ async def update_transaction(
 
     await session.commit()
     await session.refresh(transaction)
+
+    # Accept header dispatch (Phase 2 PR #3). The HTML branch
+    # renders the partial template with the just-mutated row
+    # plus the full category list (so the new <select> shows
+    # the new "selected" option). The JSON branch is the
+    # unchanged TransactionResponse contract.
+    accept = request.headers.get("accept", "").lower()
+    if "text/html" in accept:
+        categories_result = await session.execute(
+            select(Category).order_by(Category.sort_order.asc())
+        )
+        categories = list(categories_result.scalars().all())
+        return _templates.TemplateResponse(
+            request=request,
+            name="partials/transactions_table.html",
+            context={
+                "transactions": [transaction],
+                "categories": categories,
+                "error": None,
+            },
+        )
+
     return transaction
 
 
