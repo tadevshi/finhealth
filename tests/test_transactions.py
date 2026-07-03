@@ -36,7 +36,6 @@ from app.main import create_app
 from app.models import Bank, Category, CreditCard, Statement, Transaction
 from app.models.base import Base
 
-
 # ---------------------------------------------------------------------------
 # Fixtures (local — small subset of the ones in test_categories.py)
 # ---------------------------------------------------------------------------
@@ -199,7 +198,7 @@ async def _seed_diverse_transactions(engine: AsyncEngine) -> dict[str, uuid.UUID
         }
         session.add_all(rows.values())
         await session.commit()
-        for label, row in rows.items():
+        for _label, row in rows.items():
             await session.refresh(row)
         return {label: row.id for label, row in rows.items()}
 

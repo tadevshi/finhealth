@@ -121,6 +121,7 @@ async def _query_transactions(
     # * only untagged  -> ``(category_id IS NULL OR low_confidence=True)``
     # * neither        -> no WHERE clause
     from sqlalchemy import or_  # local import keeps the helper
+
     # import cluster small for the common no-filter case.
     from sqlalchemy.sql.elements import ColumnElement
 
