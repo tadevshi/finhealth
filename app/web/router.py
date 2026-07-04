@@ -46,7 +46,7 @@ web_router: APIRouter = APIRouter(tags=["web"])
 
 
 async def _query_transactions(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: AsyncSession,
     *,
     statement_id: uuid.UUID | None,
     date_from: date_typ | None,
@@ -74,6 +74,13 @@ async def _query_transactions(
         transactions = await _query_transactions(
             session, statement_id=..., date_from=..., ...
         )
+
+    The session is a plain :class:`AsyncSession` (not a FastAPI
+    ``Depends``) because the helper is called directly by the
+    route functions, not by FastAPI's dependency injector. The
+    route-level ``Depends(get_session)`` provides the session to
+    the caller; the helper just receives whatever the caller
+    hands it.
 
     Parameters mirror the route-level Query params one-to-one.
     ``category_id`` and ``uncategorized`` were added in
