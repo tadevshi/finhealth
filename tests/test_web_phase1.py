@@ -751,6 +751,141 @@ async def test_filter_form_uncategorized_checkbox_widens_to_null_rows(
 
 
 @pytest.mark.asyncio
+async def test_filter_form_submission_with_multiple_category_ids_narrows_table(
+    client: AsyncClient,
+    test_settings: Settings,
+    seeded_banks: list[Bank],
+    seeded_categories: list[Category],
+) -> None:
+    """Submitting the filter form with **two** ``category_id`` values narrows the table to the union.
+
+    The multi-select filter (``<select multiple>``) serialises
+    as ``?category_id=<uuid>&category_id=<uuid>`` on the wire.
+    The web flow (``/transactions/rows``) parses this into a
+    repeatable Query param the same way the JSON API does,
+    but the wiring is exercised here at the HTTP layer rather
+    than the FastAPI Query layer.
+
+    Seeds three new transactions, each tagged with a different
+    category (Groceries, Dining Out, Transportation), then
+    filters by Groceries + Dining Out. Only the two matching
+    transactions render; the Transportation one is excluded.
+    """
+    # Look up the three categories the test will use. Sort
+    # by name just so the test is stable across seed order
+    # changes.
+    groceries = next(c for c in seeded_categories if c.name == "Groceries")
+    dining = next(c for c in seeded_categories if c.name == "Dining Out")
+    transportation = next(c for c in seeded_categories if c.name == "Transportation")
+
+    # Seed the three new transactions against the same
+    # database the ``client`` fixture is wired to (they share
+    # ``test_settings``).
+    engine = create_engine(test_settings)
+    try:
+        from app.models.base import Base
+
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            now = datetime.now(UTC)
+            bank = seeded_banks[0]
+            card = CreditCard(
+                bank_id=bank.id,
+                card_number_masked="XXXX XXXX XXXX 7777",
+                cardholder="MULTI USER",
+                currency="CLP",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(card)
+            await session.flush()
+
+            statement = Statement(
+                credit_card_id=card.id,
+                period_start=date(2026, 5, 1),
+                period_end=date(2026, 5, 31),
+                statement_date=date(2026, 5, 22),
+                file_path="/tmp/multi.pdf",
+                file_hash="b" * 64,
+                status=StatementStatus.COMPLETED,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(statement)
+            await session.flush()
+
+            txns = [
+                Transaction(
+                    statement_id=statement.id,
+                    date=date(2026, 5, 5),
+                    description="GROCERIES-TX",
+                    amount=Decimal("12000"),
+                    currency="CLP",
+                    category="Groceries",
+                    category_id=groceries.id,
+                    low_confidence=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Transaction(
+                    statement_id=statement.id,
+                    date=date(2026, 5, 10),
+                    description="DINING-TX",
+                    amount=Decimal("8500"),
+                    currency="CLP",
+                    category="Dining Out",
+                    category_id=dining.id,
+                    low_confidence=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Transaction(
+                    statement_id=statement.id,
+                    date=date(2026, 5, 15),
+                    description="TRANSPORT-TX",
+                    amount=Decimal("4500"),
+                    currency="CLP",
+                    category="Transportation",
+                    category_id=transportation.id,
+                    low_confidence=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+            session.add_all(txns)
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+    # Submit the filter form with the two-category union.
+    # httpx serialises a list[Query] param as repeated keys
+    # (``category_id=<uuid>&category_id=<uuid>``), which is
+    # exactly what an HTML ``<select multiple>`` form posts
+    # natively.
+    response = await client.get(
+        ROWS_PATH,
+        params=[
+            ("category_id", str(groceries.id)),
+            ("category_id", str(dining.id)),
+        ],
+    )
+    assert response.status_code == 200
+    body = response.text
+    # The two matching rows are present.
+    assert "GROCERIES-TX" in body
+    assert "DINING-TX" in body
+    # The non-matching row is filtered out.
+    assert "TRANSPORT-TX" not in body
+    # Exactly two <tr data-testid="transaction-row"> rows
+    # are rendered (one per matching transaction).
+    assert body.count(ROW_TESTID) == 2
+
+
+@pytest.mark.asyncio
 async def test_patch_round_trip_renders_new_selected_option(
     client: AsyncClient, seeded_categories: list[Category]
 ) -> None:
@@ -775,7 +910,7 @@ async def test_patch_round_trip_renders_new_selected_option(
     groceries = next(c for c in seeded_categories if c.name == "Groceries")
     response = await client.patch(
         f"/api/v1/transactions/{txn_id}",
-        json={"category_id": str(groceries.id)},
+        data={"category_id": str(groceries.id)},
         headers={"Accept": "text/html"},
     )
     assert response.status_code == 200
