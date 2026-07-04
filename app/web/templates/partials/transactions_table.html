@@ -77,7 +77,21 @@
                     hx-trigger="change"
                     hx-target="closest tr"
                     hx-swap="outerHTML">
-                <option value="" {% if txn.category_id is none %}selected{% endif %}>
+                {# Defensive: blank option is selected if the row's
+                   category_id is NULL or — pathological case — the FK
+                   points at a Category row that is no longer in the
+                   seeded list (e.g. a deleted category, or a row that
+                   escaped the closed set during a manual SQL edit).
+                   Without this fallback the browser would fall back to
+                   the first option (the blank one anyway, by document
+                   order) silently, which is confusing for the user
+                   because the displayed pick would not match the
+                   row's stored FK. With the explicit `selected`, the
+                   blank option is intentional. The `|list` materialises
+                   the generator so `in` is O(n) but bounded by the
+                   12-row seed.                                            #}
+                <option value=""
+                        {% if txn.category_id is none or txn.category_id not in categories|map(attribute='id')|list %}selected{% endif %}>
                     {%- if txn.category_id is none and txn.category and txn.low_confidence -%}
                         {{ txn.category }}
                     {%- else -%}
