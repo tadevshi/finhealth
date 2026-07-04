@@ -22,10 +22,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +36,38 @@ from app.schemas.domain import TransactionResponse
 logger = logging.getLogger(__name__)
 
 router: APIRouter = APIRouter(prefix="/transactions", tags=["transactions"])
+
+
+# ---------------------------------------------------------------------------
+# Sentinel for the empty-string ``category_id`` form value
+# ---------------------------------------------------------------------------
+
+
+class _ClearCategoryIdSentinel:
+    """Marker returned by the ``category_id`` validator on an empty string.
+
+    HTMX serialises the per-row ``<select>``'s blank "—" option
+    as ``category_id=`` (an empty string). The handler must
+    distinguish three states from the Pydantic model's
+    perspective:
+
+    * ``category_id`` not in the form              -> field absent
+    * ``category_id=""`` in the form               -> user wants to clear
+    * ``category_id="<uuid>"`` in the form         -> user picked a category
+
+    Pydantic collapses the first two into ``None`` after UUID
+    validation, so the handler cannot tell them apart. The
+    validator instead returns this sentinel for the second
+    case; the handler checks for it and clears the FK. Using
+    a class instance (rather than a string literal) keeps the
+    type signature ``uuid.UUID | None`` readable — only the
+    handler has to know about the third "clear" state.
+    """
+
+    __slots__ = ()
+
+
+_CLEAR_CATEGORY_ID: Final = _ClearCategoryIdSentinel()
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +136,7 @@ class TransactionCategoryUpdate(BaseModel):
     string is ignored, and the deprecation log does not fire).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     category: str | None = Field(
         default=None,
@@ -116,14 +148,35 @@ class TransactionCategoryUpdate(BaseModel):
             "low_confidence=True and a deprecation log is emitted."
         ),
     )
-    category_id: uuid.UUID | None = Field(
+    category_id: uuid.UUID | None | _ClearCategoryIdSentinel = Field(
         default=None,
         description=(
             "UUID of a seeded Category row. When supplied, the FK and the "
             "denormalized label are written in a single transaction and the "
-            "row is marked low_confidence=False."
+            "row is marked low_confidence=False. The empty string "
+            "(``category_id=``) is the per-row ``<select>``'s blank '—' "
+            "option and clears the FK without a 422."
         ),
     )
+
+    @field_validator("category_id", mode="before")
+    @classmethod
+    def _coerce_empty_category_id(cls, value: object) -> object:
+        """Map the empty-string form value to a clear-sentinel.
+
+        The per-row ``<select>``'s blank "—" option
+        serialises as ``category_id=`` (an empty string)
+        when the user picks "no category". Pydantic would
+        otherwise reject ``""`` as an invalid UUID with
+        422; the handler needs a distinct "clear" state
+        from "field absent" (which the 422 check guards).
+        The sentinel is the bridge between the form's
+        empty string and the handler's "clear the FK"
+        branch.
+        """
+        if value == "":
+            return _CLEAR_CATEGORY_ID
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +359,7 @@ async def list_transactions(
 )
 async def update_transaction(
     transaction_id: uuid.UUID,
-    payload: TransactionCategoryUpdate,
+    payload: Annotated[TransactionCategoryUpdate, Form()],
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> Transaction | HTMLResponse:
@@ -338,8 +391,17 @@ async def update_transaction(
     body schema is closed (extra fields are rejected with 422
     by the Pydantic layer).
 
-    Phase 2 PR #3 — Accept header negotiation
-    -----------------------------------------
+    Phase 2 PR #3 — Accept header negotiation & form-encoded body
+    -------------------------------------------------------------
+
+    The endpoint reads the body as ``application/x-www-form-urlencoded``
+    (``Form()``) rather than JSON, because the only first-party
+    caller is the per-row ``<select>``'s ``hx-patch`` and HTMX
+    serialises ``hx-patch`` bodies as form fields by default.
+    The form fields match the Pydantic model field names
+    (``category_id`` and ``category``), so the Pydantic
+    ``extra="forbid"`` rule still applies: an unknown form
+    field is rejected with 422.
 
     The endpoint returns one of two shapes depending on the
     ``Accept`` header:
@@ -379,7 +441,19 @@ async def update_transaction(
             detail=f"Transaction {transaction_id} not found",
         )
 
-    if payload.category_id is not None:
+    if isinstance(payload.category_id, _ClearCategoryIdSentinel):
+        # Empty-string form value — the per-row ``<select>``'s
+        # blank "—" option. The user explicitly untagged the
+        # row, so we clear the FK, drop the denormalized
+        # string, and mark the row ``low_confidence=True``
+        # (no category to be confident about). This is the
+        # same end-state as the ingestion path for an
+        # LLM-emitted ``category=None`` per PR #2 spec
+        # scenario 6.
+        transaction.category_id = None
+        transaction.category = None
+        transaction.low_confidence = True
+    elif payload.category_id is not None:
         # Preferred path — closed-set tag with the canonical
         # name. Look up the Category row (404 if missing),
         # then write the FK and the denormalized string in

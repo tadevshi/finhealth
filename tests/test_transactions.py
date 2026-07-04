@@ -370,7 +370,7 @@ async def test_patch_with_accept_text_html_returns_html_partial(
 
     response = await seeded_client.patch(
         f"/api/v1/transactions/{tx_id}",
-        json={"category_id": str(groceries_id)},
+        data={"category_id": str(groceries_id)},
         headers={"Accept": "text/html"},
     )
     assert response.status_code == 200
@@ -411,7 +411,7 @@ async def test_patch_with_accept_application_json_returns_json(
     # No Accept header at all — the default path.
     response = await seeded_client.patch(
         f"/api/v1/transactions/{tx_id}",
-        json={"category_id": str(groceries_id)},
+        data={"category_id": str(groceries_id)},
     )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
@@ -419,6 +419,46 @@ async def test_patch_with_accept_application_json_returns_json(
     assert body["category_id"] == str(groceries_id)
     assert body["category"] == "Groceries"
     assert body["low_confidence"] is False
+
+
+@pytest.mark.asyncio
+async def test_patch_with_empty_string_category_id_clears_fk(
+    seeded_engine: AsyncEngine, seeded_client: AsyncClient
+) -> None:
+    """An empty ``category_id`` form field clears the FK (legacy string fallback per PR #2 spec scenario 6).
+
+    HTMX sends the blank "—" option as ``category_id=`` (an
+    empty string) when the user picks "no category" in the
+    per-row ``<select>``. The form-encoded handler must
+    coerce that empty string to a clear-sentinel so the
+    legacy "category_id IS NULL" path runs and the row is
+    left untagged. Without the coercion, the Pydantic layer
+    would reject the empty string with 422 (UUIDs are
+    non-empty by construction).
+    """
+    # Seed a transaction that already has a category_id so
+    # the test exercises the clear path.
+    factory = async_sessionmaker(seeded_engine, expire_on_commit=False)
+    async with factory() as session:
+        result = await session.execute(select(Category).order_by(Category.sort_order.asc()))
+        groceries_id = next(row.id for row in result.scalars().all() if row.name == "Groceries")
+    tx_id = await _seed_single_tx_for_patch(seeded_engine)
+    # First, tag the transaction with Groceries so the
+    # clear path is observable.
+    response = await seeded_client.patch(
+        f"/api/v1/transactions/{tx_id}",
+        data={"category_id": str(groceries_id)},
+    )
+    assert response.status_code == 200
+
+    # Now clear it with the empty-string sentinel.
+    response = await seeded_client.patch(
+        f"/api/v1/transactions/{tx_id}",
+        data={"category_id": ""},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["category_id"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -438,4 +478,5 @@ __all__ = [
     "test_list_transactions_uncategorized_filter",
     "test_patch_with_accept_application_json_returns_json",
     "test_patch_with_accept_text_html_returns_html_partial",
+    "test_patch_with_empty_string_category_id_clears_fk",
 ]

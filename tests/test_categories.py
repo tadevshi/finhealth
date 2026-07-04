@@ -423,7 +423,7 @@ async def test_patch_transaction_with_category_id_writes_fk_and_label(
 
     response = await seeded_client.patch(
         f"/api/v1/transactions/{tx_id}",
-        json={"category_id": str(groceries_id)},
+        data={"category_id": str(groceries_id)},
     )
     assert response.status_code == 200
     body = response.json()
@@ -448,7 +448,7 @@ async def test_patch_transaction_with_legacy_category_emits_deprecation_log(
     with caplog.at_level(logging.WARNING, logger="app.api.v1.transactions"):
         response = await seeded_client.patch(
             f"/api/v1/transactions/{tx_id}",
-            json={"category": "Custom Label"},
+            data={"category": "Custom Label"},
         )
 
     assert response.status_code == 200
@@ -484,7 +484,7 @@ async def test_patch_transaction_with_category_id_does_not_emit_deprecation_log(
     with caplog.at_level(logging.WARNING, logger="app.api.v1.transactions"):
         response = await seeded_client.patch(
             f"/api/v1/transactions/{tx_id}",
-            json={"category_id": str(groceries_id)},
+            data={"category_id": str(groceries_id)},
         )
 
     assert response.status_code == 200
@@ -500,7 +500,7 @@ async def test_patch_transaction_404_on_unknown_id(seeded_client: AsyncClient) -
     unknown = uuid.uuid4()
     response = await seeded_client.patch(
         f"/api/v1/transactions/{unknown}",
-        json={"category": "X"},
+        data={"category": "X"},
     )
     assert response.status_code == 404
 
@@ -517,7 +517,7 @@ async def test_patch_transaction_404_on_unknown_category_id(
     tx_id = await _seed_single_transaction(seeded_engine)
     response = await seeded_client.patch(
         f"/api/v1/transactions/{tx_id}",
-        json={"category_id": str(uuid.uuid4())},
+        data={"category_id": str(uuid.uuid4())},
     )
     assert response.status_code == 404
 
@@ -530,7 +530,7 @@ async def test_patch_transaction_422_on_empty_body(
     tx_id = await _seed_single_transaction(seeded_engine)
     response = await seeded_client.patch(
         f"/api/v1/transactions/{tx_id}",
-        json={},
+        data={},
     )
     assert response.status_code == 422
 
