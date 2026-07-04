@@ -28,6 +28,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.db.engine import create_engine
@@ -465,9 +466,6 @@ async def test_patch_with_empty_string_category_id_clears_fk(
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-# Local re-export so the imports above read top-to-bottom.
-from sqlalchemy import select  # noqa: E402
 
 __all__ = [
     "seeded_client",
