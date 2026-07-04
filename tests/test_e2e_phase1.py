@@ -522,7 +522,7 @@ async def test_patch_category_persists(
             txn_id = statement["transactions"][0]["id"]
             patch_resp = await client.patch(
                 f"/api/v1/transactions/{txn_id}",
-                json={"category": "Groceries"},
+                data={"category": "Groceries"},
             )
     finally:
         app.dependency_overrides.pop(get_ingestion_service, None)

@@ -2156,7 +2156,7 @@ class TestUpdateTransactionEndpoint:
                 # PATCH the category
                 patch = await client.patch(
                     f"/api/v1/transactions/{txn_id}",
-                    json={"category": "Dining Out"},
+                    data={"category": "Dining Out"},
                 )
         finally:
             app.dependency_overrides.pop(get_ingestion_service, None)
@@ -2196,7 +2196,7 @@ class TestUpdateTransactionEndpoint:
                 missing = uuid.uuid4()
                 response = await client.patch(
                     f"/api/v1/transactions/{missing}",
-                    json={"category": "Anything"},
+                    data={"category": "Anything"},
                 )
         finally:
             app.dependency_overrides.pop(get_session, None)
@@ -2220,7 +2220,7 @@ class TestUpdateTransactionEndpoint:
                 # Some random UUID — the body validation fails first
                 response = await client.patch(
                     f"/api/v1/transactions/{uuid.uuid4()}",
-                    json={"category": ""},
+                    data={"category": ""},
                 )
         finally:
             app.dependency_overrides.pop(get_session, None)
@@ -2242,7 +2242,7 @@ class TestUpdateTransactionEndpoint:
             async with AsyncClient(transport=transport, base_url="http://testserver") as client:
                 response = await client.patch(
                     f"/api/v1/transactions/{uuid.uuid4()}",
-                    json={"category": "Dining Out", "amount": "0"},
+                    data={"category": "Dining Out", "amount": "0"},
                 )
         finally:
             app.dependency_overrides.pop(get_session, None)

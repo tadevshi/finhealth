@@ -147,6 +147,60 @@
             </select>
         </div>
 
+        {# --- Category filter (Phase 2 PR #3) --------------------------- #}
+        {# Multi-select for closed-set category_id. The web router and
+           the JSON API both accept a repeatable category_id= query
+           param, so a <select multiple> serialises as the right
+           shape. The "selected" attribute is set per option so a
+           refresh of the form remembers the active selection.       #}
+        <div>
+            <label for="category_id"
+                   class="block text-xs font-medium text-gray-700 dark:text-gray-200">
+                Categories
+            </label>
+            <select id="category_id"
+                    name="category_id"
+                    multiple
+                    size="4"
+                    data-testid="filter-category-id"
+                    class="mt-1 block w-full pl-2 pr-2 py-1 text-sm border border-gray-300
+                           dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100
+                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
+                           rounded-md">
+                {% for cat in categories %}
+                <option value="{{ cat.id }}"
+                        {% if cat.id in filters.category_id %}selected{% endif %}>
+                    {{ cat.display_name }}
+                </option>
+                {% endfor %}
+            </select>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                Hold Ctrl/Cmd to select multiple.
+            </p>
+        </div>
+
+        {# --- Untagged sentinel (Phase 2 PR #3) ----------------------- #}
+        {# A separate checkbox — labelled "Untagged or low confidence"
+           to disambiguate from the seeded "Uncategorized" category
+           row at sort_order=11. The sentinel matches category_id IS
+           NULL OR low_confidence=True (legacy free-form "category:
+           str" rows).                                                #}
+        <div class="flex items-center pt-5">
+            <input id="uncategorized"
+                   type="checkbox"
+                   name="uncategorized"
+                   value="true"
+                   {% if filters.uncategorized %}checked{% endif %}
+                   data-testid="filter-uncategorized"
+                   class="h-4 w-4 rounded border-gray-300 text-indigo-600
+                          focus:ring-indigo-500 dark:border-gray-600
+                          dark:bg-gray-700">
+            <label for="uncategorized"
+                   class="ml-2 block text-xs font-medium text-gray-700 dark:text-gray-200">
+                Untagged or low confidence
+            </label>
+        </div>
+
         <div class="flex items-end gap-2 sm:col-span-2 lg:col-span-1">
             <button type="submit"
                     data-testid="filter-submit"

@@ -19,11 +19,14 @@ import logging
 import uuid
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
@@ -33,6 +36,53 @@ from app.schemas.domain import TransactionResponse
 logger = logging.getLogger(__name__)
 
 router: APIRouter = APIRouter(prefix="/transactions", tags=["transactions"])
+
+
+# ---------------------------------------------------------------------------
+# Sentinel for the empty-string ``category_id`` form value
+# ---------------------------------------------------------------------------
+
+
+class _ClearCategoryIdSentinel:
+    """Marker returned by the ``category_id`` validator on an empty string.
+
+    HTMX serialises the per-row ``<select>``'s blank "—" option
+    as ``category_id=`` (an empty string). The handler must
+    distinguish three states from the Pydantic model's
+    perspective:
+
+    * ``category_id`` not in the form              -> field absent
+    * ``category_id=""`` in the form               -> user wants to clear
+    * ``category_id="<uuid>"`` in the form         -> user picked a category
+
+    Pydantic collapses the first two into ``None`` after UUID
+    validation, so the handler cannot tell them apart. The
+    validator instead returns this sentinel for the second
+    case; the handler checks for it and clears the FK. Using
+    a class instance (rather than a string literal) keeps the
+    type signature ``uuid.UUID | None`` readable — only the
+    handler has to know about the third "clear" state.
+    """
+
+    __slots__ = ()
+
+
+_CLEAR_CATEGORY_ID: Final = _ClearCategoryIdSentinel()
+
+
+# ---------------------------------------------------------------------------
+# Shared template renderer (for the PATCH HTML branch)
+# ---------------------------------------------------------------------------
+
+
+#: Templates directory resolved relative to this file so the
+#: router works regardless of the working directory the app is
+#: launched from. The same pattern is used by ``app.web.router``.
+#: The PATCH endpoint reuses the same partial template the web
+#: router renders for ``GET /transactions/rows`` so the markup
+#: stays single-sourced.
+_TEMPLATES_DIR: Path = Path(__file__).parent.parent.parent / "web" / "templates"
+_templates: Jinja2Templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +136,7 @@ class TransactionCategoryUpdate(BaseModel):
     string is ignored, and the deprecation log does not fire).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     category: str | None = Field(
         default=None,
@@ -98,14 +148,35 @@ class TransactionCategoryUpdate(BaseModel):
             "low_confidence=True and a deprecation log is emitted."
         ),
     )
-    category_id: uuid.UUID | None = Field(
+    category_id: uuid.UUID | None | _ClearCategoryIdSentinel = Field(
         default=None,
         description=(
             "UUID of a seeded Category row. When supplied, the FK and the "
             "denormalized label are written in a single transaction and the "
-            "row is marked low_confidence=False."
+            "row is marked low_confidence=False. The empty string "
+            "(``category_id=``) is the per-row ``<select>``'s blank '—' "
+            "option and clears the FK without a 422."
         ),
     )
+
+    @field_validator("category_id", mode="before")
+    @classmethod
+    def _coerce_empty_category_id(cls, value: object) -> object:
+        """Map the empty-string form value to a clear-sentinel.
+
+        The per-row ``<select>``'s blank "—" option
+        serialises as ``category_id=`` (an empty string)
+        when the user picks "no category". Pydantic would
+        otherwise reject ``""`` as an invalid UUID with
+        422; the handler needs a distinct "clear" state
+        from "field absent" (which the 422 check guards).
+        The sentinel is the bridge between the form's
+        empty string and the handler's "clear the FK"
+        branch.
+        """
+        if value == "":
+            return _CLEAR_CATEGORY_ID
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +228,26 @@ async def list_transactions(
             description="Partial, case-insensitive match against the description.",
         ),
     ] = None,
+    category_id: Annotated[
+        list[uuid.UUID] | None,
+        Query(
+            description=(
+                "Repeatable filter — limit to transactions whose category_id "
+                "matches any of the supplied UUIDs. Combine with `uncategorized=true` "
+                "to also include untagged rows (NULL or low_confidence=True)."
+            ),
+        ),
+    ] = None,
+    uncategorized: Annotated[
+        bool,
+        Query(
+            description=(
+                "When true, also include transactions whose category_id is NULL or "
+                "whose low_confidence flag is true (i.e. tagged with a free-form "
+                "string by the legacy `category: str` field)."
+            ),
+        ),
+    ] = False,
     limit: Annotated[
         int,
         Query(
@@ -207,6 +298,39 @@ async def list_transactions(
         needle = f"%{description.lower()}%"
         query = query.where(func.lower(Transaction.description).like(needle))
 
+    # Category filters — the closed-set ``category_id`` UUID and
+    # the "untagged" sentinel compose as a parenthesized ``OR``:
+    #
+    # * both supplied  -> ``category_id IN (...) OR (IS NULL OR low_confidence=True)``
+    # * only UUIDs     -> ``category_id IN (...)``
+    # * only untagged  -> ``(category_id IS NULL OR low_confidence=True)``
+    # * neither        -> no WHERE clause
+    #
+    # Wrapping each branch in a parenthesized ``or_`` keeps the
+    # boolean precedence correct when combined with the AND
+    # filters above (otherwise the second branch would silently
+    # re-AND the closed-set UUIDs). Each branch is a single
+    # ``where`` call so the SQL stays one statement.
+    if category_id or uncategorized:
+        # ``ColumnElement`` is the common supertype so the
+        # ``.in_(...)`` and ``.is_(...)`` calls (which return
+        # different SQL element types) compose into one
+        # list. ``BinaryExpression`` in the type stub is too
+        # narrow for the union.
+        from sqlalchemy.sql.elements import ColumnElement
+
+        clauses: list[ColumnElement[bool]] = []
+        if category_id:
+            clauses.append(Transaction.category_id.in_(category_id))
+        if uncategorized:
+            clauses.append(
+                or_(
+                    Transaction.category_id.is_(None),
+                    Transaction.low_confidence.is_(True),
+                )
+            )
+        query = query.where(or_(*clauses))
+
     # Stable order: oldest transaction first, with a tiebreaker
     # on the primary key so two rows with the same date do not
     # shift between pages.
@@ -235,9 +359,10 @@ async def list_transactions(
 )
 async def update_transaction(
     transaction_id: uuid.UUID,
-    payload: TransactionCategoryUpdate,
+    payload: Annotated[TransactionCategoryUpdate, Form()],
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> Transaction:
+) -> Transaction | HTMLResponse:
     """Update a single transaction's category.
 
     Phase 2 — write-through semantics
@@ -265,6 +390,42 @@ async def update_transaction(
     endpoint would let a typo silently rewrite history, so the
     body schema is closed (extra fields are rejected with 422
     by the Pydantic layer).
+
+    Phase 2 PR #3 — Accept header negotiation & form-encoded body
+    -------------------------------------------------------------
+
+    The endpoint reads the body as ``application/x-www-form-urlencoded``
+    (``Form()``) rather than JSON, because the only first-party
+    caller is the per-row ``<select>``'s ``hx-patch`` and HTMX
+    serialises ``hx-patch`` bodies as form fields by default.
+    The form fields match the Pydantic model field names
+    (``category_id`` and ``category``), so the Pydantic
+    ``extra="forbid"`` rule still applies: an unknown form
+    field is rejected with 422.
+
+    The endpoint returns one of two shapes depending on the
+    ``Accept`` header:
+
+    * ``text/html`` — returns an :class:`HTMLResponse` with the
+      partial ``<tr>`` row (the same template the web router
+      uses for ``GET /transactions/rows``). This is the HTMX
+      swap path: the browser-side ``hx-patch`` triggers
+      ``outerHTML`` and the server is the single source of
+      truth for the new ``<select>`` state, so we do not have
+      to mutate DOM state on the client.
+    * everything else (the default; the JSON contract) —
+      returns a :class:`TransactionResponse` as before.
+
+    The ``response_model=TransactionResponse`` on the route
+    decorator is still correct: FastAPI uses it to validate
+    the *non-HTML* return value. The HTML branch returns
+    ``HTMLResponse`` directly, which is a ``Response``
+    subclass and is short-circuited by FastAPI without
+    re-serialisation.
+
+    Both branches execute the same write-through — the
+    Accept header only changes the response shape, not the
+    database mutation.
     """
     if payload.category_id is None and payload.category is None:
         raise HTTPException(
@@ -280,7 +441,19 @@ async def update_transaction(
             detail=f"Transaction {transaction_id} not found",
         )
 
-    if payload.category_id is not None:
+    if isinstance(payload.category_id, _ClearCategoryIdSentinel):
+        # Empty-string form value — the per-row ``<select>``'s
+        # blank "—" option. The user explicitly untagged the
+        # row, so we clear the FK, drop the denormalized
+        # string, and mark the row ``low_confidence=True``
+        # (no category to be confident about). This is the
+        # same end-state as the ingestion path for an
+        # LLM-emitted ``category=None`` per PR #2 spec
+        # scenario 6.
+        transaction.category_id = None
+        transaction.category = None
+        transaction.low_confidence = True
+    elif payload.category_id is not None:
         # Preferred path — closed-set tag with the canonical
         # name. Look up the Category row (404 if missing),
         # then write the FK and the denormalized string in
@@ -313,6 +486,45 @@ async def update_transaction(
 
     await session.commit()
     await session.refresh(transaction)
+
+    # Accept header dispatch (Phase 2 PR #3). The HTML branch
+    # renders the partial template with the just-mutated row
+    # plus the full category list (so the new <select> shows
+    # the new "selected" option). The JSON branch is the
+    # unchanged TransactionResponse contract.
+    accept = request.headers.get("accept", "").lower()
+    if "text/html" in accept:
+        categories_result = await session.execute(
+            select(Category).order_by(Category.sort_order.asc())
+        )
+        categories = list(categories_result.scalars().all())
+        # The write-through above already committed, so the
+        # mutation is durable. The render is the only step
+        # that can still fail; if it does (missing context
+        # key, a future template edit, etc.) we return a
+        # generic 500 without leaking the traceback. The
+        # user can refresh the page to see the new state via
+        # the partial endpoint instead.
+        try:
+            return _templates.TemplateResponse(
+                request=request,
+                name="partials/transactions_table.html",
+                context={
+                    "transactions": [transaction],
+                    "categories": categories,
+                    "error": None,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to render PATCH HTML partial for transaction %s",
+                transaction_id,
+            )
+            return HTMLResponse(
+                content="<tr><td colspan='5'>Error rendering row</td></tr>",
+                status_code=500,
+            )
+
     return transaction
 
 
