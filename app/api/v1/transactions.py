@@ -498,15 +498,32 @@ async def update_transaction(
             select(Category).order_by(Category.sort_order.asc())
         )
         categories = list(categories_result.scalars().all())
-        return _templates.TemplateResponse(
-            request=request,
-            name="partials/transactions_table.html",
-            context={
-                "transactions": [transaction],
-                "categories": categories,
-                "error": None,
-            },
-        )
+        # The write-through above already committed, so the
+        # mutation is durable. The render is the only step
+        # that can still fail; if it does (missing context
+        # key, a future template edit, etc.) we return a
+        # generic 500 without leaking the traceback. The
+        # user can refresh the page to see the new state via
+        # the partial endpoint instead.
+        try:
+            return _templates.TemplateResponse(
+                request=request,
+                name="partials/transactions_table.html",
+                context={
+                    "transactions": [transaction],
+                    "categories": categories,
+                    "error": None,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to render PATCH HTML partial for transaction %s",
+                transaction_id,
+            )
+            return HTMLResponse(
+                content="<tr><td colspan='5'>Error rendering row</td></tr>",
+                status_code=500,
+            )
 
     return transaction
 
