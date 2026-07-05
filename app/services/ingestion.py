@@ -59,7 +59,7 @@ from app.core.config import Settings
 from app.models.bank import Bank
 from app.models.category import Category
 from app.models.credit_card import CreditCard
-from app.models.merchant import Merchant, MerchantAlias
+from app.models.merchant import MerchantAlias
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
 from app.services.llm.protocol import LLMProvider

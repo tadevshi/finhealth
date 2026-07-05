@@ -47,7 +47,6 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-import uuid
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import select
@@ -59,6 +58,7 @@ from app.models.merchant import Merchant, MerchantAlias, MerchantAliasSource
 if TYPE_CHECKING:
     from app.models.category import Category
     from app.services.llm.protocol import LLMProvider
+    from app.services.llm.schemas import ExtractionResponse
 
 logger = logging.getLogger(__name__)
 
@@ -310,8 +310,8 @@ class MerchantNormalizer:
         self,
         session: AsyncSession,
         description: str,
-        categories_by_name: dict[str, "Category"],
-    ) -> tuple["Merchant", bool]:
+        categories_by_name: dict[str, Category],
+    ) -> tuple[Merchant, bool]:
         """Resolve ``description`` to a :class:`Merchant` row.
 
         The flow is a two-step lookup against the alias table:
@@ -392,7 +392,7 @@ class MerchantNormalizer:
         # Step 2: miss — auto-create. Look up the default
         # category by *name* from the closed-set dict the
         # ingestion layer already built.
-        default_category: "Category | None" = None
+        default_category: Category | None = None
         category_name = KNOWN_MERCHANT_PATTERNS.get(canonical)
         if category_name is not None:
             default_category = categories_by_name.get(category_name.lower())
@@ -453,8 +453,8 @@ class MerchantNormalizer:
         self,
         session: AsyncSession,
         description: str,
-        llm_provider: "LLMProvider",
-    ) -> tuple["Merchant", bool]:
+        llm_provider: LLMProvider,
+    ) -> tuple[Merchant, bool]:
         """Opt-in LLM helper for ambiguous merchant descriptions.
 
         Called only when ``LLM_MERCHANT_NORMALIZATION_ENABLED``
@@ -499,8 +499,6 @@ class MerchantNormalizer:
         # Local import: avoid pulling the LLM stack at
         # module load time for callers that only need
         # :func:`normalize` or :meth:`resolve_merchant`.
-        from app.services.llm.schemas import ExtractionResponse
-
         canonical = normalize(description)
         if not canonical:
             return None, False  # type: ignore[return-value]
@@ -553,13 +551,27 @@ class MerchantNormalizer:
 
         llm_canonical_normalized = normalize(llm_canonical) or canonical
 
-        merchant = Merchant(
-            name=llm_canonical_normalized,
-            default_category_id=None,
-            is_active=True,
+        # Merchant-table hit: a previous LLM call already
+        # classified *some other* description into this
+        # canonical merchant. Bind the new alias to the
+        # existing merchant instead of trying to insert a
+        # duplicate (the ``UNIQUE(merchants.name)`` would
+        # catch the duplicate, but the explicit check is
+        # cleaner than the race-recovery path).
+        merchant_result = await session.execute(
+            select(Merchant).where(Merchant.name == llm_canonical_normalized)
         )
-        session.add(merchant)
-        await session.flush()
+        merchant = merchant_result.scalar_one_or_none()
+        was_new = False
+        if merchant is None:
+            merchant = Merchant(
+                name=llm_canonical_normalized,
+                default_category_id=None,
+                is_active=True,
+            )
+            session.add(merchant)
+            await session.flush()
+            was_new = True
 
         alias = MerchantAlias(
             merchant_id=merchant.id,
@@ -581,10 +593,10 @@ class MerchantNormalizer:
                 return winner.merchant, False
             raise
 
-        return merchant, True
+        return merchant, was_new
 
 
-def _extract_canonical_from_llm(response: "ExtractionResponse", fallback: str) -> str:
+def _extract_canonical_from_llm(response: ExtractionResponse, fallback: str) -> str:
     """Extract a canonical merchant name from an LLM response.
 
     The LLM is told to emit the bank description in the

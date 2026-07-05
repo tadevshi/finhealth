@@ -69,8 +69,10 @@ class Settings(BaseSettings):
     # transient errors (network blips, 5xx responses, timeouts).
     LLM_PROVIDER: str = Field(
         default="opencode_zen",
-        description=("LLM provider identifier. 'opencode_zen' (default, free models available), "
-                     "'ollama' (self-hosted), 'opencode_go' (Go subscription)."),
+        description=(
+            "LLM provider identifier. 'opencode_zen' (default, free models available), "
+            "'ollama' (self-hosted), 'opencode_go' (Go subscription)."
+        ),
     )
     LLM_API_ENDPOINT: str = Field(
         default="https://opencode.ai/zen/v1",
