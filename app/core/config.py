@@ -119,6 +119,23 @@ class Settings(BaseSettings):
             "(transactions at boundaries will be lost)."
         ),
     )
+    LLM_MERCHANT_NORMALIZATION_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase 2 PR #4 — opt-in LLM helper for merchant "
+            "normalization. When ``True`` and the deterministic "
+            "merchant normalizer misses (no alias hit, no "
+            "``KNOWN_MERCHANT_PATTERNS`` match), the orchestrator "
+            "calls the LLM once per unique normalized text per "
+            "ingestion (first-occurrence-only) to extract a "
+            "canonical merchant name. The default is ``False`` so "
+            "the v1 deployment ships with zero extra LLM cost — "
+            "the helper is wired in but never invoked unless the "
+            "operator explicitly opts in. See product decision #6 "
+            "and architecture pick C in "
+            "``openspec/changes/phase-2-pr4-merchants-and-aliases/``."
+        ),
+    )
 
     # PDF ingestion --------------------------------------------------------------
     # ``PDF_UPLOAD_DIR`` is resolved relative to the project root when

@@ -24,6 +24,7 @@ from app.models.mixins import TimestampMixin, UUIDMixin, UUIDType
 
 if TYPE_CHECKING:
     from app.models.category import Category
+    from app.models.merchant import Merchant
     from app.models.statement import Statement
 
 
@@ -68,6 +69,23 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
         the legacy PATCH, or a row the LLM could not tag at all.
         Always ``False`` for rows tagged with a known
         :class:`Category`.
+        The same Boolean is reused as the unified
+        "I can't confidently tag this row" signal for both the
+        category miss *and* the merchant-miss case (Phase 2
+        PR #4). A newly-auto-created merchant (no
+        :data:`app.services.merchants.KNOWN_MERCHANT_PATTERNS`
+        hit) flips the flag to ``True`` even when the category
+        resolved cleanly.
+    merchant_id:
+        Optional FK to :class:`app.models.merchant.Merchant`.
+        Set by the ingestion layer when the
+        :mod:`app.services.merchants` normalizer resolves the
+        bank description to a canonical merchant (auto-created
+        on miss, looked up on hit). ``NULL`` for rows the
+        normalizer did not bind to any merchant (defensive —
+        every row is supposed to resolve, but the FK is
+        nullable so a transient failure in the normalizer does
+        not block ingestion).
     installment_number, installment_total, installment_value:
         Installment plan data. ``None`` when the charge is a one-off.
         When set, ``1 <= installment_number <= installment_total``.
@@ -97,6 +115,12 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
         index=True,
     )
     low_confidence: Mapped[bool] = mapped_column(default=False, nullable=False)
+    merchant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDType(),
+        ForeignKey("merchants.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     installment_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     installment_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     installment_value: Mapped[Decimal | None] = mapped_column(
@@ -112,5 +136,9 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
     statement: Mapped[Statement] = relationship(back_populates="transactions", lazy="joined")
     category_ref: Mapped[Category | None] = relationship(
         back_populates="transactions",
+        lazy="joined",
+    )
+    merchant_ref: Mapped[Merchant | None] = relationship(
+        back_populates="merchant_transactions",
         lazy="joined",
     )
