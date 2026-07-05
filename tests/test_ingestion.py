@@ -3099,6 +3099,369 @@ class TestBuildTransactions:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 PR #4 — merchant resolution integration
+# ---------------------------------------------------------------------------
+#
+# ``_build_transactions`` is the seam between the LLM
+# extraction and the database. Phase 2 PR #4 extends it
+# with merchant resolution (alias-table hit-or-create +
+# opt-in LLM helper). The four tests below cover the
+# two main paths (known-pattern and unknown-pattern) and
+# both LLM-helper flag positions (off / on).
+
+
+class TestBuildTransactionsMerchantResolution:
+    """``_build_transactions`` stamps ``merchant_id`` and respects the OR semantics of ``low_confidence``.
+
+    The shared fixture seeds the 12 closed-set
+    categories so the ``default_category_id`` lookup
+    for known-pattern merchants resolves to the
+    right :class:`Category`. The PR #4 portion is
+    additive — the existing category resolution
+    tests in :class:`TestBuildTransactions` keep
+    passing because their descriptions were updated
+    to use known-pattern merchants.
+    """
+
+    @pytest.fixture
+    async def session_with_categories(self, engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+        """Yield a session with the 12 categories seeded (local to this class).
+
+        Re-declared locally so the class does not
+        depend on :class:`TestBuildTransactions`'s
+        private fixture. The seeding logic is
+        identical to the one in
+        :class:`TestBuildTransactions`.
+        """
+        from app.models.category import Category
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            seed = (
+                ("Dining Out", "Dining Out", 1),
+                ("Groceries", "Groceries", 2),
+                ("Transportation", "Transportation", 3),
+                ("Shopping", "Shopping", 4),
+                ("Entertainment", "Entertainment", 5),
+                ("Bills", "Bills & Utilities", 6),
+                ("Health", "Health & Medical", 7),
+                ("Travel", "Travel", 8),
+                ("Subscriptions", "Subscriptions", 9),
+                ("Personal Care", "Personal Care", 10),
+                ("Uncategorized", "Uncategorized", 11),
+                ("Other", "Other", 12),
+            )
+            for name, display, order in seed:
+                session.add(
+                    Category(
+                        name=name,
+                        display_name=display,
+                        sort_order=order,
+                    )
+                )
+            await session.commit()
+            yield session
+
+    @pytest.mark.asyncio
+    async def test_build_transactions_known_pattern_stamps_merchant_id(
+        self, session_with_categories: AsyncSession
+    ) -> None:
+        """A ``MCDONALDS SUC 12`` row stamps ``merchant_id`` and stays ``low_confidence=False``.
+
+        The MCDONALDS canonical is in
+        :data:`app.services.merchants.KNOWN_MERCHANT_PATTERNS`,
+        so the auto-created merchant has
+        ``default_category_id`` pointing to the
+        seeded Dining Out row. The PR #4 spec
+        scenario "MCDONALDS pattern gets the
+        'Dining Out' default" is covered here.
+        """
+        from sqlalchemy import select
+
+        from app.models.category import Category
+        from app.models.merchant import Merchant
+        from app.services.ingestion import IngestionService
+
+        result = await session_with_categories.execute(
+            select(Category).where(Category.name == "Dining Out")
+        )
+        dining_out = result.scalar_one()
+
+        from types import SimpleNamespace
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "MCDONALDS SUC 12",
+                    "amount": "$ 4.500",
+                    "currency": "CLP",
+                    "category": "Dining Out",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.95,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        await session_with_categories.commit()
+
+        assert len(transactions) == 1
+        tx = transactions[0]
+        # The MCDONALDS merchant was auto-created and
+        # the new transaction is bound to it.
+        assert tx.merchant_id is not None
+        merchant_result = await session_with_categories.execute(
+            select(Merchant).where(Merchant.id == tx.merchant_id)
+        )
+        merchant = merchant_result.scalar_one()
+        assert merchant.name == "mcdonalds"
+        assert merchant.default_category_id == dining_out.id
+        # Known pattern + category hit -> low_confidence=False.
+        assert tx.low_confidence is False
+
+    @pytest.mark.asyncio
+    async def test_build_transactions_unknown_pattern_creates_merchant_low_confidence(
+        self, session_with_categories: AsyncSession
+    ) -> None:
+        """A ``TIENDA ONLINE XYZ`` row auto-creates a merchant and flips ``low_confidence`` to True.
+
+        The canonical is *not* in
+        :data:`app.services.merchants.KNOWN_MERCHANT_PATTERNS`,
+        so the auto-created merchant has
+        ``default_category_id=NULL`` and the row is
+        stamped ``low_confidence=True`` (per design
+        decision D2's OR semantics). The PR #4 spec
+        scenario "Unknown pattern gets
+        ``low_confidence=True`` and
+        ``default_category_id=NULL``" is covered
+        here.
+        """
+        from types import SimpleNamespace
+
+        from sqlalchemy import select
+
+        from app.models.merchant import Merchant
+        from app.services.ingestion import IngestionService
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "TIENDA ONLINE XYZ",
+                    "amount": "$ 9.990",
+                    "currency": "CLP",
+                    "category": "Shopping",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.95,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        await session_with_categories.commit()
+
+        assert len(transactions) == 1
+        tx = transactions[0]
+        # The unknown merchant was auto-created and
+        # the new transaction is bound to it.
+        assert tx.merchant_id is not None
+        merchant_result = await session_with_categories.execute(
+            select(Merchant).where(Merchant.id == tx.merchant_id)
+        )
+        merchant = merchant_result.scalar_one()
+        assert merchant.name == "tienda online xyz"
+        assert merchant.default_category_id is None
+        # Unknown pattern flips the flag even when
+        # the LLM category hit (D2 OR semantics).
+        assert tx.low_confidence is True
+
+    @pytest.mark.asyncio
+    async def test_build_transactions_llm_helper_flag_off(
+        self, session_with_categories: AsyncSession
+    ) -> None:
+        """Flag off: the LLM helper is never invoked; the deterministic path is taken.
+
+        The ``LLM_MERCHANT_NORMALIZATION_ENABLED``
+        setting defaults to ``False`` in production.
+        The :class:`IngestionService` instance created
+        in the test does not set the setting (no
+        ``_settings`` attribute), so the flag is read
+        as ``False`` via the ``getattr`` fallback and
+        the deterministic ``resolve_merchant`` path
+        is taken. No LLM client is required.
+        """
+        from types import SimpleNamespace
+
+        from app.services.ingestion import IngestionService
+
+        extraction = ExtractionResponse(
+            transactions=[
+                {
+                    "date": "15/05/25",
+                    "description": "MCDONALDS SUC 12",
+                    "amount": "$ 4.500",
+                    "currency": "CLP",
+                    "category": "Dining Out",
+                },
+            ],
+            metadata={
+                "card_number_masked": "XXXX XXXX XXXX 0951",
+                "cardholder": "X",
+                "currency": "CLP",
+                "period_start": "01/05/2025",
+                "period_end": "31/05/2025",
+                "statement_date": "05/06/2025",
+            },
+            confidence=0.95,
+            notes=None,
+        )
+        statement = SimpleNamespace(id=uuid.uuid4())
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        # No ``_settings`` attribute — the ``getattr``
+        # fallback in the code returns ``False`` for
+        # the flag. The deterministic path runs.
+        transactions = await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=extraction,
+            expected_currency="CLP",
+        )
+        await session_with_categories.commit()
+        assert transactions[0].merchant_id is not None
+        assert transactions[0].low_confidence is False
+
+    @pytest.mark.asyncio
+    async def test_build_transactions_llm_helper_flag_on(
+        self, session_with_categories: AsyncSession
+    ) -> None:
+        """Flag on: the LLM helper is invoked first-occurrence-only.
+
+        Sets ``LLM_MERCHANT_NORMALIZATION_ENABLED``
+        on a stub settings object bound to the
+        service, then runs two uploads of the same
+        description. The first call invokes the LLM
+        once (recorded by a counting client); the
+        second call hits the alias table and skips
+        the LLM entirely.
+        """
+        from app.services.ingestion import IngestionService
+        from app.services.llm.schemas import (
+            ExtractionResponse,
+            StatementMetadata,
+        )
+
+        class _StubSettings:
+            LLM_MERCHANT_NORMALIZATION_ENABLED = True
+
+        class _CountingClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            async def extract_transactions(self, text: str, variant: str) -> ExtractionResponse:
+                self.calls.append((text, variant))
+                return ExtractionResponse(
+                    transactions=[],
+                    metadata=StatementMetadata(
+                        card_number_masked="",
+                        cardholder="",
+                        currency="CLP",
+                        period_start="",
+                        period_end="",
+                        statement_date="",
+                    ),
+                    confidence=0.85,
+                    notes="TIENDA ONLINE XYZ",  # echoes the input verbatim
+                )
+
+        client = _CountingClient()
+        service = IngestionService.__new__(IngestionService)
+        service._session = session_with_categories
+        service._settings = _StubSettings()
+        service._llm_client = client  # type: ignore[attr-defined]
+
+        from types import SimpleNamespace
+
+        def _build_extraction() -> ExtractionResponse:
+            return ExtractionResponse(
+                transactions=[
+                    {
+                        "date": "15/05/25",
+                        "description": "TIENDA ONLINE XYZ",
+                        "amount": "$ 9.990",
+                        "currency": "CLP",
+                        "category": "Shopping",
+                    },
+                ],
+                metadata={
+                    "card_number_masked": "XXXX XXXX XXXX 0951",
+                    "cardholder": "X",
+                    "currency": "CLP",
+                    "period_start": "01/05/2025",
+                    "period_end": "31/05/2025",
+                    "statement_date": "05/06/2025",
+                },
+                confidence=0.95,
+                notes=None,
+            )
+
+        statement = SimpleNamespace(id=uuid.uuid4())
+
+        # First call: LLM is invoked (first occurrence for
+        # this description).
+        await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=_build_extraction(),
+            expected_currency="CLP",
+        )
+        await session_with_categories.commit()
+        assert len(client.calls) == 1
+
+        # Second call: same description, alias table hits,
+        # LLM is not invoked again.
+        await IngestionService._build_transactions(
+            service,
+            statement=statement,
+            extraction=_build_extraction(),
+            expected_currency="CLP",
+        )
+        await session_with_categories.commit()
+        assert len(client.calls) == 1  # unchanged — first-occurrence-only
+
+
+# ---------------------------------------------------------------------------
 # Helpers — pure functions that don't need the DB or PDF
 # ---------------------------------------------------------------------------
 
