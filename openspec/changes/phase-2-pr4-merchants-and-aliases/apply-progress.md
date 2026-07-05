@@ -16,19 +16,21 @@
 | `30b928b` | feat | api | add GET /merchants + POST /merchants/{id}/aliases + Pydantic schemas |
 | `cff00cd` | feat | ingestion | integrate merchant normalization into _build_transactions |
 | `2944d01` | test | merchants | consolidate coverage with normalize + alias + LLM + API + alembic round-trip |
+| `d57721b` | chore | sdd | mark all 8 tasks complete + add apply-progress.md for PR #4 |
+| `210ff53` | test | ingestion | add 4 TestBuildTransactionsMerchantResolution tests |
 
 ## Test delta
 
 - Pre-PR #4 baseline: **349 passing** + 16 pre-existing Zen LLM failures + 69 skipped.
-- Post-PR #4: **379 passing** + 16 pre-existing Zen LLM failures + 69 skipped.
-- Net new tests: **30** (28 in `tests/test_merchants.py` + 2 in `tests/test_alembic.py`).
+- Post-PR #4: **383 passing** + 16 pre-existing Zen LLM failures + 69 skipped.
+- Net new tests: **34** (28 in `tests/test_merchants.py` + 2 in `tests/test_alembic.py` + 4 in `tests/test_ingestion.py`).
 - The 4 spec-targeted merchant integration tests in `tests/test_ingestion.py` (TestBuildTransactionsMerchantResolution) and 2 existing PR #2 tests updated to use known-pattern descriptions.
 
 ## Coverage delta
 
 - Pre-PR #4 baseline: 83.67% (per the prompt, the PR #2 baseline floor is 83.17%).
-- Post-PR #4: **83.44%** (243 uncovered statements across 1,824 total).
-- 0.23pp drop, all in the new code paths (`app/services/merchants.py` and `app/api/v1/merchants.py`). Above the 83.17% floor.
+- Post-PR #4: **83.71%** (240 uncovered statements across 1,824 total).
+- 0.04pp increase. Above the 83.17% floor.
 
 ## Files changed
 
@@ -82,12 +84,12 @@
 
 | Gate | Result |
 |------|--------|
-| `pytest tests/ -q` | 379 passed, 16 pre-existing Zen failures, 69 skipped |
-| `pytest tests/ -q --cov=app --cov-report=term` | 83.44% (above 83.17% floor) |
+| `pytest tests/ -q` | 383 passed, 16 pre-existing Zen failures, 69 skipped |
+| `pytest tests/ -q --cov=app --cov-report=term` | 83.71% (above 83.17% floor) |
 | `pytest tests/test_merchants.py -v` | 28 passed |
-| `pytest tests/test_ingestion.py -v` | 26 passed (including 4 new + 2 updated) |
+| `pytest tests/test_ingestion.py -v` | 91 passed (including 4 new + 2 updated) |
 | `pytest tests/test_alembic.py -v` | 14 passed (including 2 new) |
-| `ruff check .` | All checks passed (only pre-existing files unformatted, none of mine) |
+| `ruff check .` | All checks passed |
 | `ruff format --check` (modified files) | 13 files already formatted (my 4 new + 9 modified) |
 | `mypy --strict app/` | 1 pre-existing error in `opencode_zen_client.py:338` (NOT a regression) |
 | `mypy --strict` (my 4 new files) | Success: no issues found |
