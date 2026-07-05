@@ -2890,7 +2890,7 @@ class TestBuildTransactions:
             transactions=[
                 {
                     "date": "15/05/25",
-                    "description": "LEADER",
+                    "description": "LIDER",
                     "amount": "$ 12.450",
                     "currency": "CLP",
                     "category": "Groceries",
@@ -3054,14 +3054,14 @@ class TestBuildTransactions:
             transactions=[
                 {
                     "date": "15/05/25",
-                    "description": "X",
+                    "description": "MCDONALDS",
                     "amount": "$ 1.000",
                     "currency": "CLP",
                     "category": "GROCERIES",
                 },
                 {
                     "date": "16/05/25",
-                    "description": "Y",
+                    "description": "STARBUCKS",
                     "amount": "$ 2.000",
                     "currency": "CLP",
                     "category": "  Groceries  ",
