@@ -12,6 +12,8 @@ Endpoint modules
 * :mod:`app.api.v1.categories` — categories list and rename
   (Phase 2, PR #2).
 * :mod:`app.api.v1.health` — liveness probe.
+* :mod:`app.api.v1.merchants` — merchant list and user alias
+  binding (Phase 2, PR #4).
 * :mod:`app.api.v1.statements` — statement upload and lookup
   (Phase 1, WU 4).
 * :mod:`app.api.v1.transactions` — transaction listing and
@@ -23,6 +25,7 @@ from fastapi import APIRouter
 from app.api.v1.banks import router as banks_router
 from app.api.v1.categories import router as categories_router
 from app.api.v1.health import router as health_router
+from app.api.v1.merchants import router as merchants_router
 from app.api.v1.statements import router as statements_router
 from app.api.v1.transactions import router as transactions_router
 
@@ -34,6 +37,7 @@ api_v1_router: APIRouter = APIRouter()
 api_v1_router.include_router(health_router)  # type: ignore[has-type]
 api_v1_router.include_router(banks_router)
 api_v1_router.include_router(categories_router)
+api_v1_router.include_router(merchants_router)
 api_v1_router.include_router(statements_router)
 api_v1_router.include_router(transactions_router)
 

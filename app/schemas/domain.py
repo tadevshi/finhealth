@@ -299,3 +299,77 @@ class CategoryRenameRequest(BaseModel):
         max_length=100,
         description="New human-readable label shown in the UI.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Merchant
+# ---------------------------------------------------------------------------
+
+
+class MerchantResponse(BaseModel):
+    """Shape returned when reading a :class:`app.models.merchant.Merchant` row.
+
+    Mirrors :class:`CategoryResponse`: the closed set of canonical
+    merchants is returned by ``GET /api/v1/merchants`` ordered by
+    ``name`` ascending so the UI can render a ``<select>`` in one
+    round-trip. The ``default_category_id`` carries the FK to
+    :class:`Category` for the ``KNOWN_MERCHANT_PATTERNS`` mapping;
+    ``None`` for merchants that did not match a known pattern
+    (the user can re-tag them by hand).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    default_category_id: uuid.UUID | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class MerchantAliasResponse(BaseModel):
+    """Shape returned when reading a :class:`app.models.merchant.MerchantAlias` row.
+
+    Returned by ``POST /api/v1/merchants/{id}/aliases``. The
+    ``alias_text`` is the raw description the user submitted
+    (preserved verbatim for audit); the ``normalized`` form is
+    the :func:`app.services.merchants.normalize` result and is
+    the lookup key the alias table is indexed on.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    merchant_id: uuid.UUID
+    alias_text: str
+    normalized: str
+    source: str
+    confidence: float | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MerchantAliasCreate(BaseModel):
+    """Body of the ``POST /api/v1/merchants/{id}/aliases`` endpoint.
+
+    The body is a single ``alias_text`` field — the canonical
+    ``normalized`` form is computed server-side via
+    :func:`app.services.merchants.normalize` and the ``source``
+    is stamped to ``"user"`` on the resulting row. The
+    ``alias_text`` is bounded to ``min_length=1`` (no blank
+    aliases) and ``max_length=200`` (matches the column width
+    in migration 0006).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alias_text: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "Raw bank description the user wants to bind to this merchant. "
+            "Preserved verbatim on the row; the canonical form is computed "
+            "server-side."
+        ),
+    )
