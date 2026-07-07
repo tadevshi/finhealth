@@ -68,7 +68,7 @@ from app.services.llm.schemas import (
     StatementMetadata,
     TransactionExtraction,
 )
-from app.services.merchants import MerchantNormalizer
+from app.services.merchants import MerchantNormalizer, normalize
 from app.services.pdf import decrypt_pdf
 
 logger = logging.getLogger(__name__)
@@ -836,10 +836,8 @@ class IngestionService:
             # auto-created with a default category and
             # does *not* flip ``low_confidence`` — the
             # user already has a sensible default.
-            from app.services.merchants import normalize as _normalize_description
-
             merchant_id: uuid.UUID | None = None
-            canonical = _normalize_description(txn.description)
+            canonical = normalize(txn.description)
             if canonical:
                 existing_alias = merchant_aliases_by_normalized.get(canonical)
                 if existing_alias is not None:
