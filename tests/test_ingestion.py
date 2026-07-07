@@ -2871,10 +2871,21 @@ class TestBuildTransactions:
         ``Category.id`` on the row, leaves the canonical
         ``name`` in the denormalized column, and marks
         ``low_confidence=False``.
+
+        Phase 2 — merchants foundation. The ``LIDER``
+        description is in
+        :data:`app.services.merchants.KNOWN_MERCHANT_PATTERNS`,
+        so the auto-created merchant has its
+        ``default_category_id`` pointing to the seeded
+        ``Groceries`` row. The PR #4 spec scenario
+        "LIDER → 'Groceries' default category" is covered
+        here — the THEN clause asserts the merchant's
+        default category, not just the transaction's.
         """
         from sqlalchemy import select
 
         from app.models.category import Category
+        from app.models.merchant import Merchant
         from app.services.ingestion import IngestionService
 
         # Capture the seeded UUID for ``Groceries`` so the
@@ -2890,7 +2901,7 @@ class TestBuildTransactions:
             transactions=[
                 {
                     "date": "15/05/25",
-                    "description": "LIDER",
+                    "description": "LIDER COM 3",
                     "amount": "$ 12.450",
                     "currency": "CLP",
                     "category": "Groceries",
@@ -2921,6 +2932,18 @@ class TestBuildTransactions:
         assert tx.category == "Groceries"
         assert tx.category_id == groceries.id
         assert tx.low_confidence is False
+        # The LIDER merchant was auto-created and
+        # bound to the transaction. The known-pattern
+        # lookup in ``KNOWN_MERCHANT_PATTERNS`` maps
+        # the ``"lider"`` canonical to the seeded
+        # Groceries row, so ``default_category_id``
+        # must point at the same UUID as ``tx.category_id``.
+        merchant_result = await session_with_categories.execute(
+            select(Merchant).where(Merchant.name == "lider")
+        )
+        merchant = merchant_result.scalar_one()
+        assert tx.merchant_id == merchant.id
+        assert merchant.default_category_id == groceries.id
 
     @pytest.mark.asyncio
     async def test_miss_on_unknown_name(self, session_with_categories: AsyncSession) -> None:
