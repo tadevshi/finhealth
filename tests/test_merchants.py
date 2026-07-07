@@ -200,6 +200,35 @@ class TestNormalize:
         """
         assert normalize("CAFÉ / AÉROPORT") == "cafe aeroport"
 
+    def test_normalize_strips_sac_legal_suffix(self) -> None:
+        """``"EMPRESA S.A.C."`` strips the ``S.A.C.`` legal-entity suffix.
+
+        ``S.A.C.`` (Sociedad Anónima Comercial) is a common
+        Chilean legal-entity suffix. The regex uses the same
+        lookbehind/lookahead pair as ``S.A.`` (the trailing
+        period has no ``\\b`` word boundary after it) and
+        the additional ``.C.`` is anchored to a word
+        character on the right via ``(?!\\w)``. The result
+        is the bare merchant name ``"empresa"`` so two
+        branches of the same company (``"EMPRESA S.A.C."``
+        vs ``"EMPRESA"``) normalise to the same canonical
+        key.
+        """
+        assert normalize("EMPRESA S.A.C.") == "empresa"
+
+    def test_normalize_strips_spa_legal_suffix(self) -> None:
+        """``"EMPRESA SpA"`` strips the ``SpA`` legal-entity suffix.
+
+        ``SpA`` (Sociedad por Acciones) is a common Chilean
+        legal-entity suffix. The ``\\b`` word-boundary
+        anchors on either side of ``SpA`` keep the
+        abbreviation from matching a substring of a
+        legitimate word (the same guard the ``CIA``
+        alternative uses for ``"CINEMARK"``). The result
+        is the bare merchant name ``"empresa"``.
+        """
+        assert normalize("EMPRESA SpA") == "empresa"
+
 
 # ---------------------------------------------------------------------------
 # Alias lookup — DB-backed tests (5 from the spec)

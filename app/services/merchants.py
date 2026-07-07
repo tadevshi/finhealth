@@ -71,7 +71,8 @@ logger = logging.getLogger(__name__)
 # to the canonical :class:`Category.name`. The names on the *left*
 # are what :func:`normalize` produces — so they are already
 # lowercase, accent-free, and stripped of digits, punctuation,
-# ``S.A.``, ``LTDA``, ``CIA``, ``SUCURSAL``, ``SUC``, ``COM``.
+# ``S.A.``, ``S.A.C.``, ``SpA``, ``LTDA``, ``CIA``, ``SUCURSAL``,
+# ``SUC``, ``COM``.
 # The names on the *right* must match the seeded category names
 # in :mod:`app.models.category` (closed-set, 12 rows, ``name``
 # column).
@@ -126,20 +127,23 @@ KNOWN_MERCHANT_PATTERNS: Final[dict[str, str]] = {
 # ``B=1``, …) so the digit-strip pass never touches the
 # marker itself.
 #
-# The legal-entity tokens (``S.A.``, ``LTDA``, ``CIA``,
-# ``SUCURSAL``, ``SUC``, ``COM``) are matched as whole
-# words so substrings of legitimate words (e.g.
-# ``CINEMARK`` containing ``CIN``) are not
+# The legal-entity tokens (``S.A.``, ``S.A.C.``, ``SpA``,
+# ``LTDA``, ``CIA``, ``SUCURSAL``, ``SUC``, ``COM``) are
+# matched as whole words so substrings of legitimate words
+# (e.g. ``CINEMARK`` containing ``CIN``) are not
 # over-stripped (per architecture pick A in the PR #4
-# explore). ``S.A.`` uses a lookbehind/lookahead for the
-# leading and trailing boundary because the trailing
-# period sits between two non-word characters (period and
-# space) and therefore has no ``\b`` word boundary after
-# it; the explicit lookarounds cover the same ground
-# without the false negative.
+# explore). ``S.A.`` and ``S.A.C.`` use a
+# lookbehind/lookahead for the leading and trailing
+# boundary because the trailing period sits between two
+# non-word characters (period and space) and therefore has
+# no ``\b`` word boundary after it; the explicit lookarounds
+# cover the same ground without the false negative.
+# ``SpA`` uses ``\b`` because it ends in an uppercase
+# letter, not a punctuation character.
 
 _LEGAL_ENTITY_TOKENS: Final = re.compile(
-    r"(?<!\w)S\.A\.(?!\w)|\bLTDA\b|\bCIA\b|\bSUCURSAL\b|\bSUC\b|\bCOM\b",
+    r"(?<!\w)S\.A\.C\.(?!\w)|(?<!\w)S\.A\.(?!\w)|\bSpA\b|\bLTDA\b|\bCIA\b"
+    r"|\bSUCURSAL\b|\bSUC\b|\bCOM\b",
     flags=re.IGNORECASE,
 )
 # ``NN/NN`` patterns: the installment marker. Captured
@@ -184,10 +188,11 @@ def normalize(raw: str) -> str:
        accented characters into a base + combining mark, and
        ``encode('ascii', 'ignore')`` drops the combining mark
        (it is non-ASCII) so the result is plain ASCII.
-    2. :data:`_LEGAL_ENTITY_TOKENS` strips whole-word legal
-       suffixes (``S.A.``, ``LTDA``, ``CIA``, ``SUCURSAL``,
-       ``SUC``, ``COM``). The ``\b`` anchors keep
-       ``"CINEMARK"`` from being matched as ``"CIN"`` + ``"EMARK"``.
+     2. :data:`_LEGAL_ENTITY_TOKENS` strips whole-word legal
+        suffixes (``S.A.``, ``S.A.C.``, ``SpA``, ``LTDA``,
+        ``CIA``, ``SUCURSAL``, ``SUC``, ``COM``). The ``\b``
+        anchors keep ``"CINEMARK"`` from being matched as
+        ``"CIN"`` + ``"EMARK"``.
     3. *Placeholder protect* — :data:`_INSTALLMENT_PATTERN`
        captures every ``NN/NN`` pattern (e.g. ``"03/06"``)
        and replaces it with a non-digit marker
