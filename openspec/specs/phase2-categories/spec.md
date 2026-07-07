@@ -27,6 +27,14 @@ migration time, and enforced at three boundaries:
 Out of scope: category hierarchy, bulk category assignment from a filter view,
 Sentry alerts for failures, audit trail for renames.
 
+
+> **Phase 2 PR #4 extends the partial migration `0006_phase2_merchants_transactions_alter.py`**
+> (originally started in PR #2) with the `merchants` + `merchant_aliases` tables and the
+> `transactions.merchant_id` FK. The capability's behaviour (9 requirements, 22
+> scenarios from PR #2 + PR #3) is unchanged; only the schema is extended. The new
+> merchant-related behavior is documented in the `phase2-merchant-aliasing` capability
+> (a sibling spec).
+
 ## ADDED Requirements
 
 ### Requirement: Seeded Taxonomy and FK Columns
