@@ -408,9 +408,31 @@ class MerchantNormalizer:
             is_active=True,
         )
         session.add(merchant)
-        # Flush so the merchant gets a UUID before we
-        # build the alias row that references it.
-        await session.flush()
+        try:
+            # Flush so the merchant gets a UUID before we
+            # build the alias row that references it. The
+            # ``UNIQUE(merchants.name)`` constraint is
+            # enforced now, and a concurrent ingest that
+            # won the race for the same canonical key
+            # (e.g. ``"MCDONALDS SUC 12"`` and
+            # ``"MCDONALDS SUC 13"`` both normalising to
+            # ``"mcdonalds"``) raises an ``IntegrityError``
+            # that we catch and recover from below.
+            await session.flush()
+        except IntegrityError:
+            # A concurrent ingest won the race for the
+            # merchant row. Roll back our insert and
+            # re-query the merchant table to bind the
+            # alias to the winning row. The race is a
+            # defensive measure; the single-user
+            # use-case means it almost never fires in
+            # practice, but the error path is here so
+            # the second concurrent upload is not lost.
+            await session.rollback()
+            rerun_merchant = await session.execute(
+                select(Merchant).where(Merchant.name == canonical)
+            )
+            merchant = rerun_merchant.scalar_one()
 
         alias = MerchantAlias(
             merchant_id=merchant.id,
