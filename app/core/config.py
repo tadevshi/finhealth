@@ -69,8 +69,10 @@ class Settings(BaseSettings):
     # transient errors (network blips, 5xx responses, timeouts).
     LLM_PROVIDER: str = Field(
         default="opencode_zen",
-        description=("LLM provider identifier. 'opencode_zen' (default, free models available), "
-                     "'ollama' (self-hosted), 'opencode_go' (Go subscription)."),
+        description=(
+            "LLM provider identifier. 'opencode_zen' (default, free models available), "
+            "'ollama' (self-hosted), 'opencode_go' (Go subscription)."
+        ),
     )
     LLM_API_ENDPOINT: str = Field(
         default="https://opencode.ai/zen/v1",
@@ -117,6 +119,23 @@ class Settings(BaseSettings):
             "large enough to cover a full transaction row in the "
             "verbose Santander layout. Set to 0 to disable overlap "
             "(transactions at boundaries will be lost)."
+        ),
+    )
+    LLM_MERCHANT_NORMALIZATION_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase 2 PR #4 — opt-in LLM helper for merchant "
+            "normalization. When ``True`` and the deterministic "
+            "merchant normalizer misses (no alias hit, no "
+            "``KNOWN_MERCHANT_PATTERNS`` match), the orchestrator "
+            "calls the LLM once per unique normalized text per "
+            "ingestion (first-occurrence-only) to extract a "
+            "canonical merchant name. The default is ``False`` so "
+            "the v1 deployment ships with zero extra LLM cost — "
+            "the helper is wired in but never invoked unless the "
+            "operator explicitly opts in. See product decision #6 "
+            "and architecture pick C in "
+            "``openspec/changes/phase-2-pr4-merchants-and-aliases/``."
         ),
     )
 

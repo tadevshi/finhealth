@@ -59,6 +59,7 @@ from app.core.config import Settings
 from app.models.bank import Bank
 from app.models.category import Category
 from app.models.credit_card import CreditCard
+from app.models.merchant import MerchantAlias
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
 from app.services.llm.protocol import LLMProvider
@@ -67,6 +68,7 @@ from app.services.llm.schemas import (
     StatementMetadata,
     TransactionExtraction,
 )
+from app.services.merchants import MerchantNormalizer, normalize
 from app.services.pdf import decrypt_pdf
 
 logger = logging.getLogger(__name__)
@@ -732,6 +734,39 @@ class IngestionService:
         for category in categories_result.scalars():
             categories_by_name[category.name.lower()] = category
 
+        # Phase 2 PR #4 — merchant resolution. One query
+        # against ``merchant_aliases`` at the start of the
+        # call so the per-row lookup is a dict hit, not an
+        # N+1 against the alias table. The dict is keyed
+        # by ``alias.normalized`` (the lowercase+accent-
+        # stripped form ``app.services.merchants.normalize``
+        # computes) so the per-row match is an O(1) lookup.
+        # The ``Merchant`` relationship on
+        # ``MerchantAlias`` is ``lazy="joined"`` so the
+        # merchant is on the attribute without an extra
+        # round-trip.
+        merchant_aliases_by_normalized: dict[str, MerchantAlias] = {}
+        alias_result = await self._session.execute(select(MerchantAlias))
+        for alias in alias_result.scalars():
+            merchant_aliases_by_normalized[alias.normalized] = alias
+        # The LLM helper is opt-in (default off). The
+        # service is created once per call so the per-row
+        # resolve path is straightforward to read. The
+        # ``getattr`` is defensive — some unit tests
+        # construct an :class:`IngestionService` via
+        # ``__new__`` and only set ``_session`` (the
+        # canonical pattern for in-process unit tests of
+        # the per-row logic). In production the settings
+        # are always present.
+        merchant_normalizer = MerchantNormalizer()
+        llm_helper_enabled: bool = bool(
+            getattr(
+                getattr(self, "_settings", None),
+                "LLM_MERCHANT_NORMALIZATION_ENABLED",
+                False,
+            )
+        )
+
         transactions: list[Transaction] = []
         for index, txn in enumerate(extraction.transactions):
             if not isinstance(txn, TransactionExtraction):
@@ -786,6 +821,47 @@ class IngestionService:
             if category_id is None and not category_name:
                 category_name = "Uncategorized"
 
+            # Phase 2 PR #4 — merchant resolution. The
+            # normalizer's ``resolve_merchant`` does the
+            # alias-table hit-or-create flow; the LLM
+            # helper is only invoked when (a) the flag is
+            # on *and* (b) the deterministic path
+            # produced a miss. The ``low_confidence``
+            # signal uses OR semantics: a *new* merchant
+            # whose canonical key was not in
+            # ``KNOWN_MERCHANT_PATTERNS`` flips the flag
+            # to ``True`` so the user can re-tag the row
+            # by hand (per design decision D2). A
+            # known-pattern merchant (e.g. MCDONALDS) is
+            # auto-created with a default category and
+            # does *not* flip ``low_confidence`` — the
+            # user already has a sensible default.
+            merchant_id: uuid.UUID | None = None
+            canonical = normalize(txn.description)
+            if canonical:
+                existing_alias = merchant_aliases_by_normalized.get(canonical)
+                if existing_alias is not None:
+                    merchant_id = existing_alias.merchant_id
+                else:
+                    if llm_helper_enabled:
+                        merchant, _was_new = await merchant_normalizer.resolve_merchant_with_llm(
+                            self._session, txn.description, self._llm_client
+                        )
+                    else:
+                        merchant, _was_new = await merchant_normalizer.resolve_merchant(
+                            self._session, txn.description, categories_by_name
+                        )
+                    merchant_id = merchant.id if merchant is not None else None
+                    if merchant is not None and merchant.default_category_id is None:
+                        # Unknown pattern: the auto-created
+                        # merchant has no default category,
+                        # so the user must re-tag the row.
+                        # OR semantics: flip the flag even
+                        # when the LLM category hit (the
+                        # user has the option to override
+                        # both at once).
+                        low_confidence = True
+
             transactions.append(
                 Transaction(
                     statement_id=statement.id,
@@ -796,6 +872,7 @@ class IngestionService:
                     category=category_name,
                     category_id=category_id,
                     low_confidence=low_confidence,
+                    merchant_id=merchant_id,
                     installment_number=txn.installment_number,
                     installment_total=txn.installment_total,
                     installment_value=installment_value,

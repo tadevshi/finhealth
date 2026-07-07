@@ -19,6 +19,7 @@ from app.models.bank import Bank
 from app.models.base import Base
 from app.models.category import Category
 from app.models.credit_card import CreditCard
+from app.models.merchant import Merchant, MerchantAlias, MerchantAliasSource
 from app.models.mixins import TimestampMixin, UUIDMixin
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
@@ -28,6 +29,9 @@ __all__ = [
     "Base",
     "Category",
     "CreditCard",
+    "Merchant",
+    "MerchantAlias",
+    "MerchantAliasSource",
     "Statement",
     "StatementStatus",
     "TimestampMixin",

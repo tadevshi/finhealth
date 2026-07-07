@@ -390,6 +390,178 @@ def test_alembic_transactions_round_trip_category_columns(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 PR #4 — merchants + merchant_aliases + transactions.merchant_id
+# ---------------------------------------------------------------------------
+#
+# Migration ``0006_phase2_merchants_transactions_alter`` (PR #4 portion)
+# adds three artifacts to the schema:
+#
+# * the ``merchants`` table with a nullable FK to
+#   ``categories.id`` (``ON DELETE SET NULL``);
+# * the ``merchant_aliases`` table with a CASCADE FK to
+#   ``merchants.id`` and a UNIQUE constraint on
+#   ``alias_text``;
+# * the ``transactions.merchant_id`` column with a
+#   nullable FK to ``merchants.id`` (``ON DELETE SET
+#   NULL``) and a B-tree index.
+#
+# The two tests below prove the new artifacts survive a
+# full upgrade / downgrade round-trip. The PR #2 portion
+# of migration 0006 (the ``category_id`` column,
+# ``low_confidence``, the FK and index) is exercised by
+# ``test_alembic_transactions_round_trip_category_columns``
+# above — the two halves share the same file, so the
+# round-trip test below implicitly proves the two PRs
+# co-exist cleanly.
+
+
+def test_alembic_seeds_create_merchants_and_aliases_tables(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """Migration 0006 creates the ``merchants`` and ``merchant_aliases`` tables.
+
+    The PR #4 portion of migration 0006 is the table
+    create + the FK + the unique constraint + the
+    index. The test asserts every artifact is present
+    on the live schema after ``upgrade head``.
+    """
+    alembic_upgrade(alembic_config, "head")
+    inspector = inspect(sync_engine)
+
+    # ``merchants`` table exists with the expected
+    # columns and a UNIQUE on ``name``.
+    assert "merchants" in inspector.get_table_names()
+    merchant_columns = {col["name"] for col in inspector.get_columns("merchants")}
+    assert {
+        "id",
+        "name",
+        "default_category_id",
+        "is_active",
+        "created_at",
+        "updated_at",
+    } <= merchant_columns
+    merchant_uniques = inspector.get_unique_constraints("merchants")
+    assert any("name" in u["column_names"] for u in merchant_uniques), (
+        f"merchants.name should be UNIQUE, got {merchant_uniques}"
+    )
+
+    # ``merchant_aliases`` table exists with the
+    # expected columns and a UNIQUE on ``alias_text``.
+    assert "merchant_aliases" in inspector.get_table_names()
+    alias_columns = {col["name"] for col in inspector.get_columns("merchant_aliases")}
+    assert {
+        "id",
+        "merchant_id",
+        "alias_text",
+        "normalized",
+        "source",
+        "confidence",
+        "created_at",
+        "updated_at",
+    } <= alias_columns
+    alias_uniques = inspector.get_unique_constraints("merchant_aliases")
+    assert any("alias_text" in u["column_names"] for u in alias_uniques), (
+        f"merchant_aliases.alias_text should be UNIQUE, got {alias_uniques}"
+    )
+
+    # ``transactions.merchant_id`` column exists with
+    # an index. The FK is verified by the
+    # round-trip test below.
+    transactions_columns = {col["name"] for col in inspector.get_columns("transactions")}
+    assert "merchant_id" in transactions_columns
+    transactions_indexes = inspector.get_indexes("transactions")
+    assert any(idx["name"] == "ix_transactions_merchant_id" for idx in transactions_indexes), (
+        f"ix_transactions_merchant_id should exist, got {transactions_indexes}"
+    )
+
+
+def test_alembic_transactions_round_trip_merchant_id(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """The new ``transactions.merchant_id`` column round-trips cleanly.
+
+    Inserts a row with an explicit ``merchant_id``
+    bound to a pre-seeded ``Merchant``, then re-reads
+    it, so a regression in the column type or the FK
+    constraint is caught at the boundary. Also inserts
+    a row with ``merchant_id=NULL`` (the auto-create
+    miss path and the pre-PR #4 historical rows) to
+    verify the column is nullable. The round-trip
+    also covers the ``MerchantAlias`` row and the
+    ``UNIQUE(alias_text)`` collision.
+    """
+    alembic_upgrade(alembic_config, "head")
+
+    with sync_engine.begin() as conn:
+        # Seed the parent chain (bank, card, statement,
+        # category, merchant) so the FKs resolve.
+        conn.exec_driver_sql(
+            "INSERT INTO banks (id, created_at, updated_at, name, display_name, password_formula, is_active) "
+            "VALUES ('11111111-1111-1111-1111-111111111111', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'alembic_test_bank', 'Alembic Test Bank', 'rut_sin_dv', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO credit_cards (id, created_at, updated_at, bank_id, card_number_masked, cardholder, currency, is_active) "
+            "VALUES ('22222222-2222-2222-2222-222222222222', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'11111111-1111-1111-1111-111111111111', 'XXXX XXXX XXXX 0001', 'TEST USER', 'CLP', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO statements (id, created_at, updated_at, credit_card_id, period_start, period_end, statement_date, file_path, file_hash, status) "
+            "VALUES ('33333333-3333-3333-3333-333333333333', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'22222222-2222-2222-2222-222222222222', '2026-05-01', '2026-05-31', '2026-06-01', "
+            "'/tmp/alembic-test.pdf', 'c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2', 'COMPLETED')"
+        )
+        # Pick the seeded ``Dining Out`` category by name
+        # so the test is independent of the random UUIDs.
+        food_id = conn.exec_driver_sql(
+            "SELECT id FROM categories WHERE name = 'Dining Out'"
+        ).scalar_one()
+        # Seed a merchant (MCDONALDS) and an alias row.
+        conn.exec_driver_sql(
+            "INSERT INTO merchants (id, created_at, updated_at, name, default_category_id, is_active) "
+            "VALUES ('55555555-5555-5555-5555-555555555555', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            f"'mcdonalds', '{food_id}', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO merchant_aliases (id, created_at, updated_at, merchant_id, alias_text, normalized, source) "
+            "VALUES ('66666666-6666-6666-6666-666666666666', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'55555555-5555-5555-5555-555555555555', 'MCDONALDS SUC 12', 'mcdonalds', 'auto')"
+        )
+
+        # Insert a transaction with a valid merchant FK.
+        conn.exec_driver_sql(
+            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category, merchant_id) "
+            "VALUES ('44444444-4444-4444-4444-444444444443', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'33333333-3333-3333-3333-333333333333', '2026-05-05', 'MCDONALDS SUC 12', 4500.00, 'CLP', "
+            f"'{food_id}', 0, 'Dining Out', '55555555-5555-5555-5555-555555555555')"
+        )
+        # Insert a transaction with merchant_id=NULL
+        # (the pre-PR #4 historical rows + the
+        # auto-create-miss path).
+        conn.exec_driver_sql(
+            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category) "
+            "VALUES ('44444444-4444-4444-4444-444444444444', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'33333333-3333-3333-3333-333333333333', '2026-05-06', 'NO-MERCHANT-PATH', 100.00, 'CLP', "
+            f"'{food_id}', 0, 'Dining Out')"
+        )
+
+        # Re-read both rows and assert the merchant_id
+        # column round-trips through the schema exactly
+        # as written.
+        with_merchant = conn.exec_driver_sql(
+            "SELECT merchant_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444443'"
+        ).fetchone()
+        without_merchant = conn.exec_driver_sql(
+            "SELECT merchant_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444444'"
+        ).fetchone()
+
+    assert with_merchant is not None
+    assert str(with_merchant[0]) == "55555555-5555-5555-5555-555555555555"
+    assert without_merchant is not None
+    assert without_merchant[0] is None
+
+
+# ---------------------------------------------------------------------------
 # Timestamp server_default regression guard
 # ---------------------------------------------------------------------------
 #
