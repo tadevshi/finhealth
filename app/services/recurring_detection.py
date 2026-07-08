@@ -357,7 +357,6 @@ class RecurringDetector:
         # inspect.
         median_interval = 400 if not intervals else round(statistics.median(intervals))
         period_label, period_days = self._classify_period(median_interval)
-        period_label, period_days = self._classify_period(median_interval)
 
         # Use the *in-band* amount bounds (not the
         # ±15% band the filter used) for the rule row —
