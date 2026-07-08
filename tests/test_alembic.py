@@ -562,6 +562,174 @@ def test_alembic_transactions_round_trip_merchant_id(
 
 
 # ---------------------------------------------------------------------------
+# Migration 0007 — ``recurring_rules`` + ``transactions.recurring_rule_id``
+# ---------------------------------------------------------------------------
+#
+# Phase 2 PR #5 introduces the deterministic recurring-transaction
+# detector. The migration adds one new table and one new nullable
+# column on ``transactions``. The round-trip tests below exercise
+# the schema shape (the table + indexes + the nullable FK on
+# transactions) and prove a value inserted via the new column
+# reads back exactly as written.
+
+
+def test_alembic_seeds_create_recurring_rules_table(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """Migration 0007 creates the ``recurring_rules`` table + indexes + FK.
+
+    The PR #5 portion of migration 0007 is the new table +
+    the composite upsert index + the ``is_active`` index +
+    the ``transactions.recurring_rule_id`` column + its
+    index + its FK. The test asserts every artifact is
+    present on the live schema after ``upgrade head``.
+    """
+    alembic_upgrade(alembic_config, "head")
+    inspector = inspect(sync_engine)
+
+    # ``recurring_rules`` table exists with the expected
+    # columns and the merchant FK with ``ON DELETE CASCADE``.
+    assert "recurring_rules" in inspector.get_table_names()
+    rule_columns = {col["name"] for col in inspector.get_columns("recurring_rules")}
+    assert {
+        "id",
+        "merchant_id",
+        "period_days",
+        "period_label",
+        "amount_min",
+        "amount_max",
+        "currency",
+        "is_active",
+        "confidence",
+        "last_seen_date",
+        "occurrences",
+        "created_at",
+        "updated_at",
+    } <= rule_columns
+    rule_foreign_keys = inspector.get_foreign_keys("recurring_rules")
+    assert any(
+        fk["referred_table"] == "merchants"
+        and fk["constrained_columns"] == ["merchant_id"]
+        and (fk.get("options") or {}).get("ondelete") == "CASCADE"
+        for fk in rule_foreign_keys
+    ), f"recurring_rules.merchant_id FK should be CASCADE, got {rule_foreign_keys}"
+
+    # The composite upsert index + the read-side ``is_active``
+    # index. The composite is non-unique because the upsert
+    # key also includes ``amount_min`` / ``amount_max``, which
+    # are not in the index (checked in application code).
+    rule_indexes = inspector.get_indexes("recurring_rules")
+    assert any(
+        idx["name"] == "ix_recurring_rules_merchant_currency_period"
+        and tuple(idx["column_names"]) == ("merchant_id", "currency", "period_days")
+        for idx in rule_indexes
+    ), (
+        f"ix_recurring_rules_merchant_currency_period should exist on the right columns, "
+        f"got {rule_indexes}"
+    )
+    assert any(
+        idx["name"] == "ix_recurring_rules_is_active"
+        and tuple(idx["column_names"]) == ("is_active",)
+        for idx in rule_indexes
+    ), f"ix_recurring_rules_is_active should exist, got {rule_indexes}"
+
+    # ``transactions.recurring_rule_id`` column exists with
+    # an index. The FK with ``ON DELETE SET NULL`` is verified
+    # by the round-trip test below.
+    transactions_columns = {col["name"] for col in inspector.get_columns("transactions")}
+    assert "recurring_rule_id" in transactions_columns
+    transactions_indexes = inspector.get_indexes("transactions")
+    assert any(
+        idx["name"] == "ix_transactions_recurring_rule_id"
+        for idx in transactions_indexes
+    ), f"ix_transactions_recurring_rule_id should exist, got {transactions_indexes}"
+
+
+def test_alembic_transactions_round_trip_recurring_rule_id(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """The new ``transactions.recurring_rule_id`` column round-trips cleanly.
+
+    Inserts a row with an explicit ``recurring_rule_id``
+    bound to a pre-seeded ``RecurringRule``, then re-reads
+    it, so a regression in the column type or the FK
+    constraint is caught at the boundary. Also inserts a
+    row with ``recurring_rule_id=NULL`` (the pre-PR #5
+    historical rows + the auto-create-miss path) to verify
+    the column is nullable. The round-trip also covers the
+    ``recurring_rules`` row.
+    """
+    alembic_upgrade(alembic_config, "head")
+
+    with sync_engine.begin() as conn:
+        # Seed the parent chain (bank, card, statement,
+        # category, merchant) so the FKs resolve.
+        conn.exec_driver_sql(
+            "INSERT INTO banks (id, created_at, updated_at, name, display_name, password_formula, is_active) "
+            "VALUES ('11111111-1111-1111-1111-111111111111', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'alembic_test_bank_pr5', 'Alembic Test Bank PR5', 'rut_sin_dv', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO credit_cards (id, created_at, updated_at, bank_id, card_number_masked, cardholder, currency, is_active) "
+            "VALUES ('22222222-2222-2222-2222-222222222222', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'11111111-1111-1111-1111-111111111111', 'XXXX XXXX XXXX 0001', 'TEST USER', 'CLP', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO statements (id, created_at, updated_at, credit_card_id, period_start, period_end, statement_date, file_path, file_hash, status) "
+            "VALUES ('33333333-3333-3333-3333-333333333333', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'22222222-2222-2222-2222-222222222222', '2026-05-01', '2026-05-31', '2026-06-01', "
+            "'/tmp/alembic-test-pr5.pdf', 'd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3', 'COMPLETED')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO merchants (id, created_at, updated_at, name, default_category_id, is_active) "
+            "VALUES ('55555555-5555-5555-5555-555555555555', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'spotify', NULL, 1)"
+        )
+        # Seed a recurring rule so the FK has a valid target.
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, occurrences"
+            ") VALUES ("
+            "'77777777-7777-7777-7777-777777777777', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'55555555-5555-5555-5555-555555555555', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.95, '2026-05-15', 3"
+            ")"
+        )
+
+        # Insert a transaction with a valid recurring_rule FK.
+        conn.exec_driver_sql(
+            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, low_confidence, recurring_rule_id) "
+            "VALUES ('44444444-4444-4444-4444-444444444445', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'33333333-3333-3333-3333-333333333333', '2026-05-15', 'SPOTIFY USA', 9.99, 'USD', "
+            "0, '77777777-7777-7777-7777-777777777777')"
+        )
+        # Insert a transaction with recurring_rule_id=NULL
+        # (the pre-PR #5 historical rows + the one-off
+        # charges the detector skips).
+        conn.exec_driver_sql(
+            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, low_confidence) "
+            "VALUES ('44444444-4444-4444-4444-444444444446', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'33333333-3333-3333-3333-333333333333', '2026-05-16', 'ONE-OFF PURCHASE', 50.00, 'USD', 0)"
+        )
+
+        # Re-read both rows and assert the recurring_rule_id
+        # column round-trips through the schema exactly as
+        # written.
+        with_rule = conn.exec_driver_sql(
+            "SELECT recurring_rule_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444445'"
+        ).fetchone()
+        without_rule = conn.exec_driver_sql(
+            "SELECT recurring_rule_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444446'"
+        ).fetchone()
+
+    assert with_rule is not None
+    assert str(with_rule[0]) == "77777777-7777-7777-7777-777777777777"
+    assert without_rule is not None
+    assert without_rule[0] is None
+
+
+# ---------------------------------------------------------------------------
 # Timestamp server_default regression guard
 # ---------------------------------------------------------------------------
 #

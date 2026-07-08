@@ -25,6 +25,7 @@ from app.models.mixins import TimestampMixin, UUIDMixin, UUIDType
 if TYPE_CHECKING:
     from app.models.category import Category
     from app.models.merchant import Merchant
+    from app.models.recurring_rule import RecurringRule
     from app.models.statement import Statement
 
 
@@ -89,6 +90,16 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
     installment_number, installment_total, installment_value:
         Installment plan data. ``None`` when the charge is a one-off.
         When set, ``1 <= installment_number <= installment_total``.
+    recurring_rule_id:
+        Optional FK to
+        :class:`app.models.recurring_rule.RecurringRule`. Set by
+        :class:`app.services.recurring_detection.RecurringDetector`
+        when the row matches a detected pattern (the in-band
+        amount range on the same merchant + currency). The
+        detector preserves the FK on deactivation (per design
+        D) so historical audit links survive. ``NULL`` for
+        one-off charges and for rows the detector has not yet
+        processed.
     raw_json:
         Verbatim LLM extraction output for this row. Preserved so we
         can re-derive the row if the parser changes — debugging gold.
@@ -127,6 +138,12 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
         Numeric(15, 2),
         nullable=True,
     )
+    recurring_rule_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDType(),
+        ForeignKey("recurring_rules.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     raw_json: Mapped[dict[str, object] | list[object] | None] = mapped_column(
         JSON,
         nullable=True,
@@ -140,5 +157,9 @@ class Transaction(UUIDMixin, TimestampMixin, Base):
     )
     merchant_ref: Mapped[Merchant | None] = relationship(
         back_populates="merchant_transactions",
+        lazy="joined",
+    )
+    recurring_rule_ref: Mapped[RecurringRule | None] = relationship(
+        back_populates="transactions",
         lazy="joined",
     )
