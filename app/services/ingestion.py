@@ -70,6 +70,7 @@ from app.services.llm.schemas import (
 )
 from app.services.merchants import MerchantNormalizer, normalize
 from app.services.pdf import decrypt_pdf
+from app.services.recurring_detection import RecurringDetector
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,19 @@ class IngestionService:
         self._session = session
         self._llm_client = llm_client
         self._settings = settings
+        # ``_last_failed_chunks`` is set by
+        # :meth:`_run_chunked_extraction` before it
+        # returns. The ingest path reads it at the end
+        # of :meth:`ingest_statement` so the
+        # :class:`RecurringDetector` knows whether the
+        # statement reached ``status=COMPLETED`` via a
+        # full-success or a partial-success path
+        # (decision #7 — log level split). Defensive
+        # init to ``0`` so a test that bypasses the
+        # chunked-extraction path (e.g. a unit test that
+        # calls ``_build_transactions`` directly) does
+        # not trip an :class:`AttributeError`.
+        self._last_failed_chunks = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -418,6 +432,28 @@ class IngestionService:
             statement.id,
             len(transactions),
         )
+
+        # 14. Run the recurring-transaction detector. The
+        #     detector is wrapped in a bare ``try/except``
+        #     (design D2) so a detector failure does NOT
+        #     fail the otherwise-successful ingest. The
+        #     ``partial_success`` flag drives the detector's
+        #     log level: ``info`` on full success,
+        #     ``warning`` on partial success (decisions #7,
+        #     #14). The flag is stashed by
+        #     :meth:`_run_chunked_extraction` before it
+        #     returns (KNOWN RISK #1 in the PR #5 design).
+        try:
+            await RecurringDetector(
+                self._session,
+                partial_success=self._last_failed_chunks > 0,
+            ).detect(statement)
+        except Exception:
+            logger.exception(
+                "Recurring detection failed for statement=%s; ingest will still complete",
+                statement.id,
+            )
+
         return statement
 
     # ------------------------------------------------------------------
@@ -569,6 +605,22 @@ class IngestionService:
                 raise IngestionError("LLM did not return a usable metadata block in any chunk")
 
             deduped = _dedupe_transactions(all_transactions)
+
+            # Stash the per-call ``failed_chunks`` count on
+            # the service instance so the detector call in
+            # :meth:`ingest_statement` can pick it up. This
+            # is the only line added inside the
+            # cherry-pick-protected ``_run_chunked_extraction``
+            # function (KNOWN RISK #1 in the PR #5 design);
+            # the chunk loop, ``try/finally``, the
+            # ``first_successful_chunk_seen`` flag, the
+            # ``last_chunk_exc`` chaining, the all-fail
+            # guard, the metadata-None guard, the counters,
+            # and ``_metadata_completeness`` are all
+            # UNTOUCHED. The stash is purely additive — it
+            # has no flow effect on the chunked-extraction
+            # path itself.
+            self._last_failed_chunks = failed_chunks
 
             return ExtractionResponse(
                 transactions=deduped,
