@@ -1147,6 +1147,52 @@ class TestRecurringDetectorAlgorithm:
 
         assert rules == []
 
+    @pytest.mark.asyncio
+    async def test_majority_same_day_with_one_later_does_not_create_rule(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """A majority-same-day group (3 on day D, 1 on day D+30) does not produce a rule.
+
+        This is the residual the Round 2 same-day fix
+        was written to close. Intervals are
+        ``[0, 0, 30]``; ``statistics.median`` returns
+        ``0``; ``round(0) == 0``; the guard
+        ``if median_interval == 0: return None`` skips the
+        group. Without the fix, ``_classify_period(0)``
+        would return ``("weekly", 0)`` and upsert a
+        meaningless rule. The pure-same-day test above
+        does not lock this case because the old
+        ``all(i == 0 for i in intervals)`` guard also
+        caught it.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            # 3 on day D, 1 on day D+30 → intervals [0, 0, 30] → median 0.
+            for amount in ("10.00", "10.50", "11.00"):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=date(2026, 6, 1),
+                )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="10.75",
+                txn_date=date(2026, 7, 1),
+            )
+            await session.commit()
+
+            statement = await session.get(Statement, statement_id)
+            rules = await RecurringDetector(session, partial_success=False).detect(statement)
+
+        assert rules == []
+
 
 # ---------------------------------------------------------------------------
 # API tests
