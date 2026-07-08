@@ -157,10 +157,18 @@ class RecurringRule(UUIDMixin, TimestampMixin, Base):
     occurrences: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # Relationships ---------------------------------------------------------
-    merchant: Mapped[Merchant] = relationship(lazy="joined")
+    # Both relationships use ``lazy="noload"`` so the
+    # default read path (``GET /api/v1/recurring``) does
+    # not pay for a JOIN on ``merchants`` or a second
+    # round-trip for ``transactions`` — neither is in the
+    # ``RecurringRuleResponse`` schema. Callers that need
+    # them can still opt in with an explicit
+    # ``await session.refresh(rule, ["merchant"])`` or
+    # ``selectinload(RecurringRule.transactions)``.
+    merchant: Mapped[Merchant] = relationship(lazy="noload")
     transactions: Mapped[list[Transaction]] = relationship(
         back_populates="recurring_rule_ref",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
