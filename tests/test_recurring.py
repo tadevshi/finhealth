@@ -209,15 +209,15 @@ class TestRecurringDetectorAlgorithm:
     ) -> None:
         """Transactions older than 90 days are excluded from the rule.
 
-        A group with 3 occurrences inside the 90-day
+        A group with 4 occurrences inside the 90-day
         window and 1 occurrence at day 120 still produces
-        a rule based on the 3 in-window occurrences
+        a rule based on the 4 in-window occurrences
         (assuming they qualify on the amount axis).
         """
         statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
         merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
         # period_end = 2026-06-30 → cutoff = 2026-04-01
-        # 3 in-window at days -90, -60, -30 + 1 out-of-window at day -120
+        # 4 in-window at days 0, -30, -60, -90 + 1 out-of-window at day -120
         async with session_factory() as session:
             _add_transaction(
                 session,
@@ -245,6 +245,13 @@ class TestRecurringDetectorAlgorithm:
                 statement_id=statement_id,
                 merchant_id=merchant_id,
                 amount="9.99",
+                txn_date=date(2026, 6, 30),  # day 0 — inside the window
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="9.99",
                 txn_date=date(2026, 3, 2),  # 120 days before — out of window
             )
             await session.commit()
@@ -254,7 +261,7 @@ class TestRecurringDetectorAlgorithm:
             rules = await detector.detect(statement)
 
         assert len(rules) == 1
-        assert rules[0].occurrences == 3  # out-of-window excluded
+        assert rules[0].occurrences == 4  # out-of-window excluded; day 0 included
 
     @pytest.mark.asyncio
     async def test_two_occurrences_do_not_qualify(
@@ -769,6 +776,369 @@ class TestRecurringDetectorAlgorithm:
         ]
         assert len(warning_records) == 1
         assert "partial-success" in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_same_merchant_different_currencies_produces_two_rules(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Same merchant in two currencies produces two rules (one per currency).
+
+        The grouping key is ``(merchant_id, currency)``,
+        so MCDONALDS charges in USD and CLP become two
+        separate rules. Each currency's group needs
+        ≥3 in-band occurrences on its own median.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            # 3 USD transactions, 30 days apart, at $9.99.
+            for d in (date(2026, 4, 1), date(2026, 5, 1), date(2026, 6, 1)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount="9.99",
+                    txn_date=d,
+                    currency="USD",
+                )
+            # 3 CLP transactions, 30 days apart, at $5000.
+            for d in (date(2026, 4, 15), date(2026, 5, 15), date(2026, 6, 15)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount="5000.00",
+                    txn_date=d,
+                    currency="CLP",
+                )
+            await session.commit()
+
+            statement = await session.get(Statement, statement_id)
+            rules = await RecurringDetector(session, partial_success=False).detect(statement)
+
+        assert len(rules) == 2
+        by_currency = {r.currency: r for r in rules}
+        assert set(by_currency.keys()) == {"USD", "CLP"}
+        assert by_currency["USD"].amount_min == Decimal("9.99")
+        assert by_currency["USD"].amount_max == Decimal("9.99")
+        assert by_currency["CLP"].amount_min == Decimal("5000.00")
+        assert by_currency["CLP"].amount_max == Decimal("5000.00")
+
+    @pytest.mark.asyncio
+    async def test_10_occurrences_5pct_variance_yields_high_confidence(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """10 occurrences with a tight amount range produce ~0.95 confidence.
+
+        The amounts are chosen so the full-group median
+        is $10.25 and the in-band range is
+        ``[$10.00, $10.50]`` — the spec's worked example
+        for the ``min(1.0, 10/5) * (1.0 - 0.50/10.25)``
+        formula. The date spacing is 9 days so 3 intervals
+        fit in the 90-day window and the period classifier
+        picks a deterministic bucket.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        # 10 amounts: median is (10.20 + 10.30) / 2 = 10.25.
+        # amount_min = 10.00, amount_max = 10.50.
+        # spread = 0.50 / 10.25 = 0.0488 → 1 - 0.0488 = 0.9512.
+        # confidence = 1.0 * 0.9512 = 0.9512.
+        amounts = (
+            "10.00",
+            "10.05",
+            "10.10",
+            "10.15",
+            "10.20",
+            "10.30",
+            "10.35",
+            "10.40",
+            "10.45",
+            "10.50",
+        )
+        async with session_factory() as session:
+            # 10 dates, 9 days apart, starting at period_end
+            # (2026-06-30) and walking backwards. All 10
+            # fall in the 90-day window.
+            for offset, amount in enumerate(amounts):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=_offset_from(date(2026, 6, 30), -9 * offset),
+                )
+            await session.commit()
+
+            statement = await session.get(Statement, statement_id)
+            rules = await RecurringDetector(session, partial_success=False).detect(statement)
+
+        assert len(rules) == 1
+        rule = rules[0]
+        assert rule.occurrences == 10
+        assert rule.amount_min == Decimal("10.00")
+        assert rule.amount_max == Decimal("10.50")
+        # Robust to rounding — the formula target is 0.9512.
+        assert 0.94 <= rule.confidence <= 0.96, f"confidence {rule.confidence} not in [0.94, 0.96]"
+
+    @pytest.mark.asyncio
+    async def test_outlier_filtered_by_tolerance_creates_rule(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """An outlier is excluded by the ±15% band and the rule still qualifies.
+
+        Mirrors the spec's "outlier filtered" scenario:
+        4 occurrences at $10.00, $10.25, $10.50, $100.00.
+        The $100.00 row is outside the ±15% band on the
+        $10.375 full-group median; the 3 in-band rows have
+        median $10.25 and produce
+        ``confidence = (3/5) * (1.0 - 0.50/10.25) = 0.5707``.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            # 4 transactions: 3 in-band + 1 outlier.
+            for amount, txn_date in (
+                ("10.00", date(2026, 4, 1)),
+                ("10.25", date(2026, 5, 1)),
+                ("10.50", date(2026, 6, 1)),
+                ("100.00", date(2026, 6, 20)),  # outlier — > 11.93
+            ):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=txn_date,
+                )
+            await session.commit()
+
+            statement = await session.get(Statement, statement_id)
+            rules = await RecurringDetector(session, partial_success=False).detect(statement)
+
+        assert len(rules) == 1
+        rule = rules[0]
+        # Outlier excluded: only 3 in-band rows count.
+        assert rule.occurrences == 3
+        assert rule.amount_min == Decimal("10.00")
+        assert rule.amount_max == Decimal("10.50")
+        # 0.6 * 0.9512 = 0.5707 (4-decimal rounding).
+        assert abs(rule.confidence - 0.5707) < 0.001, (
+            f"confidence {rule.confidence} not within 0.001 of 0.5707"
+        )
+
+    @pytest.mark.asyncio
+    async def test_different_amount_range_creates_separate_rule(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Two amount ranges on the same merchant+currency+period produce two rules.
+
+        The upsert key includes ``amount_min`` and
+        ``amount_max``, so a $10.00-$10.50 monthly rule
+        and a $11.00-$11.50 monthly rule are two
+        separate rows. Uses two cards (same bank) so the
+        second ``detect()`` does not contaminate the
+        first's period window.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        bank_id = seeded_world["bank_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            # Second card on the same bank.
+            card_b = CreditCard(
+                bank_id=bank_id,
+                card_number_masked="XXXX XXXX XXXX 0002",
+                cardholder="AMOUNT RANGE USER",
+                currency="CLP",
+                is_active=True,
+            )
+            session.add(card_b)
+            await session.commit()
+            await session.refresh(card_b)
+            # Second statement for card B (period_end in
+            # the same window so the monthly pattern fits).
+            statement_b = Statement(
+                credit_card_id=card_b.id,
+                period_start=date(2026, 6, 1),
+                period_end=date(2026, 6, 30),
+                statement_date=date(2026, 6, 30),
+                file_path="/tmp/recurring-amount-range.pdf",
+                file_hash="a" * 64,
+                status=StatementStatus.COMPLETED,
+            )
+            session.add(statement_b)
+            await session.commit()
+            await session.refresh(statement_b)
+
+            # Card A (seeded): 3 monthly $10.00 transactions.
+            for d in (date(2026, 4, 1), date(2026, 5, 1), date(2026, 6, 1)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount="10.00",
+                    txn_date=d,
+                )
+            # Card B: 3 monthly $11.50 transactions.
+            for d in (date(2026, 4, 1), date(2026, 5, 1), date(2026, 6, 1)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_b.id,
+                    merchant_id=merchant_id,
+                    amount="11.50",
+                    txn_date=d,
+                )
+            await session.commit()
+
+            statement_a = await session.get(Statement, statement_id)
+            await RecurringDetector(session, partial_success=False).detect(statement_a)
+            statement_b_obj = await session.get(Statement, statement_b.id)
+            await RecurringDetector(session, partial_success=False).detect(statement_b_obj)
+
+            all_rules = (
+                (
+                    await session.execute(
+                        select(RecurringRule).where(RecurringRule.merchant_id == merchant_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert len(all_rules) == 2
+        ranges = sorted((r.amount_min, r.amount_max) for r in all_rules)
+        assert ranges == [
+            (Decimal("10.00"), Decimal("10.00")),
+            (Decimal("11.50"), Decimal("11.50")),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_different_period_creates_separate_rule(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Two periods on the same merchant+currency+amount produce two rules.
+
+        The upsert key includes ``period_days``, so a
+        monthly rule and a biweekly rule (same merchant,
+        same amount, same currency) are two separate
+        rows. The spec's "quarterly" example is not
+        reachable in a 90-day window with 3 in-band
+        occurrences (a quarterly cadence spans 180 days,
+        so only 2 fit in the window); biweekly (14-day
+        intervals) is the next-closest cadence that
+        exercises the same upsert-key separation.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        bank_id = seeded_world["bank_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            # Second card on the same bank.
+            card_b = CreditCard(
+                bank_id=bank_id,
+                card_number_masked="XXXX XXXX XXXX 0003",
+                cardholder="PERIOD RANGE USER",
+                currency="CLP",
+                is_active=True,
+            )
+            session.add(card_b)
+            await session.commit()
+            await session.refresh(card_b)
+            # Second statement for card B.
+            statement_b = Statement(
+                credit_card_id=card_b.id,
+                period_start=date(2026, 6, 1),
+                period_end=date(2026, 6, 30),
+                statement_date=date(2026, 6, 30),
+                file_path="/tmp/recurring-period-range.pdf",
+                file_hash="b" * 64,
+                status=StatementStatus.COMPLETED,
+            )
+            session.add(statement_b)
+            await session.commit()
+            await session.refresh(statement_b)
+
+            # Card A: 3 monthly $10.00 transactions.
+            for d in (date(2026, 4, 1), date(2026, 5, 1), date(2026, 6, 1)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount="10.00",
+                    txn_date=d,
+                )
+            # Card B: 3 biweekly $10.00 transactions.
+            for d in (date(2026, 6, 1), date(2026, 6, 15), date(2026, 6, 29)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_b.id,
+                    merchant_id=merchant_id,
+                    amount="10.00",
+                    txn_date=d,
+                )
+            await session.commit()
+
+            statement_a = await session.get(Statement, statement_id)
+            await RecurringDetector(session, partial_success=False).detect(statement_a)
+            statement_b_obj = await session.get(Statement, statement_b.id)
+            await RecurringDetector(session, partial_success=False).detect(statement_b_obj)
+
+            all_rules = (
+                (
+                    await session.execute(
+                        select(RecurringRule).where(RecurringRule.merchant_id == merchant_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert len(all_rules) == 2
+        by_label = {r.period_label: r for r in all_rules}
+        assert set(by_label.keys()) == {"monthly", "biweekly"}
+        assert by_label["monthly"].period_days == 30
+        assert by_label["biweekly"].period_days == 14
+
+    @pytest.mark.asyncio
+    async def test_same_day_occurrences_do_not_create_rule(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """3+ transactions on the same date do not produce a rule.
+
+        Same-day occurrences yield zero intervals
+        (``[0, 0]``), which the period classifier would
+        bucket as ``"weekly"`` with ``period_days=0`` —
+        a meaningless rule. The detector must skip the
+        group entirely and return ``[]``.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            for amount in ("10.00", "10.50", "11.00"):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=date(2026, 6, 1),  # all on the same date
+                )
+            await session.commit()
+
+            statement = await session.get(Statement, statement_id)
+            rules = await RecurringDetector(session, partial_success=False).detect(statement)
+
+        assert rules == []
 
 
 # ---------------------------------------------------------------------------
