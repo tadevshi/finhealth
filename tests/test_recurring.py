@@ -665,10 +665,14 @@ class TestRecurringDetectorAlgorithm:
 
         async with session_factory() as session:
             txns = (
-                await session.execute(
-                    select(Transaction).where(Transaction.statement_id == statement_id)
+                (
+                    await session.execute(
+                        select(Transaction).where(Transaction.statement_id == statement_id)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert all(t.recurring_rule_id == rule_id for t in txns)
 
     @pytest.mark.asyncio
@@ -1031,10 +1035,14 @@ class TestRecurringAPI:
         # historical link is preserved.
         async with session_factory() as session:
             txns = (
-                await session.execute(
-                    select(Transaction).where(Transaction.statement_id == statement.id)
+                (
+                    await session.execute(
+                        select(Transaction).where(Transaction.statement_id == statement.id)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert len(txns) == 5
             assert all(t.recurring_rule_id == rule_id for t in txns)
 
