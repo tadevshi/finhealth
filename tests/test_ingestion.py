@@ -3670,3 +3670,253 @@ class TestModuleHelpers:
         )
         result = _dedupe_transactions([a, b, c])
         assert result == [a]
+
+
+# ---------------------------------------------------------------------------
+# Recurring-detector integration (Phase 2 PR #5)
+# ---------------------------------------------------------------------------
+#
+# Phase 2 PR #5 wires the :class:`RecurringDetector` into
+# :meth:`IngestionService.ingest_statement` via a 6-LOC
+# additive change (the import + a defensive ``__init__``
+# field + a 1-line stash of ``failed_chunks`` inside
+# ``_run_chunked_extraction`` + a ``try/except`` detector
+# call after the commit + refresh). The tests below
+# exercise the four integration scenarios from the spec:
+#
+# * Full-success ingest → ``logger.info`` on the detector.
+# * Partial-success ingest → ``logger.warning`` on the
+#   detector (decision #7).
+# * Detector failure → does NOT fail the ingest (the
+#   ``try/except`` wrapper, design D2).
+# * Dedup early-return → the detector is NOT called
+#   (design E — the early return is at line 356, BEFORE
+#   the detector call site).
+#
+# The tests use the same single-chunk monkey-patch the
+# existing partial-failure tests use, so the LLM
+# chunker returns a single response and the per-call
+# ``failed_chunks`` count is the value the fake's
+# ``fail_on`` set produces.
+
+
+@needs_sample_pdfs
+@needs_test_rut
+class TestRecurringDetectorIntegration:
+    """``IngestionService.ingest_statement`` runs the recurring detector."""
+
+    @pytest.mark.asyncio
+    async def test_detector_logs_info_on_full_success(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A full-success ingest emits a ``logger.info`` from the detector.
+
+        The detector's log level is ``info`` when
+        ``failed_chunks == 0`` (decision #7). The test
+        captures both the detector's logger and the
+        orchestrator's so an info line from the
+        detector surfaces cleanly.
+        """
+        import logging
+
+        caplog.set_level(logging.INFO, logger="app.services.recurring_detection")
+
+        llm = FakeLLMClient(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
+        )
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+        assert statement.status == StatementStatus.COMPLETED
+
+        # The detector's completion line fires at INFO on
+        # a full-success ingest.
+        info_records = [
+            r
+            for r in caplog.records
+            if r.name == "app.services.recurring_detection"
+            and r.levelno == logging.INFO
+        ]
+        assert len(info_records) >= 1
+        assert any(
+            "Recurring detection complete" in r.getMessage() for r in info_records
+        )
+
+    @pytest.mark.asyncio
+    async def test_detector_logs_warning_on_partial_success(
+        self,
+        make_ingestion_service: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A partial-success ingest emits a ``logger.warning`` from the detector.
+
+        Decision #7: the detector's log level flips to
+        ``warning`` when ``failed_chunks > 0`` so an
+        operator can correlate a partial-success run
+        with the rule set the detector still produced.
+        """
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="app.services.recurring_detection")
+
+        from app.services.llm.schemas import LLMExtractionError
+
+        # Fail chunk 1 of 3-4; the orchestrator tolerates
+        # the partial failure and the statement still
+        # reaches ``status=COMPLETED`` with
+        # ``_last_failed_chunks = 1``.
+        llm = _FailOnNthChunk(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD),
+            fail_on={1},
+            exc=LLMExtractionError("chunk 2 outage"),
+        )
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+        assert statement.status == StatementStatus.COMPLETED
+
+        # The detector's completion line fires at WARNING
+        # on a partial-success ingest.
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.name == "app.services.recurring_detection"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(warning_records) >= 1
+        assert any(
+            "Recurring detection complete" in r.getMessage() for r in warning_records
+        )
+        assert any("partial-success" in r.getMessage() for r in warning_records)
+
+    @pytest.mark.asyncio
+    async def test_detector_failure_does_not_fail_ingest(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A detector exception is swallowed (design D2).
+
+        The detector is wrapped in a bare ``try/except``
+        so a DB error or unexpected payload during
+        detection does NOT fail the otherwise-successful
+        ingest. The orchestrator logs the exception via
+        :func:`logger.exception` and returns the
+        :class:`Statement` with ``status=COMPLETED``.
+        """
+        import logging
+
+        caplog.set_level(logging.ERROR, logger="app.services.ingestion")
+
+        # Patch the detector's ``detect`` to raise. The
+        # monkeypatch targets the source module, not the
+        # locally-bound reference inside
+        # :mod:`app.services.ingestion` (which the
+        # orchestrator imports at module load).
+        from app.services import recurring_detection
+
+        async def _raise(stmt: object) -> None:
+            raise RuntimeError("detector DB outage")
+
+        monkeypatch.setattr(
+            recurring_detection.RecurringDetector,
+            "detect",
+            _raise,
+        )
+
+        llm = FakeLLMClient(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
+        )
+        async with make_ingestion_service(llm) as service:
+            statement = await service.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        # The ingest still succeeded.
+        assert statement.status == StatementStatus.COMPLETED
+        # The exception was logged at exception level
+        # via ``logger.exception``.
+        error_records = [
+            r
+            for r in caplog.records
+            if r.name == "app.services.ingestion"
+            and r.levelno >= logging.ERROR
+        ]
+        assert any(
+            "Recurring detection failed" in r.getMessage() for r in error_records
+        )
+
+    @pytest.mark.asyncio
+    async def test_detector_not_called_on_dedup_early_return(
+        self,
+        make_ingestion_service: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The dedup early-return bypasses the detector (design E).
+
+        Re-uploading the same PDF for the same card
+        returns the existing statement at line 356,
+        BEFORE the detector call site. The detector is
+        never invoked — the second ingest is a no-op.
+        The test patches the detector's ``detect`` to
+        assert it is never called, mirroring the
+        production call path.
+        """
+        from app.services import recurring_detection
+
+        detect_calls: list[object] = []
+
+        original_detect = recurring_detection.RecurringDetector.detect
+
+        async def _count(self: object, stmt: object) -> object:  # type: ignore[no-untyped-def]
+            detect_calls.append(stmt)
+            return await original_detect(self, stmt)
+
+        monkeypatch.setattr(
+            recurring_detection.RecurringDetector,
+            "detect",
+            _count,
+        )
+
+        llm1 = FakeLLMClient(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
+        )
+        async with make_ingestion_service(llm1) as service1:
+            first = await service1.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+
+        # The first call ran the detector once.
+        assert len(detect_calls) == 1
+
+        # Second upload of the same PDF: dedup early-return
+        # at line 356, detector NOT called.
+        llm2 = FakeLLMClient(
+            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
+        )
+        async with make_ingestion_service(llm2) as service2:
+            second = await service2.ingest_statement(
+                file_path=SANTANDER_PDF,
+                bank_name="santander",
+                rut=TEST_RUT,
+            )
+        assert second.id == first.id
+        # Detector call count did NOT change — the
+        # second ingest was a no-op.
+        assert len(detect_calls) == 1

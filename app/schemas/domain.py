@@ -373,3 +373,67 @@ class MerchantAliasCreate(BaseModel):
             "server-side."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# RecurringRule
+# ---------------------------------------------------------------------------
+
+
+class RecurringRuleResponse(BaseModel):
+    """Shape returned when reading a :class:`app.models.recurring_rule.RecurringRule` row.
+
+    Returned by ``GET /api/v1/recurring`` (filtered to
+    ``is_active=True`` and ordered by ``last_seen_date``
+    descending) and by ``PATCH /api/v1/recurring/{id}``. The
+    ``confidence`` is a 0.0-1.0 score (decision #10) computed
+    by the detector from occurrence count and amount
+    consistency; ``period_label`` is the human-readable bucket
+    name (``weekly`` / ``biweekly`` / ``monthly`` / ``quarterly``
+    / ``yearly``) and ``period_days`` is the median interval
+    between consecutive in-band postings. The ``amount_min``
+    and ``amount_max`` define the in-band range the detector
+    matched against.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    merchant_id: uuid.UUID
+    period_label: str
+    period_days: int
+    amount_min: Decimal
+    amount_max: Decimal
+    currency: str
+    is_active: bool
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Detector's 0.0-1.0 confidence score (decision #10).",
+    )
+    last_seen_date: date_typ
+    occurrences: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class RecurringRuleUpdate(BaseModel):
+    """Body of the ``PATCH /api/v1/recurring/{id}`` endpoint.
+
+    The body carries a single ``is_active`` flag — the only
+    field the user can edit. Deactivating a rule preserves the
+    ``recurring_rule_id`` FK on existing transactions
+    (per design D) so the historical audit trail survives.
+    The endpoint returns 200 with the updated rule, or 404
+    if the UUID does not exist.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    is_active: bool = Field(
+        description=(
+            "Whether the rule is active. The detector's upsert path "
+            "ignores this flag, so a re-detected pattern always updates "
+            "the same row regardless of the active state."
+        ),
+    )

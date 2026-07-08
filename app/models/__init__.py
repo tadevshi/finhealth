@@ -21,6 +21,7 @@ from app.models.category import Category
 from app.models.credit_card import CreditCard
 from app.models.merchant import Merchant, MerchantAlias, MerchantAliasSource
 from app.models.mixins import TimestampMixin, UUIDMixin
+from app.models.recurring_rule import RecurringRule
 from app.models.statement import Statement, StatementStatus
 from app.models.transaction import Transaction
 
@@ -32,6 +33,7 @@ __all__ = [
     "Merchant",
     "MerchantAlias",
     "MerchantAliasSource",
+    "RecurringRule",
     "Statement",
     "StatementStatus",
     "TimestampMixin",
