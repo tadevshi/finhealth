@@ -133,9 +133,11 @@ class RecurringRule(UUIDMixin, TimestampMixin, Base):
         One-to-many relationship to :class:`Transaction`. Backed
         by ``Transaction.recurring_rule_ref``. ``noload`` so the
         default read path does not pay for the relationship the
-        v1 API does not expose; future endpoints that need the
-        list can opt in via ``await session.refresh(rule,
-        attribute_names=["transactions"])``.
+        v1 API does not expose. Future endpoints that need the
+        list must opt in at query time with
+        ``selectinload(RecurringRule.transactions)`` —
+        ``session.refresh`` does NOT override ``noload`` on
+        SQLAlchemy 2.0 and the relationship would stay empty.
     """
 
     __tablename__ = "recurring_rules"
@@ -161,10 +163,11 @@ class RecurringRule(UUIDMixin, TimestampMixin, Base):
     # default read path (``GET /api/v1/recurring``) does
     # not pay for a JOIN on ``merchants`` or a second
     # round-trip for ``transactions`` — neither is in the
-    # ``RecurringRuleResponse`` schema. Callers that need
-    # them can still opt in with an explicit
-    # ``await session.refresh(rule, ["merchant"])`` or
-    # ``selectinload(RecurringRule.transactions)``.
+    # ``RecurringRuleResponse`` schema. ``noload`` is
+    # stricter than ``select``: it ignores ``session.refresh``
+    # as well, so callers that need the relationship must
+    # opt in at query time with ``selectinload`` /
+    # ``joinedload``.
     merchant: Mapped[Merchant] = relationship(lazy="noload")
     transactions: Mapped[list[Transaction]] = relationship(
         back_populates="recurring_rule_ref",
