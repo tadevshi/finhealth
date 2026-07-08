@@ -131,11 +131,11 @@ class RecurringRule(UUIDMixin, TimestampMixin, Base):
         occurrence factor at 1.0.
     transactions:
         One-to-many relationship to :class:`Transaction`. Backed
-        by ``Transaction.recurring_rule_ref``. ``selectin`` load
-        so a list of rules can serialise its transactions in one
-        round-trip (defensive — the v1 API does not expose the
-        list, but the relationship is there for future
-        endpoints).
+        by ``Transaction.recurring_rule_ref``. ``noload`` so the
+        default read path does not pay for the relationship the
+        v1 API does not expose; future endpoints that need the
+        list can opt in via ``await session.refresh(rule,
+        attribute_names=["transactions"])``.
     """
 
     __tablename__ = "recurring_rules"

@@ -351,19 +351,22 @@ class RecurringDetector:
             (sorted_in_band[i + 1].date - sorted_in_band[i].date).days
             for i in range(len(sorted_in_band) - 1)
         ]
-        # A group of 3+ transactions on the same date has
-        # all-zero intervals — that yields ``median_interval=0``,
-        # which ``_classify_period`` would bucket as ``"weekly"``
-        # with ``period_days=0``. That is a meaningless rule
+        # A group where most or all transactions share the
+        # same date yields ``median_interval=0`` — pure
+        # same-day (intervals all zero) or majority same-day
+        # (e.g. 3 on day D + 1 on day D+30 → intervals
+        # ``[0, 0, 30]`` → median 0). ``_classify_period``
+        # would bucket 0 as ``"weekly"`` with
+        # ``period_days=0``, which is a meaningless rule
         # (a zero-day cadence is not a subscription), so we
-        # skip the rule entirely. The same skip applies when
-        # ``intervals`` is empty (defensive — at this point
-        # ``in_band`` has at least 3 rows, so ``intervals``
-        # always has at least 2 entries in practice, but the
-        # guard keeps the function honest).
-        if not intervals or all(i == 0 for i in intervals):
-            return None
+        # skip the rule entirely in that case. The
+        # ``len(in_band) >= MIN_OCCURRENCES`` precondition
+        # above guarantees ``intervals`` has at least 2
+        # entries, so ``statistics.median`` is always
+        # well-defined here.
         median_interval = round(statistics.median(intervals))
+        if median_interval == 0:
+            return None
         period_label, period_days = self._classify_period(median_interval)
 
         # Use the *in-band* amount bounds (not the
