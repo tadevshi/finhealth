@@ -37,9 +37,9 @@ Finhealth detects every line-item in a bank statement, but the user still has to
 - **WHEN** `ingest_statement` hits the dedup early return
 - **THEN** `RecurringDetector.detect` is NOT called (the early return is BEFORE the detector call, per design E)
 
-### Requirement: Detection Algorithm Scans Last 90 Days and Groups by `(credit_card_id, merchant_id, currency)`
+### Requirement: Detection Algorithm Scans Last 90 Days and Groups by `(merchant_id, currency)`
 
-The detector MUST scan `Transaction` rows on the same `credit_card_id` as the just-ingested statement, restricted to `date >= statement.period_end - 90 days`, where `installment_number IS NULL`. Rows MUST be grouped by `(credit_card_id, merchant_id, currency)`. Rows with `merchant_id IS NULL` MUST be excluded. The grouping is per credit card so a recurring charge on one card does not affect another card's pattern. (Design E)
+The detector MUST scan `Transaction` rows on the same `credit_card_id` as the just-ingested statement, restricted to `date >= statement.period_end - 90 days`, where `installment_number IS NULL`. Rows MUST be grouped by `(merchant_id, currency)`. The detector scans on the same `credit_card_id` as the just-ingested statement, so the per-card scope is enforced by the scan filter, not by the grouping key. Rows with `merchant_id IS NULL` MUST be excluded. (Design E)
 
 #### Scenario: 90-day window excludes older occurrences
 
@@ -58,12 +58,6 @@ The detector MUST scan `Transaction` rows on the same `credit_card_id` as the ju
 - **GIVEN** MCDONALDS has 3 occurrences in USD and 3 occurrences in CLP within 90 days
 - **WHEN** the detector runs
 - **THEN** two separate rules are created (one per `(merchant_id, currency)`)
-
-#### Scenario: Same merchant + currency on two different cards produces two rules
-
-- **GIVEN** MCDONALDS USD has 3 occurrences on credit card A and 3 occurrences on credit card B within 90 days
-- **WHEN** the detector runs
-- **THEN** two separate rules are created (one per `(credit_card_id, merchant_id, currency)`) — the patterns are per-card and do not interfere
 
 ### Requirement: Pattern Detection Requires ≥3 Occurrences and ±15% Amount Tolerance
 
@@ -145,9 +139,9 @@ The detector MUST classify the cadence from the median interval between consecut
 
 #### Scenario: An outlier is filtered out by the ±15% tolerance and does not tank confidence
 
-- **GIVEN** a group with 3 occurrences at $10.00, $10.50, $100.00
+- **GIVEN** a group with 4 occurrences at $10.00, $10.25, $10.50, $100.00
 - **WHEN** the detector runs
-- **THEN** the $100.00 row is excluded by the ±15% tolerance; the in-band $0.50 range on a $10.25 median yields `confidence ≈ 0.6 * 0.951 ≈ 0.571` (positive, not zero — the outlier is filtered before confidence is computed)
+- **THEN** the $100.00 row is excluded by the ±15% tolerance on the $10.375 full-group median (band [8.82, 11.93]); the 3 in-band rows have median $10.25, yielding `confidence = (3/5) * (1.0 - 0.50/10.25) ≈ 0.6 * 0.951 ≈ 0.5707` (positive, not zero — the outlier is filtered before confidence is computed)
 
 ### Requirement: Upsert Is Idempotent by `(merchant_id, amount_min, amount_max, currency, period_days)`
 
