@@ -89,3 +89,42 @@ s                                                                        [100%]
 Skips cleanly without `TEST_RUT` (the `needs_test_rut` marker is the
 first guard to fire; the `needs_sample_pdf` marker would also skip
 in environments without the gitignored sample PDF).
+
+## Gate-Correction Pass (sdd-verify → sdd-apply re-run)
+
+After the first apply pass, `sdd-verify` caught a latent data bug
+in the test that would fail the assertion at line 503 when run with
+`TEST_RUT`. Re-ran `sdd-apply` with the corrective fix.
+
+### Task 4: `fix(test): correct LIDER_CANNED_DATE in test_e2e_phase2`
+
+- **Commit:** `71e0955`
+- **Files changed:** `tests/test_e2e_phase2.py` (+9 / -8),
+  `openspec/changes/phase-2-pr6-docs-e2e/verify-report.md` (+12 / -3)
+- **What:** Changed `LIDER_CANNED_DATE = date(2026, 4, 15)` →
+  `date(2026, 4, 5)` and rewrote the comment block to call out the
+  PARIS-vs-LIDER distinction. The canned LIDER row in
+  `CANNED_NACIONAL_EXTRACTION` is dated `"05/04/26"` = 2026-04-05;
+  the previous value (2026-04-15) was the PARIS row date.
+  Updated `verify-report.md` to reflect the corrected state
+  (status now notes the gate correction; math walk-through
+  included).
+- **Math:** with the fix, pre-seeded + canned LIDER dates = 
+  [2026-02-04, 2026-03-06, 2026-04-05]; intervals = [30, 30];
+  median = 30.0; `period_days = 30` — line 503 assertion passes.
+- **Verified:** `ruff check` and `ruff format --check` clean;
+  `pytest tests/test_e2e_phase2.py` skips cleanly (1 skipped,
+  no `TEST_RUT`); `pytest tests/ --ignore=tests/test_llm_services.py`
+  = 340 passed, 74 skipped.
+
+## Updated Diff Stats (after gate correction)
+
+```
+ README.md                                          |  94 +++-
+ .../changes/phase-2-pr6-docs-e2e/apply-progress.md | 113 +++++
+ .../changes/phase-2-pr6-docs-e2e/verify-report.md  |  30 +++
+ tests/test_e2e_phase2.py                           | 562 +++++++++++++++++++++
+ 4 files changed, 793 insertions(+), 6 deletions(-)
+```
+
+Still under the 800-line review budget.
