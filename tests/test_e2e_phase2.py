@@ -175,14 +175,15 @@ CANNED_NACIONAL_EXTRACTION: dict[str, object] = {
 # Phase 2 historical anchor
 # ---------------------------------------------------------------------------
 
-#: The canned LIDER row is dated 2026-04-15. The detector scans
-#: the 90 days before the new statement's period_end
-#: (2026-04-30 → cutoff 2026-01-30), so the pre-seeded
-#: historical LIDER transactions at -60d and -30d from the
-#: canned row all fall inside the window. Intervals are 30
-#: days each, so the detector classifies the cadence as
-#: ``monthly``.
-LIDER_CANNED_DATE = date(2026, 4, 15)
+#: The canned LIDER row in ``CANNED_NACIONAL_EXTRACTION`` is
+#: dated ``"05/04/26"`` = **2026-04-05** (NOT 2026-04-15, which
+#: is the PARIS row). The detector scans the 90 days before the
+#: new statement's period_end (2026-04-30 → cutoff 2026-01-30),
+#: so the pre-seeded historical LIDER transactions at -60d and
+#: -30d from the canned row all fall inside the window.
+#: Intervals are 30 days each, so the detector classifies the
+#: cadence as ``monthly``.
+LIDER_CANNED_DATE = date(2026, 4, 5)
 
 
 # ---------------------------------------------------------------------------
