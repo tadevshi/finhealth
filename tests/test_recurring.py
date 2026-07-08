@@ -896,9 +896,14 @@ class TestRecurringDetectorAlgorithm:
         Mirrors the spec's "outlier filtered" scenario:
         4 occurrences at $10.00, $10.25, $10.50, $100.00.
         The $100.00 row is outside the ±15% band on the
-        $10.375 full-group median; the 3 in-band rows have
-        median $10.25 and produce
-        ``confidence = (3/5) * (1.0 - 0.50/10.25) = 0.5707``.
+        $10.375 full-group median; the 3 in-band rows span
+        $10.00-$10.50 and the formula uses the full-group
+        median, producing
+        ``confidence = (3/5) * (1.0 - 0.50/10.375) = 0.5711``
+        (rounded to 4 decimals). The tight tolerance
+        (``< 0.0001``) locks the full-group median choice —
+        switching to the in-band subset median would yield
+        ``0.5707`` and fail this assertion.
         """
         statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
         merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
@@ -928,9 +933,11 @@ class TestRecurringDetectorAlgorithm:
         assert rule.occurrences == 3
         assert rule.amount_min == Decimal("10.00")
         assert rule.amount_max == Decimal("10.50")
-        # 0.6 * 0.9512 = 0.5707 (4-decimal rounding).
-        assert abs(rule.confidence - 0.5707) < 0.001, (
-            f"confidence {rule.confidence} not within 0.001 of 0.5707"
+        # 0.6 * (1.0 - 0.50/10.375) = 0.6 * 0.95181 = 0.5711
+        # (4-decimal rounding). Tight tolerance locks the
+        # full-group median choice.
+        assert abs(rule.confidence - 0.5711) < 0.0001, (
+            f"confidence {rule.confidence} not within 0.0001 of 0.5711"
         )
 
     @pytest.mark.asyncio

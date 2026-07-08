@@ -141,7 +141,7 @@ The detector MUST classify the cadence from the median interval between consecut
 
 - **GIVEN** a group with 4 occurrences at $10.00, $10.25, $10.50, $100.00
 - **WHEN** the detector runs
-- **THEN** the $100.00 row is excluded by the ±15% tolerance on the $10.375 full-group median (band [8.82, 11.93]); the 3 in-band rows have median $10.25, yielding `confidence = (3/5) * (1.0 - 0.50/10.25) ≈ 0.6 * 0.951 ≈ 0.5707` (positive, not zero — the outlier is filtered before confidence is computed)
+- **THEN** the $100.00 row is excluded by the ±15% tolerance on the $10.375 full-group median (band [8.82, 11.93]); the 3 in-band rows span $10.00–$10.50, yielding `confidence = (3/5) * (1.0 - 0.50/10.375) ≈ 0.6 * 0.952 ≈ 0.5711` (positive, not zero — the outlier is filtered before confidence is computed; the formula uses the **full-group** median as the band anchor, not the in-band subset median)
 
 ### Requirement: Upsert Is Idempotent by `(merchant_id, amount_min, amount_max, currency, period_days)`
 
