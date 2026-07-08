@@ -4,10 +4,13 @@ A personal financial analyzer and spend control. Self-hosted, single-user,
 opinionated: ingest bank statement PDFs, parse them with LLMs, and surface where
 the money actually goes.
 
-> **Status:** Phase 1 — PDF ingestion with LLM extraction is live. Upload a
-> Chilean bank statement (Santander, Itaú, Banco de Chile), the LLM extracts
-> every line item, and the transactions list page lets you filter and tag.
-> Categorization rules and the spend dashboard land in Phase 2+.
+> **Status:** Phase 1 + Phase 2 are live. PDF ingestion with LLM extraction,
+> closed-set categorization, merchant resolution, and deterministic
+> recurring-transaction detection ship together. Upload a Chilean bank
+> statement (Santander, Itaú, Banco de Chile), the pipeline categorises
+> every line item, binds it to a canonical merchant, and flags recurring
+> patterns (subscriptions, utility bills, monthly groceries). The spend
+> dashboard lands in Phase 3+.
 
 ---
 
@@ -38,10 +41,65 @@ the money actually goes.
   `ruff format`) wired in `pyproject.toml`
 - **Test suite** with `pytest`, `pytest-asyncio`, and coverage
 
+### Available now (Phase 2 — Classification, Merchant Resolution & Recurring Detection)
+
+- **Closed-set LLM categorization** (`phase2-categories`,
+  [spec](openspec/specs/phase2-categories/spec.md)) — the ingestion
+  pipeline tells the LLM to emit one of 12 seeded Y-NAB category
+  names verbatim, resolves the emitted string against the seed
+  in a single SELECT + in-memory dict cache, and stamps the
+  ``category_id`` FK + ``low_confidence=False`` on every hit.
+  A miss keeps the LLM string with ``low_confidence=True`` so
+  the user can re-tag the row by hand via the existing
+  ``PATCH /api/v1/transactions/{id}`` endpoint. The
+  ``POST /api/v1/categories/{id}`` rename endpoint propagates
+  the change to every transaction's denormalized ``category``
+  string atomically (single ``commit()`` covers the Category
+  UPDATE + the cascade UPDATE on ``transactions``); a name
+  collision is rejected with 422 *before* any write.
+- **Merchant resolution & aliasing** (`phase2-merchant-aliasing`,
+  [spec](openspec/specs/phase2-merchant-aliasing/spec.md)) — the
+  deterministic normaliser in
+  :mod:`app.services.merchants` strips Chilean legal-entity
+  suffixes (``S.A.``, ``S.A.C.``, ``SpA``), branch identifiers
+  (``SUC 12``, ``COM 3``), punctuation, and diacritics so two
+  bank descriptions that refer to the same merchant land on the
+  same canonical key. The :class:`MerchantNormalizer` does an
+  alias-table hit-or-create: ~80% of the way is covered by
+  :data:`KNOWN_MERCHANT_PATTERNS` (12 hardcoded canonical
+  merchants → seeded categories); the remaining 20% auto-create
+  a :class:`Merchant` row on first sight and bind the bank
+  description as a ``MerchantAlias`` with ``source='auto'``.
+  The user can extend the table via
+  ``POST /api/v1/merchants/{id}/aliases``; the canonical
+  ``normalized`` form is computed server-side and the row is
+  stamped ``source='user'``.
+- **Deterministic recurring-transaction detection**
+  (`phase2-recurring-detection`,
+  [spec](openspec/changes/phase-2-pr5-recurring-detection/specs/phase2-recurring-detection/spec.md)
+  — will live at `openspec/specs/phase2-recurring-detection/spec.md`
+  after PR #5's archive step) — :class:`RecurringDetector`
+  runs at the end of every successful ingest. It scans the
+  last 90 days of transactions on the same ``credit_card_id``,
+  groups by ``(merchant_id, currency)``, drops amounts
+  outside the ±15% median band, and requires ≥3 in-band
+  occurrences to qualify. The median interval between
+  consecutive in-band dates drives the period label
+  (``weekly`` / ``biweekly`` / ``monthly`` / ``quarterly`` /
+  ``yearly``); a 0.0–1.0 ``confidence`` score combines an
+  occurrence-count factor with an amount-consistency factor
+  (``min(1.0, occurrences/5) * (1.0 - (max-min)/median)``,
+  rounded to 4 decimals). The detector upserts by a composite
+  key ``(merchant_id, amount_min, amount_max, currency,
+  period_days)`` and back-fills the ``recurring_rule_id`` FK
+  on the just-ingested statement's transactions in the same
+  ``commit()``. The user toggles a rule's visibility via
+  ``PATCH /api/v1/recurring/{id}`` with ``{"is_active":
+  false}``; the FK is preserved on deactivation (design D)
+  so the historical audit trail survives.
+
 ### Coming next
 
-- **Phase 2 — Classification:** automatic spend categories, merchant alias
-  map, recurring-transaction detection
 - **Phase 3 — Dashboard:** charts, monthly trends, anomaly flags
 - **Phase 4 — Insights:** budgeting rules, alerts, exports
 
@@ -149,6 +207,12 @@ The server listens on `http://127.0.0.1:8000` by default.
 | GET    | `/api/v1/statements/{statement_id}`   | Read a single statement (with transactions)   |
 | GET    | `/api/v1/transactions`                | List transactions with filters                |
 | PATCH  | `/api/v1/transactions/{transaction_id}` | Update a single transaction's category      |
+| GET    | `/api/v1/categories`                  | List the 12 closed-set Y-NAB categories (PR #2) |
+| POST   | `/api/v1/categories/{id}`             | Rename a category + propagate to its transactions (PR #2) |
+| GET    | `/api/v1/merchants`                   | List canonical merchants (PR #4)              |
+| POST   | `/api/v1/merchants/{id}/aliases`      | Bind a user-supplied alias to a merchant (PR #4) |
+| GET    | `/api/v1/recurring`                   | List active recurring-transaction rules, freshest first (PR #5) |
+| PATCH  | `/api/v1/recurring/{id}`              | Activate or deactivate a recurring rule (PR #5) |
 
 ### Quick health check
 
@@ -281,6 +345,24 @@ alembic current
 # Show migration history
 alembic history
 ```
+
+The migration history is small and intentionally append-only:
+
+| Revision                                            | Phase | Purpose                                                              |
+| --------------------------------------------------- | ----- | -------------------------------------------------------------------- |
+| `0001_initial`                                      | 1     | Initial schema (banks, credit cards, statements, transactions)        |
+| `0002_phase1_ingestion`                             | 1     | Phase 1 ingestion columns + indexes                                  |
+| `0003_statement_error_message`                      | 1     | Surface ingestion failures on the statement row                      |
+| `0004_timestamp_server_defaults`                    | 1     | Server-side `CURRENT_TIMESTAMP` defaults for `created_at`/`updated_at` |
+| `0005_phase2_categories`                            | 2     | `categories` table + seed of 12 Y-NAB rows; `category_id` FK on `transactions` |
+| `0006_phase2_merchants_transactions_alter`          | 2     | `merchants` + `merchant_aliases` tables; `merchant_id` FK + `low_confidence` on `transactions` |
+| `0007_phase2_recurring_rules`                       | 2     | `recurring_rules` table; `recurring_rule_id` FK on `transactions`    |
+
+`alembic upgrade head` runs all seven in order and is invoked
+automatically on every container start (see
+[Docker deployment](#docker-deployment) below), so a fresh
+clone + `docker compose up` is enough to land on the latest
+schema with no manual steps.
 
 ### Pre-commit hooks (optional)
 
