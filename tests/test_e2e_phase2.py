@@ -142,7 +142,7 @@ CANNED_NACIONAL_EXTRACTION: dict[str, object] = {
             "description": "COMBUSTIBLE COPEC",
             "amount": "$ 35.000",
             "currency": "CLP",
-            "category": "Transport",
+            "category": "Transportation",
             "installment_number": None,
             "installment_total": None,
             "installment_value": None,
@@ -287,7 +287,7 @@ async def phase2_world(
     canned row hits the alias table, and 1 historical statement
     with 2 historical LIDER transactions on the same
     ``credit_card_id`` dated 60 and 30 days back from the
-    canned LIDER row (2026-04-15). The historical rows push the
+    canned LIDER row (2026-04-05). The historical rows push the
     detector's occurrence count over the 3-row threshold when
     the canned 3rd LIDER row arrives via the upload.
     """
@@ -485,7 +485,7 @@ async def test_phase2_happy_path_end_to_end(
             assert lider_txn.merchant_id == lider_id
             assert lider_txn.category_id == groceries_id
             assert lider_txn.category == "Groceries"
-            assert copec_txn.category == "Transport"
+            assert copec_txn.category == "Transportation"
             assert paris_txn.category == "Shopping"
             # The detector back-filled the FK on the LIDER row only.
             assert lider_txn.recurring_rule_id is not None

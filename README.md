@@ -88,7 +88,7 @@ the money actually goes.
   (``weekly`` / ``biweekly`` / ``monthly`` / ``quarterly`` /
   ``yearly``); a 0.0–1.0 ``confidence`` score combines an
   occurrence-count factor with an amount-consistency factor
-  (``min(1.0, occurrences/5) * (1.0 - (max-min)/median)``,
+  (``min(1.0, occurrences/5) * max(0.0, 1.0 - (max-min)/median)``,
   rounded to 4 decimals). The detector upserts by a composite
   key ``(merchant_id, amount_min, amount_max, currency,
   period_days)`` and back-fills the ``recurring_rule_id`` FK
@@ -354,8 +354,8 @@ The migration history is small and intentionally append-only:
 | `0002_phase1_ingestion`                             | 1     | Phase 1 ingestion columns + indexes                                  |
 | `0003_statement_error_message`                      | 1     | Surface ingestion failures on the statement row                      |
 | `0004_timestamp_server_defaults`                    | 1     | Server-side `CURRENT_TIMESTAMP` defaults for `created_at`/`updated_at` |
-| `0005_phase2_categories`                            | 2     | `categories` table + seed of 12 Y-NAB rows; `category_id` FK on `transactions` |
-| `0006_phase2_merchants_transactions_alter`          | 2     | `merchants` + `merchant_aliases` tables; `merchant_id` FK + `low_confidence` on `transactions` |
+| `0005_phase2_categories`                            | 2     | `categories` table + seed of 12 Y-NAB rows |
+| `0006_phase2_merchants_transactions_alter`          | 2     | `merchants` + `merchant_aliases` tables; `category_id` + `merchant_id` FKs + `low_confidence` on `transactions` |
 | `0007_phase2_recurring_rules`                       | 2     | `recurring_rules` table; `recurring_rule_id` FK on `transactions`    |
 
 `alembic upgrade head` runs all seven in order and is invoked
