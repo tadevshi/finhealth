@@ -19,8 +19,9 @@ magazine at $24.99 quarterly — produce two rules with the
 same ``merchant_id`` but different ``amount_*`` / ``period_days``
 columns. Keeping the amount bounds on the rule row (instead of
 computing them on the fly) makes the upsert path a single
-``SELECT`` on a unique composite index and makes the rule
-self-describing for the API consumer.
+``SELECT`` against the ``uq_recurring_rules_upsert_key``
+UNIQUE constraint and makes the rule self-describing for the
+API consumer.
 
 Why a real ``confidence`` column
 --------------------------------
@@ -56,7 +57,7 @@ from datetime import date as date_typ
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Date, Float, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Boolean, Date, Float, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -77,9 +78,15 @@ class RecurringRule(UUIDMixin, TimestampMixin, Base):
     same pattern updates the existing row (increments
     ``occurrences``, recomputes ``confidence``, bumps
     ``last_seen_date``) instead of inserting a new one. The
-    composite is enforced by the
-    ``ix_recurring_rules_merchant_currency_period`` index in
-    migration 0007.
+    composite is enforced at the database layer by the
+    ``uq_recurring_rules_upsert_key`` UNIQUE constraint
+    (migration 0008) — a concurrent detector run on the same
+    pattern is now caught at flush as ``IntegrityError``
+    instead of silently inserting a duplicate. The
+    ``ix_recurring_rules_merchant_currency_period`` index
+    (migration 0007) is kept alongside for read-side queries
+    that filter on ``(merchant_id, currency, period_days)``
+    alone.
 
     Attributes
     ----------
@@ -141,6 +148,17 @@ class RecurringRule(UUIDMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "recurring_rules"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "merchant_id",
+            "amount_min",
+            "amount_max",
+            "currency",
+            "period_days",
+            name="uq_recurring_rules_upsert_key",
+        ),
+    )
 
     merchant_id: Mapped[uuid.UUID] = mapped_column(
         UUIDType(),
