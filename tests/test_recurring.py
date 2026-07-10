@@ -52,6 +52,7 @@ from app.main import create_app
 from app.models import Bank, CreditCard, Merchant, RecurringRule, Statement, Transaction
 from app.models.base import Base
 from app.models.statement import StatementStatus
+from app.schemas.domain import RecurringRuleResponse
 from app.services.recurring_detection import (
     RecurringDetector,
 )
@@ -1482,6 +1483,92 @@ class TestRecurringAPI:
         )
         assert response.status_code == 404
         assert str(unknown_id) in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# RecurringRuleResponse — NaN/inf sanitization (PR #7)
+# ---------------------------------------------------------------------------
+#
+# ``RecurringRuleResponse.confidence`` is bounded by
+# ``Field(ge=0.0, le=1.0)``. The detector's algorithm never
+# produces non-finite values today, but a future bug or a
+# corrupt database row must not crash the API surface. The
+# ``_sanitize_confidence`` ``field_validator(mode="before")``
+# coerces ``NaN`` / ``+inf`` / ``-inf`` to ``0.0`` so the
+# bound check downstream passes. Finite values are passed
+# through unchanged; finite out-of-range values still raise
+# ``ValidationError`` (the bound check is the final authority).
+
+
+def _response_kwargs(confidence: float) -> dict[str, object]:
+    """Build the minimal kwargs for a valid ``RecurringRuleResponse``.
+
+    Centralised so the four new tests stay one-liners focused
+    on the field under test. ``confidence`` is the only field
+    that varies across the cases.
+    """
+    return {
+        "id": uuid.uuid4(),
+        "merchant_id": uuid.uuid4(),
+        "period_label": "monthly",
+        "period_days": 30,
+        "amount_min": Decimal("9.99"),
+        "amount_max": Decimal("9.99"),
+        "currency": "USD",
+        "is_active": True,
+        "last_seen_date": date(2026, 5, 15),
+        "occurrences": 3,
+        "created_at": datetime(2026, 5, 15, 0, 0, 0),
+        "updated_at": datetime(2026, 5, 15, 0, 0, 0),
+        "confidence": confidence,
+    }
+
+
+def test_confidence_nan_coerces_to_zero() -> None:
+    """``NaN`` confidence coerces to ``0.0`` instead of raising."""
+    response = RecurringRuleResponse(**_response_kwargs(float("nan")))
+    assert response.confidence == 0.0
+
+
+def test_confidence_positive_infinity_coerces_to_zero() -> None:
+    """``+inf`` confidence coerces to ``0.0`` instead of raising."""
+    response = RecurringRuleResponse(**_response_kwargs(float("inf")))
+    assert response.confidence == 0.0
+
+
+def test_confidence_negative_infinity_coerces_to_zero() -> None:
+    """``-inf`` confidence coerces to ``0.0`` instead of raising."""
+    response = RecurringRuleResponse(**_response_kwargs(float("-inf")))
+    assert response.confidence == 0.0
+
+
+def test_confidence_finite_in_range_passes_through() -> None:
+    """Finite, in-bounds confidence passes through unchanged.
+
+    The validator is a no-op for finite values — the bound
+    check is Pydantic's job. This is the "happy path" guard
+    so a future refactor of the validator does not regress
+    normal data.
+    """
+    response = RecurringRuleResponse(**_response_kwargs(0.42))
+    assert response.confidence == 0.42
+
+
+def test_confidence_finite_out_of_range_raises() -> None:
+    """Finite out-of-range confidence still raises ``ValidationError``.
+
+    The sanitization is *only* for non-finite values. Finite
+    values above ``1.0`` or below ``0.0`` are the
+    ``Field(ge=0.0, le=1.0)`` constraint's job — the
+    validator must not silently clamp them, because a real
+    data bug deserves a loud failure.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        RecurringRuleResponse(**_response_kwargs(1.5))
+    with pytest.raises(ValidationError):
+        RecurringRuleResponse(**_response_kwargs(-0.1))
 
 
 # ---------------------------------------------------------------------------

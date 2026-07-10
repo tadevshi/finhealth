@@ -640,8 +640,7 @@ def test_alembic_seeds_create_recurring_rules_table(
     assert "recurring_rule_id" in transactions_columns
     transactions_indexes = inspector.get_indexes("transactions")
     assert any(
-        idx["name"] == "ix_transactions_recurring_rule_id"
-        for idx in transactions_indexes
+        idx["name"] == "ix_transactions_recurring_rule_id" for idx in transactions_indexes
     ), f"ix_transactions_recurring_rule_id should exist, got {transactions_indexes}"
 
 
@@ -727,6 +726,347 @@ def test_alembic_transactions_round_trip_recurring_rule_id(
     assert str(with_rule[0]) == "77777777-7777-7777-7777-777777777777"
     assert without_rule is not None
     assert without_rule[0] is None
+
+
+# ---------------------------------------------------------------------------
+# Migration 0008 — ``recurring_rules`` UNIQUE upsert key + dedup
+# ---------------------------------------------------------------------------
+#
+# Phase 2 PR #7 closes the concurrent-insert race on the
+# detector's SELECT-then-INSERT upsert path by adding a
+# UNIQUE constraint on the 5-column upsert key. The
+# migration's ``upgrade()`` also runs a defensive dedup
+# step that keeps the row with the highest ``confidence``
+# (tie-break: max ``last_seen_date``) for each duplicate
+# group, bumping the keeper's ``last_seen_date`` to the
+# group's max. The two tests below prove both halves.
+
+
+def test_alembic_seeds_create_unique_upsert_key(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """Migration 0008 creates the ``uq_recurring_rules_upsert_key`` UNIQUE constraint.
+
+    The PR #7 portion of migration 0008 is the new
+    UNIQUE constraint on the 5-column upsert key. The
+    test asserts the constraint is present on the live
+    schema after ``upgrade head``, named exactly
+    ``uq_recurring_rules_upsert_key`` and covering
+    ``(merchant_id, amount_min, amount_max, currency,
+    period_days)``. The pre-existing 3-column
+    ``ix_recurring_rules_merchant_currency_period``
+    index is also asserted to be preserved (read-side
+    queries still need it).
+    """
+    alembic_upgrade(alembic_config, "head")
+    inspector = inspect(sync_engine)
+
+    # The 5-column UNIQUE constraint exists on the
+    # upsert key. ``inspect.get_unique_constraints``
+    # returns the constraint metadata including the
+    # column list, so we can assert both name and
+    # column order match the migration.
+    rule_uniques = inspector.get_unique_constraints("recurring_rules")
+    matching = [
+        u
+        for u in rule_uniques
+        if u["name"] == "uq_recurring_rules_upsert_key"
+        and tuple(u["column_names"])
+        == ("merchant_id", "amount_min", "amount_max", "currency", "period_days")
+    ]
+    assert matching, (
+        f"uq_recurring_rules_upsert_key on the 5-tuple should exist, got {rule_uniques}"
+    )
+
+    # The 3-column read-side index from migration 0007
+    # is preserved (the migration's docstring promises
+    # not to drop it).
+    rule_indexes = inspector.get_indexes("recurring_rules")
+    assert any(
+        idx["name"] == "ix_recurring_rules_merchant_currency_period"
+        and tuple(idx["column_names"]) == ("merchant_id", "currency", "period_days")
+        for idx in rule_indexes
+    ), f"ix_recurring_rules_merchant_currency_period should still exist, got {rule_indexes}"
+
+    # The unique constraint is actually enforced —
+    # a second INSERT with the same 5-tuple raises
+    # ``IntegrityError`` at flush. This is the
+    # concurrent-insert race guard the constraint
+    # exists to provide.
+    with sync_engine.begin() as conn:
+        # Seed a merchant (FK target) so the INSERT
+        # can succeed the FK check before hitting
+        # the UNIQUE check.
+        conn.exec_driver_sql(
+            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
+            "VALUES ('88888888-8888-8888-8888-888888888888', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, 'dedup_test_merchant', 1)"
+        )
+        # First INSERT — succeeds.
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            "'88888888-1111-1111-1111-888888888881', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, '88888888-8888-8888-8888-888888888888', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.8, '2026-05-01', 3)"
+        )
+
+    # Second INSERT with the same 5-tuple but a
+    # different id — must raise IntegrityError.
+    from sqlalchemy.exc import IntegrityError
+
+    with pytest.raises(IntegrityError), sync_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            "'88888888-1111-1111-1111-888888888882', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, '88888888-8888-8888-8888-888888888888', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.7, '2026-05-02', 3)"
+        )
+
+
+def test_alembic_recurring_rules_dedup_on_unique_upgrade(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """Migration 0008 dedups existing rows before adding the UNIQUE constraint.
+
+    Three rows are seeded with the same upsert-key
+    5-tuple but different ``confidence`` and
+    ``last_seen_date`` values. Running ``upgrade head``
+    must dedup to a single row:
+
+    * The survivor is the row with the highest
+      ``confidence`` (0.9 in the example).
+    * The survivor's ``last_seen_date`` is set to
+      ``max(last_seen_date)`` across the group
+      (2026-05-20 in the example — the value from
+      the 0.5-confidence row, which had the most
+      recent seen-date).
+
+    This matches the spec scenario for
+    "Duplicate rows are deduplicated on upgrade".
+    """
+    # Upgrade to 0007 first so we can seed dupes
+    # without tripping the UNIQUE constraint that
+    # 0008 introduces.
+    alembic_upgrade(alembic_config, "0007_phase2_recurring_rules")
+
+    with sync_engine.begin() as conn:
+        # Seed the merchant FK target.
+        conn.exec_driver_sql(
+            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
+            "VALUES ('99999999-9999-9999-9999-999999999999', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, 'dedup_race_merchant', 1)"
+        )
+        # Three duplicate rows: same upsert key
+        # (merchant_id, amount_min, amount_max,
+        # currency, period_days) but different
+        # confidence + last_seen_date.
+        # - 0.7 confidence, seen 2026-05-01
+        # - 0.9 confidence, seen 2026-05-15  <- max confidence → keeper
+        # - 0.5 confidence, seen 2026-05-20  <- max last_seen → tie-break
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            "'99999999-0001-0001-0001-999999999991', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, '99999999-9999-9999-9999-999999999999', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.7, '2026-05-01', 3)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            "'99999999-0002-0002-0002-999999999992', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, '99999999-9999-9999-9999-999999999999', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.9, '2026-05-15', 3)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            "'99999999-0003-0003-0003-999999999993', CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, '99999999-9999-9999-9999-999999999999', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.5, '2026-05-20', 3)"
+        )
+
+    # Run the dedup-bearing migration. 0008's
+    # upgrade() dedups BEFORE adding the UNIQUE
+    # constraint, so the test is meaningful.
+    alembic_upgrade(alembic_config, "head")
+
+    # Exactly one row remains.
+    with sync_engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT id, confidence, last_seen_date FROM recurring_rules "
+            "WHERE merchant_id = '99999999-9999-9999-9999-999999999999'"
+        ).fetchall()
+
+    assert len(rows) == 1, f"Expected 1 row after dedup, got {len(rows)}: {rows}"
+
+    # The survivor is the 0.9-confidence row.
+    survivor_id, survivor_confidence, survivor_last_seen = rows[0]
+    assert str(survivor_id) == "99999999-0002-0002-0002-999999999992", (
+        f"Expected the 0.9-confidence row to survive, got {survivor_id}"
+    )
+    assert survivor_confidence == 0.9, (
+        f"Expected survivor confidence 0.9, got {survivor_confidence}"
+    )
+
+    # The survivor's last_seen_date is bumped to
+    # max(last_seen_date) across the original
+    # group: 2026-05-20 (the value from the
+    # 0.5-confidence row). The 0.9 row originally
+    # had 2026-05-15; the dedup bumps it to
+    # 2026-05-20 so the survivor reflects the
+    # freshest seen-date the detector ever
+    # observed.
+    assert str(survivor_last_seen) == "2026-05-20", (
+        f"Expected survivor last_seen_date 2026-05-20 (group max), got {survivor_last_seen}"
+    )
+
+
+def test_alembic_0008_downgrade_drops_unique_constraint_preserves_data(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """Migration 0008's downgrade drops the UNIQUE constraint and preserves data.
+
+    The spec scenario "Downgrade drops the unique constraint"
+    requires that ``alembic downgrade -1`` (0008 -> 0007) drops
+    the ``uq_recurring_rules_upsert_key`` UNIQUE constraint AND
+    leaves the ``recurring_rules`` table intact (no data loss —
+    the rows that survived the upgrade's dedup step are still
+    readable).
+
+    The round-trip tests in this file downgrade all the way to
+    ``base``, which drops the entire ``recurring_rules`` table
+    (it was created in migration 0007), so they cannot verify
+    the data-preservation half of the scenario. This test
+    downgrades only to ``-1`` (0008 -> 0007), inserts a row,
+    runs the downgrade, and asserts all three halves:
+
+    * The ``recurring_rules`` table is still present (0007
+      still owns the table — the downgrade must not drop it).
+    * The ``uq_recurring_rules_upsert_key`` constraint is gone
+      (so a duplicate INSERT now succeeds instead of raising
+      ``IntegrityError``).
+    * The inserted row's data round-trips through ``SELECT``
+      exactly as written — no rows were deleted by the
+      downgrade.
+    """
+    # 1. Upgrade to head so the UNIQUE constraint is in
+    #    place (this is the "GIVEN" the spec scenario requires).
+    alembic_upgrade(alembic_config, "head")
+    pre_inspector = inspect(sync_engine)
+    pre_uniques = pre_inspector.get_unique_constraints("recurring_rules")
+    assert any(u["name"] == "uq_recurring_rules_upsert_key" for u in pre_uniques), (
+        f"Pre-condition failed: uq_recurring_rules_upsert_key should exist after head, "
+        f"got {pre_uniques}"
+    )
+
+    # 2. Seed a merchant + a recurring_rule row so there is
+    #    real data to preserve through the downgrade. The
+    #    upsert-key 5-tuple matches the on-disk column types
+    #    (amount_min/max as REAL, currency as TEXT, period_days
+    #    as INTEGER) so the constraint accepts the INSERT.
+    inserted_rule_id = "dddddddd-0001-0001-0001-dddddddddd01"
+    inserted_merchant_id = "dddddddd-0002-0002-0002-dddddddddd02"
+    with sync_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
+            "VALUES ("
+            f"'{inserted_merchant_id}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'downgrade_test_merchant', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            f"'{inserted_rule_id}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            f"'{inserted_merchant_id}', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.95, '2026-05-15', 3)"
+        )
+
+    # 3. Downgrade 0008 -> 0007. This is JUST 0008's
+    #    downgrade (``op.batch_alter_table`` + ``drop_constraint``
+    #    with ``type_="unique"``), not all the way to base.
+    #    The 0007 step would have been a no-op here (we are
+    #    already at 0008) so calling ``-1`` exercises only
+    #    0008's own downgrade.
+    alembic_downgrade(alembic_config, "-1")
+
+    # Discard the pre-downgrade inspector and dispose the
+    # engine pool so the post-downgrade reads come from a
+    # fresh connection. ``Inspect`` caches per-instance
+    # results, and on SQLite the ``batch_alter_table``
+    # copy-and-move creates a brand-new on-disk table
+    # that the old cached state would not see.
+    sync_engine.dispose()
+    post_inspector = inspect(sync_engine)
+
+    # 4. The ``recurring_rules`` table is still present
+    #    (0007 still creates it — only 0008's upgrade is
+    #    being reversed).
+    assert "recurring_rules" in post_inspector.get_table_names(), (
+        "recurring_rules table should still exist after 0008 downgrade (0007 still owns the table)"
+    )
+
+    # 5. The UNIQUE constraint is gone. The 3-column
+    #    read-side index from 0007 must still be present
+    #    (the downgrade must not touch it).
+    post_uniques = post_inspector.get_unique_constraints("recurring_rules")
+    assert "uq_recurring_rules_upsert_key" not in {u["name"] for u in post_uniques}, (
+        f"uq_recurring_rules_upsert_key should be dropped after 0008 downgrade, got {post_uniques}"
+    )
+    post_indexes = post_inspector.get_indexes("recurring_rules")
+    assert any(
+        idx["name"] == "ix_recurring_rules_merchant_currency_period" for idx in post_indexes
+    ), (
+        f"ix_recurring_rules_merchant_currency_period should be preserved after 0008 "
+        f"downgrade, got {post_indexes}"
+    )
+
+    # 6. The inserted row is still readable with its data
+    #    intact. The downgrade must not have touched any
+    #    rows — the spec scenario explicitly requires "no
+    #    data is lost".
+    with sync_engine.connect() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT id, merchant_id, period_days, amount_min, amount_max, "
+            "currency, is_active, confidence, last_seen_date, occurrences "
+            f"FROM recurring_rules WHERE id = '{inserted_rule_id}'"
+        ).fetchone()
+
+    assert row is not None, (
+        f"Recurring rule {inserted_rule_id} should still be present after 0008 downgrade"
+    )
+    assert str(row[0]) == inserted_rule_id
+    assert str(row[1]) == inserted_merchant_id
+    assert int(row[2]) == 30
+    # amount_min / amount_max come back as ``float`` from
+    # the SQLite driver — compare as floats so the test is
+    # not tied to the exact repr.
+    assert float(row[3]) == 9.99
+    assert float(row[4]) == 9.99
+    assert row[5] == "USD"
+    assert int(row[6]) == 1
+    assert float(row[7]) == 0.95
+    assert str(row[8]) == "2026-05-15"
+    assert int(row[9]) == 3
 
 
 # ---------------------------------------------------------------------------
