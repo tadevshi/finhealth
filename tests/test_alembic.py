@@ -938,6 +938,137 @@ def test_alembic_recurring_rules_dedup_on_unique_upgrade(
     )
 
 
+def test_alembic_0008_downgrade_drops_unique_constraint_preserves_data(
+    alembic_config: AlembicConfig, sync_engine: Engine
+) -> None:
+    """Migration 0008's downgrade drops the UNIQUE constraint and preserves data.
+
+    The spec scenario "Downgrade drops the unique constraint"
+    requires that ``alembic downgrade -1`` (0008 -> 0007) drops
+    the ``uq_recurring_rules_upsert_key`` UNIQUE constraint AND
+    leaves the ``recurring_rules`` table intact (no data loss —
+    the rows that survived the upgrade's dedup step are still
+    readable).
+
+    The round-trip tests in this file downgrade all the way to
+    ``base``, which drops the entire ``recurring_rules`` table
+    (it was created in migration 0007), so they cannot verify
+    the data-preservation half of the scenario. This test
+    downgrades only to ``-1`` (0008 -> 0007), inserts a row,
+    runs the downgrade, and asserts all three halves:
+
+    * The ``recurring_rules`` table is still present (0007
+      still owns the table — the downgrade must not drop it).
+    * The ``uq_recurring_rules_upsert_key`` constraint is gone
+      (so a duplicate INSERT now succeeds instead of raising
+      ``IntegrityError``).
+    * The inserted row's data round-trips through ``SELECT``
+      exactly as written — no rows were deleted by the
+      downgrade.
+    """
+    # 1. Upgrade to head so the UNIQUE constraint is in
+    #    place (this is the "GIVEN" the spec scenario requires).
+    alembic_upgrade(alembic_config, "head")
+    pre_inspector = inspect(sync_engine)
+    pre_uniques = pre_inspector.get_unique_constraints("recurring_rules")
+    assert any(u["name"] == "uq_recurring_rules_upsert_key" for u in pre_uniques), (
+        f"Pre-condition failed: uq_recurring_rules_upsert_key should exist after head, "
+        f"got {pre_uniques}"
+    )
+
+    # 2. Seed a merchant + a recurring_rule row so there is
+    #    real data to preserve through the downgrade. The
+    #    upsert-key 5-tuple matches the on-disk column types
+    #    (amount_min/max as REAL, currency as TEXT, period_days
+    #    as INTEGER) so the constraint accepts the INSERT.
+    inserted_rule_id = "dddddddd-0001-0001-0001-dddddddddd01"
+    inserted_merchant_id = "dddddddd-0002-0002-0002-dddddddddd02"
+    with sync_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
+            "VALUES ("
+            f"'{inserted_merchant_id}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            "'downgrade_test_merchant', 1)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO recurring_rules ("
+            "id, created_at, updated_at, merchant_id, period_days, period_label, "
+            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
+            "occurrences"
+            ") VALUES ("
+            f"'{inserted_rule_id}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+            f"'{inserted_merchant_id}', 30, 'monthly', "
+            "9.99, 9.99, 'USD', 1, 0.95, '2026-05-15', 3)"
+        )
+
+    # 3. Downgrade 0008 -> 0007. This is JUST 0008's
+    #    downgrade (``op.batch_alter_table`` + ``drop_constraint``
+    #    with ``type_="unique"``), not all the way to base.
+    #    The 0007 step would have been a no-op here (we are
+    #    already at 0008) so calling ``-1`` exercises only
+    #    0008's own downgrade.
+    alembic_downgrade(alembic_config, "-1")
+
+    # Discard the pre-downgrade inspector and dispose the
+    # engine pool so the post-downgrade reads come from a
+    # fresh connection. ``Inspect`` caches per-instance
+    # results, and on SQLite the ``batch_alter_table``
+    # copy-and-move creates a brand-new on-disk table
+    # that the old cached state would not see.
+    sync_engine.dispose()
+    post_inspector = inspect(sync_engine)
+
+    # 4. The ``recurring_rules`` table is still present
+    #    (0007 still creates it — only 0008's upgrade is
+    #    being reversed).
+    assert "recurring_rules" in post_inspector.get_table_names(), (
+        "recurring_rules table should still exist after 0008 downgrade (0007 still owns the table)"
+    )
+
+    # 5. The UNIQUE constraint is gone. The 3-column
+    #    read-side index from 0007 must still be present
+    #    (the downgrade must not touch it).
+    post_uniques = post_inspector.get_unique_constraints("recurring_rules")
+    assert "uq_recurring_rules_upsert_key" not in {u["name"] for u in post_uniques}, (
+        f"uq_recurring_rules_upsert_key should be dropped after 0008 downgrade, got {post_uniques}"
+    )
+    post_indexes = post_inspector.get_indexes("recurring_rules")
+    assert any(
+        idx["name"] == "ix_recurring_rules_merchant_currency_period" for idx in post_indexes
+    ), (
+        f"ix_recurring_rules_merchant_currency_period should be preserved after 0008 "
+        f"downgrade, got {post_indexes}"
+    )
+
+    # 6. The inserted row is still readable with its data
+    #    intact. The downgrade must not have touched any
+    #    rows — the spec scenario explicitly requires "no
+    #    data is lost".
+    with sync_engine.connect() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT id, merchant_id, period_days, amount_min, amount_max, "
+            "currency, is_active, confidence, last_seen_date, occurrences "
+            f"FROM recurring_rules WHERE id = '{inserted_rule_id}'"
+        ).fetchone()
+
+    assert row is not None, (
+        f"Recurring rule {inserted_rule_id} should still be present after 0008 downgrade"
+    )
+    assert str(row[0]) == inserted_rule_id
+    assert str(row[1]) == inserted_merchant_id
+    assert int(row[2]) == 30
+    # amount_min / amount_max come back as ``float`` from
+    # the SQLite driver — compare as floats so the test is
+    # not tied to the exact repr.
+    assert float(row[3]) == 9.99
+    assert float(row[4]) == 9.99
+    assert row[5] == "USD"
+    assert int(row[6]) == 1
+    assert float(row[7]) == 0.95
+    assert str(row[8]) == "2026-05-15"
+    assert int(row[9]) == 3
+
+
 # ---------------------------------------------------------------------------
 # Timestamp server_default regression guard
 # ---------------------------------------------------------------------------

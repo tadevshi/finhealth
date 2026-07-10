@@ -4,9 +4,27 @@
 
 Both phases of the change implement the spec delta for
 `phase2-recurring-detection` (PR #7). All 4 task groups (1.1–1.3,
-2.1–2.5, 3.1–3.3, 4.1–4.2) are complete. The five new unit tests +
-two new alembic tests all pass alongside the existing 405-test
+2.1–2.5, 3.1–3.4, 4.1–4.2) are complete. The five new unit tests +
+three new alembic tests all pass alongside the existing 405-test
 suite. Ruff, mypy, and the alembic round-trip are clean.
+
+### Gate-fix history (Round 2)
+
+The first verify pass was a HARD FAIL on the
+"Downgrade drops the unique constraint" spec scenario — the
+existing round-trip tests downgrade to `base` (which drops the
+entire `recurring_rules` table), so they could not verify the
+data-preservation half of the scenario. The gate caught a real
+test-coverage gap: the `downgrade()` was correct (manually
+verified with sqlite3 — constraint dropped, table+data
+preserved) but a regression in the downgrade path would not be
+caught by the test suite.
+
+The fix: `tests/test_alembic.py::test_alembic_0008_downgrade_drops_unique_constraint_preserves_data`
+inserts a `recurring_rules` row at head, runs `downgrade -1`
+(0008 → 0007 only), then asserts all three halves: table still
+exists, constraint gone, inserted row still readable. This
+turns the gate's catch into a permanent regression guard.
 
 ## Cross-walk
 
@@ -16,7 +34,7 @@ suite. Ruff, mypy, and the alembic round-trip are clean.
 | `recurring_rules` has UNIQUE constraint `uq_recurring_rules_upsert_key` on the 5-tuple `(merchant_id, amount_min, amount_max, currency, period_days)`, enforced at the DB layer (defense in depth alongside the application-level SELECT) | `alembic/versions/0008_phase2_recurring_rules_unique.py` — adds the constraint via `op.batch_alter_table` (the SQLite-compatible portable abstraction; PostgreSQL gets a plain `ALTER TABLE`). `app/models/recurring_rule.py` — `__table_args__` declares a matching `UniqueConstraint(... name="uq_recurring_rules_upsert_key")` so the schema is self-describing. |
 | Migration dedup: for each duplicate group, keep the row with the highest `confidence` (tie-break: max `last_seen_date`); set the keeper's `last_seen_date` to `max(last_seen_date)` across the group; delete the losers | `alembic/versions/0008_phase2_recurring_rules_unique.py` — the dedup CTE ranks rows within each group with `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY confidence DESC, last_seen_date DESC, id ASC)` and computes `MAX(last_seen_date) OVER (PARTITION BY ...)`. Step 1a updates the keeper's `last_seen_date` to the group max; step 1b deletes the losers. `tests/test_alembic.py::test_alembic_recurring_rules_dedup_on_unique_upgrade` — seeds 3 dupes (confidences 0.7, 0.9, 0.5; last_seen_dates 2026-05-01, 2026-05-15, 2026-05-20) and asserts the 0.9 row survives with `last_seen_date` bumped to 2026-05-20 (the group max). |
 | The unique constraint surfaces the concurrent-insert race as `IntegrityError` (the application layer's existing race-guard pattern catches and retries) | `tests/test_alembic.py::test_alembic_seeds_create_unique_upsert_key` — inserts a second row with the same 5-tuple and asserts `IntegrityError` is raised. The application-side race guard lives in `app/services/merchants.py:419,450,613` (the merchant-alias precedent) — the spec scenario pins the behaviour; no app code change required. |
-| Downgrade drops the UNIQUE constraint | `alembic/versions/0008_phase2_recurring_rules_unique.py::downgrade()` — `op.batch_alter_table` + `drop_constraint(... type_="unique")`. The dedup is not reversed (the deleted rows are not re-inserted); this is documented in the downgrade docstring. |
+| Downgrade drops the UNIQUE constraint | `alembic/versions/0008_phase2_recurring_rules_unique.py::downgrade()` — `op.batch_alter_table` + `drop_constraint(... type_="unique")`. The dedup is not reversed (the deleted rows are not re-inserted); this is documented in the downgrade docstring. `tests/test_alembic.py::test_alembic_0008_downgrade_drops_unique_constraint_preserves_data` — inserts a `recurring_rules` row at head, runs `downgrade -1` (0008 → 0007, not all the way to base), then asserts the table still exists, the constraint is gone, the 3-column read-side index is preserved, and the inserted row's data round-trips through `SELECT` exactly as written. The existing round-trip tests in this file downgrade to `base` (which drops the entire `recurring_rules` table), so they cannot verify the data-preservation half of the scenario — this dedicated test fills that gap. |
 | The 3-column read-side index `ix_recurring_rules_merchant_currency_period` is preserved | `alembic/versions/0008_phase2_recurring_rules_unique.py` — the migration's `upgrade()` does not touch the index. `tests/test_alembic.py::test_alembic_seeds_create_unique_upsert_key` — asserts the index still exists with the same 3 columns. |
 
 ## Test Results
@@ -24,8 +42,8 @@ suite. Ruff, mypy, and the alembic round-trip are clean.
 | Check | Result |
 |---|---|
 | `pytest -q tests/test_recurring.py` | **30 passed** (25 existing + 5 new) |
-| `pytest -q tests/test_alembic.py` | **18 passed** (16 existing + 2 new) |
-| `pytest -q tests/ --ignore=tests/test_llm_services.py` | **347 passed, 74 skipped** (74 skips are pre-existing — `TEST_RUT` env var not set + missing sample PDF, not regressions) |
+| `pytest -q tests/test_alembic.py` | **19 passed** (16 existing + 3 new) |
+| `pytest -q tests/ --ignore=tests/test_llm_services.py` | **348 passed, 74 skipped** (74 skips are pre-existing — `TEST_RUT` env var not set + missing sample PDF, not regressions) |
 | `ruff check .` | **All checks passed** |
 | `ruff format --check app/schemas/domain.py app/models/recurring_rule.py alembic/versions/0008_phase2_recurring_rules_unique.py tests/test_recurring.py tests/test_alembic.py` | **5 files already formatted** |
 | `mypy --strict app/schemas/domain.py app/models/recurring_rule.py` | **0 errors in modified files** (2 pre-existing errors in unrelated files: `app/services/llm/opencode_zen_client.py:338` and `app/api/v1/router.py:40`) |
@@ -36,13 +54,13 @@ suite. Ruff, mypy, and the alembic round-trip are clean.
 Pytest tail (focused run):
 
 ```
-================================ 48 passed in 5.61s ================================
+================================ 49 passed in 3.97s ================================
 ```
 
 Pytest tail (full suite, excluding LLM live-service tests):
 
 ```
-================== 347 passed, 74 skipped in 15.37s ==================
+================== 348 passed, 74 skipped in 15.37s ==================
 ```
 
 ## Files changed
@@ -53,11 +71,11 @@ Pytest tail (full suite, excluding LLM live-service tests):
 | `app/models/recurring_rule.py` | + `UniqueConstraint` import; `__table_args__` with `uq_recurring_rules_upsert_key`; docstring updates (mentions the constraint alongside the read-side index) |
 | `alembic/versions/0008_phase2_recurring_rules_unique.py` | **new** — dedup CTE + `batch_alter_table` + UNIQUE constraint; downgrade drops the constraint |
 | `tests/test_recurring.py` | + 5 unit tests covering the sanitization contract + 1 helper `_response_kwargs` |
-| `tests/test_alembic.py` | + 2 round-trip tests: unique-constraint creation + dedup behaviour |
+| `tests/test_alembic.py` | + 3 round-trip tests: unique-constraint creation, dedup behaviour, downgrade drops constraint + preserves data |
 
-Total: 1 new file, 4 modified files. Diff size: **~640 lines** including
-migration docstring and test docstrings (substantially under the
-800-line review budget from `tasks.md`).
+Total: 1 new file, 4 modified files. Diff size: **~760 lines** including
+migration docstring and test docstrings (under the 800-line review
+budget from `tasks.md`).
 
 ## Risks
 
