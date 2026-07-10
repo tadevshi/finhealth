@@ -15,12 +15,13 @@ type is already correct.
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import date as date_typ
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.statement import StatementStatus
 
@@ -394,6 +395,17 @@ class RecurringRuleResponse(BaseModel):
     between consecutive in-band postings. The ``amount_min``
     and ``amount_max`` define the in-band range the detector
     matched against.
+
+    The ``confidence`` field is sanitized at the Pydantic
+    boundary: non-finite values (``NaN``, ``+inf``, ``-inf``)
+    are coerced to ``0.0`` before the ``Field(ge=0.0, le=1.0)``
+    bound check runs (via the ``_sanitize_confidence``
+    ``field_validator(mode="before")``). This is defensive —
+    the detector's current algorithm never produces non-finite
+    ``confidence`` values, but a future bug or a corrupt
+    database row must not crash the API surface. The coerced
+    ``0.0`` satisfies the bound, so no ``ValidationError`` is
+    raised for any input.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -415,6 +427,27 @@ class RecurringRuleResponse(BaseModel):
     occurrences: int
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _sanitize_confidence(cls, v: object) -> object:
+        """Coerce non-finite floats (``NaN``, ``+inf``, ``-inf``) to ``0.0``.
+
+        Runs in ``mode="before"`` so the sanitization executes
+        *before* the ``Field(ge=0.0, le=1.0)`` constraint check.
+        The detector's algorithm never produces non-finite
+        ``confidence`` values, but a future bug (e.g. a
+        division-by-zero in a refactored
+        ``_compute_confidence``) or a corrupt database row must
+        not crash the API surface. The coerced ``0.0`` is
+        in-bounds, so Pydantic's constraint check is happy
+        downstream. Non-float inputs (e.g. an int) are passed
+        through unchanged so Pydantic's own coercion still
+        applies.
+        """
+        if isinstance(v, float) and not math.isfinite(v):
+            return 0.0
+        return v
 
 
 class RecurringRuleUpdate(BaseModel):
