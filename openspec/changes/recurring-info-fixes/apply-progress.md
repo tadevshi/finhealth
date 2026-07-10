@@ -4,7 +4,8 @@
 
 All 4 task groups (1.1–1.3, 2.1–2.5, 3.1–3.4, 4.1–4.2) are done.
 Branch: `feat/recurring-info-fixes`. Base: `origin/main` @ `46ec7b8`.
-Two implementation commits on top of base, no pushes.
+Three implementation commits + one gate-fix commit on top of base,
+no pushes.
 
 ## Commit map
 
@@ -12,7 +13,8 @@ Two implementation commits on top of base, no pushes.
 |---|---|---|---|
 | Phase 1 | 1 | `3a264eb` | fix(schema): sanitize NaN/inf in RecurringRuleResponse.confidence |
 | Phase 2 | 2 | `a0ea4fb` | fix(recurring): add UNIQUE constraint on upsert key + dedup migration |
-| Phase 4 | 3 | (next commit) | chore(sdd): write verify-report and apply-progress for recurring-info-fixes |
+| Phase 4 | 3 | `9f4e205` | chore(sdd): write verify-report and apply-progress for recurring-info-fixes |
+| Gate fix | 4 | `b6ff6fd` | test(alembic): add dedicated test for 0008 downgrade path |
 
 ## Task status
 
@@ -36,6 +38,7 @@ Two implementation commits on top of base, no pushes.
 - [x] **3.2** Add `test_alembic_seeds_create_unique_upsert_key` in `tests/test_alembic.py` (asserts the constraint name + 5 columns + that a second INSERT with the same key raises `IntegrityError`)
 - [x] **3.3** Add `test_alembic_recurring_rules_dedup_on_unique_upgrade` (seeds 3 dupes with confidences 0.7, 0.9, 0.5; asserts the 0.9 row survives with `last_seen_date` bumped to the group max)
 - [x] **3.4** `pytest -q` clean; `ruff check .` clean; `mypy --strict` clean on modified files
+- [x] **3.5** *(gate-fix, Round 2)* Add `test_alembic_0008_downgrade_drops_unique_constraint_preserves_data` — closes the coverage gap the verify gate caught: existing round-trip tests downgrade to `base` (which drops the `recurring_rules` table), so they cannot verify the data-preservation half of the "Downgrade drops the unique constraint" spec scenario. This test downgrades only to `-1` (0008 → 0007), asserts the table still exists, the constraint is gone, the 3-column index is preserved, and the inserted row's data round-trips through `SELECT`.
 
 ### Phase 4 — SDD Audit Trail ✅
 
@@ -46,19 +49,19 @@ Two implementation commits on top of base, no pushes.
 
 ```
 $ python -m pytest tests/test_recurring.py tests/test_alembic.py --no-header -q
-================================ 48 passed in 5.61s ================================
+================================ 49 passed in 3.97s ================================
 ```
 
 | File | Existing | New | Total |
 |---|---|---|---|
 | `tests/test_recurring.py` | 25 | 5 | 30 |
-| `tests/test_alembic.py` | 16 | 2 | 18 |
+| `tests/test_alembic.py` | 16 | 3 | 19 |
 
 ## Pytest output (full suite, excluding LLM live-service tests)
 
 ```
 $ python -m pytest tests/ --no-header -q --ignore=tests/test_llm_services.py
-================== 347 passed, 74 skipped in 15.37s ==================
+================== 348 passed, 74 skipped in 10.53s ==================
 ```
 
 74 skips are pre-existing (missing `TEST_RUT` env var + missing
@@ -107,10 +110,10 @@ The dedup CTE inside the upgrade is a no-op on a clean DB (the
 | Metric | Value |
 |---|---|
 | Files changed | 5 (1 new + 4 modified) |
-| Lines added | ~640 (incl. migration docstring + test docstrings) |
-| Lines removed | ~9 |
+| Lines added | ~760 (incl. migration docstring + test docstrings) |
+| Lines removed | ~20 |
 | Review budget | 800 (per `tasks.md`) |
-| Budget used | ~80% |
+| Budget used | ~95% |
 | Chained PRs needed | No |
 
 The diff is well under the 400-line per-PR guideline for chained
