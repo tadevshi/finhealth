@@ -1,0 +1,75 @@
+{# Partial: top merchants with per-currency amounts.
+
+   Returned by ``GET /dashboard/sections/merchants`` and
+   swapped into ``#dashboard-merchants`` by HTMX. Also
+   inlined into ``dashboard.html`` for the initial paint.
+
+   Renders one row per merchant (up to the configured
+   ``limit``, default 10). When the dataset is empty the
+   section shows an empty-state message; the test surface
+   relies on this to keep the page meaningful in a
+   fresh-checkout scenario.
+
+   Variables
+   ---------
+   merchants:
+       List of :class:`app.schemas.dashboard.MerchantBreakdown`
+       rows (length ``min(limit, distinct_merchants_in_period)``).
+   period_label:
+       Pre-formatted ``"YYYY-MM"`` for the heading.
+   card_label:
+       Human-readable label for the active card filter.
+#}
+<div data-testid="dashboard-merchants"
+     class="rounded-lg border border-gray-200 dark:border-gray-700
+            bg-white dark:bg-gray-900 p-4 shadow-sm">
+
+    <div class="flex items-baseline justify-between">
+        <h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            Top comercios &mdash; {{ period_label }} &middot; {{ card_label }}
+        </h2>
+    </div>
+
+    {% if merchants|length == 0 %}
+        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400"
+           data-testid="dashboard-merchants-empty">
+            No hay comercios con transacciones en el per&iacute;odo.
+        </p>
+    {% else %}
+        <ul class="mt-4 divide-y divide-gray-200 dark:divide-gray-700"
+            data-testid="dashboard-merchants-list">
+            {% for merch in merchants %}
+                <li class="py-2 flex items-center justify-between gap-2"
+                    data-testid="dashboard-merchants-row"
+                    data-merchant-id="{{ merch.merchant_id }}">
+                    <div class="min-w-0">
+                        <p class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate"
+                           title="{{ merch.display_name }}"
+                           data-testid="dashboard-merchants-name">
+                            {{ merch.display_name }}
+                        </p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400"
+                           data-testid="dashboard-merchants-meta">
+                            {{ merch.transaction_count }} tx
+                            {% if merch.last_seen_date %}
+                                &middot; &uacute;ltima: {{ merch.last_seen_date.isoformat() }}
+                            {% endif %}
+                        </p>
+                    </div>
+                    <div class="text-right text-sm whitespace-nowrap"
+                         data-testid="dashboard-merchants-amounts">
+                        {% for cur, amt in merch.total_per_currency.items() %}
+                            <div>
+                                {% if cur == 'CLP' %}
+                                    $ {{ "{:,.0f}".format(amt) }} <span class="text-xs text-gray-500">CLP</span>
+                                {% else %}
+                                    $ {{ "{:,.2f}".format(amt) }} <span class="text-xs text-gray-500">USD</span>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    </div>
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+</div>

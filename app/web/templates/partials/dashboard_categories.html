@@ -1,0 +1,91 @@
+{# Partial: 12 closed-set categories with Tailwind horizontal bars.
+
+   Returned by ``GET /dashboard/sections/categories`` and
+   swapped into ``#dashboard-categories`` by HTMX. Also
+   inlined into ``dashboard.html`` for the initial paint.
+
+   Each category row carries a horizontal Tailwind bar whose
+   width is the per-currency share of the period total (a
+   single ``pct_of_total`` float per the spec — when both
+   currencies are present, the dominant currency's share
+   is what is shown; see
+   :class:`app.schemas.dashboard.CategoryBreakdown`). The
+   bar uses ``bg-indigo-500`` and a ``bg-gray-200`` track
+   to stay on-brand with the rest of the UI.
+
+   When a category has no transactions, the row renders an
+   empty bar (zero width) and "—" amounts so the 12 rows
+   always appear with the same shape — even on an empty
+   period.
+
+   Variables
+   ---------
+   categories:
+       List of :class:`app.schemas.dashboard.CategoryBreakdown`
+       rows (always 12).
+   period_label:
+       Pre-formatted ``"YYYY-MM"`` for the heading.
+   card_label:
+       Human-readable label for the active card filter.
+#}
+<div data-testid="dashboard-categories"
+     class="rounded-lg border border-gray-200 dark:border-gray-700
+            bg-white dark:bg-gray-900 p-4 shadow-sm">
+
+    <div class="flex items-baseline justify-between">
+        <h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            Categor&iacute;as &mdash; {{ period_label }} &middot; {{ card_label }}
+        </h2>
+    </div>
+
+    {% if categories|length == 0 %}
+        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400"
+           data-testid="dashboard-categories-empty">
+            No hay categor&iacute;as para mostrar.
+        </p>
+    {% else %}
+        <ul class="mt-4 space-y-2"
+            data-testid="dashboard-categories-list">
+            {% for cat in categories %}
+                {% set pct_pct = (cat.pct_of_total * 100) if cat.pct_of_total else 0 %}
+                {% set width = "{:.1f}".format(pct_pct) %}
+                <li class="flex items-center gap-2"
+                    data-testid="dashboard-categories-row"
+                    data-category-id="{{ cat.category_id }}">
+                    <span class="w-32 text-sm text-gray-700 dark:text-gray-200 truncate"
+                          title="{{ cat.display_name }}">
+                        {{ cat.display_name }}
+                    </span>
+
+                    <div class="flex-1 bg-gray-200 dark:bg-gray-700 rounded h-3 overflow-hidden">
+                        <div class="bg-indigo-500 h-3 rounded transition-all"
+                             style="width: {{ width }}%"
+                             data-testid="dashboard-categories-bar"
+                             data-width="{{ width }}">
+                        </div>
+                    </div>
+
+                    <span class="w-28 text-right text-sm text-gray-700 dark:text-gray-200 whitespace-nowrap"
+                          data-testid="dashboard-categories-amount">
+                        {% if cat.total_per_currency %}
+                            {% for cur, amt in cat.total_per_currency.items() %}
+                                {% if cur == 'CLP' %}
+                                    $ {{ "{:,.0f}".format(amt) }} CLP
+                                {% else %}
+                                    $ {{ "{:,.2f}".format(amt) }} USD
+                                {% endif %}
+                            {% endfor %}
+                        {% else %}
+                            <span class="text-gray-400">&mdash;</span>
+                        {% endif %}
+                    </span>
+
+                    <span class="w-12 text-right text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap"
+                          data-testid="dashboard-categories-count">
+                        {{ cat.transaction_count }} tx
+                    </span>
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+</div>

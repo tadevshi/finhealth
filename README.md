@@ -98,14 +98,72 @@ the money actually goes.
   false}``; the FK is preserved on deactivation (design D)
   so the historical audit trail survives.
 
+### Available now (Phase 3 — Dashboard)
+
+- **Read-side aggregation service** (`phase3-dashboard`,
+  [spec](openspec/changes/phase-3-dashboard/specs/phase3-dashboard/spec.md))
+  — :class:`app.services.dashboard.DashboardService` ships
+  five pure-SQL aggregation methods (summary / categories /
+  merchants / monthly / recurring) that all return
+  per-currency sub-rollups (``{"CLP": ..., "USD": ...}``).
+  The service is the single source of truth for the
+  per-currency contract, the 12-row categories guarantee,
+  the card-filter (``UUID | "all"``) semantics, and the
+  monthly bar-chart time series. Multi-currency is honest
+  about no FX: the app has no rate table, so the dashboard
+  never sums across currencies — every aggregate is a
+  per-currency dict the UI can render side-by-side.
+- **JSON API endpoints** (``/api/v1/dashboard/*``, PR #9) —
+  five thin HTTP wrappers over the service that validate
+  the query params (``period`` regex, ``range`` ∈
+  ``{0, 3, 6, 12}``, ``card_id`` UUID or ``"all"``) and
+  return ``400`` for any other shape. The endpoints are
+  the wire-format surface; the service is the business
+  logic.
+- **Server-rendered dashboard page** (`/dashboard`, PR #10) —
+  a single page with two Alpine.js pickers (card + period)
+  and five HTMX-loaded sections (KPIs, categories, top
+  merchants, monthly bars, recurring list). The page is
+  a pure server-render — **no JS chart library** (no
+  Chart.js, ApexCharts, Plotly, ECharts, or D3). Every
+  bar is a Tailwind ``<div>`` with
+  ``style="width: {pct_of_max}%"`` computed server-side
+  from the time-series max; the spec scenario "Each month
+  renders a Tailwind bar with ``style="width: X%"``" is
+  the contract. The first paint is meaningful with
+  JavaScript disabled; HTMX + Alpine are a progressive
+  enhancement.
+- **Multi-currency side-by-side** — the KPI grid renders
+  two sub-grids (CLP and USD) when both currencies are
+  present in the period, and a single sub-grid otherwise.
+  The monthly bar chart renders two sub-bars per month
+  (indigo for CLP, emerald for USD) when both are
+  present. No FX conversion is applied anywhere; the
+  per-currency sub-rollup is the v1 contract.
+- **Card picker** — "Todas las cards" (default) + every
+  active :class:`CreditCard` row from the database,
+  labelled ``"<bank.display_name> - <card_number_masked>"``.
+  Inactive cards are excluded so the picker never shows
+  cards the user has retired.
+- **Period picker** — "Mes actual" (default), "Últimos
+  3 / 6 / 12 meses", and "Todo el historial". The
+  "all-time" option is the ``range=0`` sentinel the
+  service treats as "every distinct month in the
+  dataset". The current-month default matches the spec
+  scenario "Period picker defaults to the current month".
+- **Honest "top spenders" label** — the dashboard surfaces
+  the top categories and merchants per period (per the
+  categories and merchants endpoints). This is *not* an
+  anomaly detector — there is no model, no flag, no alert.
+  A future Phase 4 capability may add real anomaly
+  detection; for v1 the top-N lists are honestly labelled
+  as "top spenders" / "categorías principales".
+
 ### Coming next
 
-- **Phase 3 — Dashboard:** charts, monthly trends, anomaly flags
 - **Phase 4 — Insights:** budgeting rules, alerts, exports
 
 ---
-
-## Prerequisites
 
 - **Python 3.12+** (`python --version` should report 3.12 or newer)
 - **pip** (bundled with Python 3.12)
@@ -194,8 +252,19 @@ The server listens on `http://127.0.0.1:8000` by default.
 | `http://127.0.0.1:8000/`         | Redirects to `/upload`                      |
 | `http://127.0.0.1:8000/upload`   | Drag-and-drop statement upload form         |
 | `http://127.0.0.1:8000/transactions` | Filterable, paginated transaction list |
+| `http://127.0.0.1:8000/dashboard` | Phase 3 dashboard (KPIs + Tailwind bars + HTMX partials) |
 | `http://127.0.0.1:8000/docs`     | Interactive OpenAPI / Swagger UI            |
 | `http://127.0.0.1:8000/redoc`    | ReDoc API reference                         |
+
+The `/dashboard` page renders the read-side aggregation
+layer with two pickers (card + period) and five HTMX-loaded
+sections. The first paint is meaningful with JavaScript
+disabled; the picker change triggers an HTMX partial
+refresh (no full page reload) and the per-section endpoint
+hits the same :class:`app.services.dashboard.DashboardService`
+the JSON API uses. See the
+[Phase 3 spec](openspec/changes/phase-3-dashboard/specs/phase3-dashboard/spec.md)
+for the per-section contract.
 
 ### API endpoints (v1)
 
@@ -213,6 +282,11 @@ The server listens on `http://127.0.0.1:8000` by default.
 | POST   | `/api/v1/merchants/{id}/aliases`      | Bind a user-supplied alias to a merchant (PR #4) |
 | GET    | `/api/v1/recurring`                   | List active recurring-transaction rules, freshest first (PR #5) |
 | PATCH  | `/api/v1/recurring/{id}`              | Activate or deactivate a recurring rule (PR #5) |
+| GET    | `/api/v1/dashboard/summary`           | Phase 3 KPI tile payload for a single month (PR #9) |
+| GET    | `/api/v1/dashboard/categories`        | Phase 3 12 closed-set category rows for a month (PR #9) |
+| GET    | `/api/v1/dashboard/merchants`         | Phase 3 top-N merchants for a month (PR #9) |
+| GET    | `/api/v1/dashboard/monthly`           | Phase 3 monthly time series for the bar chart (PR #9) |
+| GET    | `/api/v1/dashboard/recurring`         | Phase 3 active recurring rules with an in-band occurrence (PR #9) |
 
 ### Quick health check
 

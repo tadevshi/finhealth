@@ -1,0 +1,97 @@
+{# Partial: KPI grid (summary) for the dashboard.
+
+   Returned by ``GET /dashboard/sections/summary`` and
+   swapped into ``#dashboard-summary`` by HTMX. Also
+   re-rendered inline as part of the initial paint of
+   ``dashboard.html`` (the same context, the same template).
+
+   The KPI grid renders two sub-grids side-by-side when both
+   CLP and USD are present in the period; a single sub-grid
+   when only one currency has data. The shapes mirror
+   :class:`app.schemas.dashboard.SummaryResponse` — the
+   service is the single source of truth for the per-currency
+   contract.
+
+   Variables
+   ---------
+   summary:
+       A :class:`app.schemas.dashboard.SummaryResponse` instance.
+   period_label:
+       Pre-formatted ``"YYYY-MM"`` for the heading (e.g. "2026-07").
+   card_label:
+       Human-readable label for the active card filter (e.g.
+       "Todas las cards" or "<bank> - <masked>").
+   range_label:
+       Human-readable label for the active period picker.
+#}
+{% set summary = summary or {} %}
+{% set currencies = summary.total_per_currency.keys()|list %}
+{% set show_two = currencies|length == 2 %}
+
+<div data-testid="dashboard-summary"
+     class="rounded-lg border border-gray-200 dark:border-gray-700
+            bg-white dark:bg-gray-900 p-4 shadow-sm">
+
+    <div class="flex items-baseline justify-between">
+        <h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            Resumen &mdash; {{ period_label }} &middot; {{ card_label }}
+        </h2>
+        <span class="text-xs text-gray-500 dark:text-gray-400">
+            {{ range_label }}
+        </span>
+    </div>
+
+    {% if summary.transaction_count == 0 %}
+        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400"
+           data-testid="dashboard-summary-empty">
+            No hay transacciones en el per&iacute;odo seleccionado.
+        </p>
+    {% else %}
+        <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+            {{ summary.transaction_count }} transacci&oacute;n(es) en el per&iacute;odo.
+        </p>
+
+        <div class="mt-4 grid gap-4 {{ 'grid-cols-2' if show_two else 'grid-cols-1' }}">
+            {% for currency in currencies %}
+            <div class="rounded-md border border-gray-200 dark:border-gray-700
+                        bg-gray-50 dark:bg-gray-800 p-3"
+                 data-testid="dashboard-summary-currency"
+                 data-currency="{{ currency }}">
+                <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200">
+                    {{ currency }}
+                </h3>
+                {% set total = summary.total_per_currency.get(currency, 0) %}
+                <p class="mt-2 text-2xl font-bold text-gray-900 dark:text-gray-100"
+                   data-testid="dashboard-summary-total">
+                    {% if currency == 'CLP' %}
+                        $ {{ "{:,.0f}".format(total) }}
+                    {% else %}
+                        $ {{ "{:,.2f}".format(total) }}
+                    {% endif %}
+                </p>
+
+                {% set daily_avg = summary.daily_avg_per_currency.get(currency) %}
+                {% if daily_avg is not none %}
+                <p class="mt-2 text-xs text-gray-500 dark:text-gray-400"
+                   data-testid="dashboard-summary-daily-avg">
+                    Promedio diario:
+                    {% if currency == 'CLP' %}
+                        $ {{ "{:,.0f}".format(daily_avg) }}
+                    {% else %}
+                        $ {{ "{:,.2f}".format(daily_avg) }}
+                    {% endif %}
+                </p>
+                {% endif %}
+
+                {% set comp_pct = summary.comparison_to_prev_period_pct_per_currency.get(currency) %}
+                {% if comp_pct is not none %}
+                <p class="mt-1 text-xs {% if comp_pct >= 0 %}text-emerald-600 dark:text-emerald-400{% else %}text-red-600 dark:text-red-400{% endif %}"
+                   data-testid="dashboard-summary-comparison">
+                    {% if comp_pct >= 0 %}+{% endif %}{{ "{:.1f}".format(comp_pct) }}% vs mes anterior
+                </p>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    {% endif %}
+</div>
