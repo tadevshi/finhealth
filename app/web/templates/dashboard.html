@@ -1,0 +1,250 @@
+{% extends "base.html" %}
+
+{# Dashboard page (Phase 3, PR #10).
+
+   Server-renders the full page on first paint, then lets the
+   user reload individual sections via HTMX. The page has two
+   pickers (Alpine.js):
+
+   * Card picker (Todas las cards + every active CreditCard row).
+   * Period picker (current month + last 3/6/12 months + all-time).
+
+   Changing either picker triggers an HTMX partial refresh for
+   the five sections: KPI grid, categories, top merchants,
+   monthly bars, and recurring list. The HTMX requests hit the
+   dedicated ``/dashboard/sections/*`` endpoints (defined in
+   :mod:`app.web.router`), which call
+   :class:`app.services.dashboard.DashboardService` directly so
+   the picker change is one DB roundtrip per section (not two:
+   there is no JSON-to-DOM step).
+
+   The initial paint is the same code path: the route handler
+   calls the service once per section, then renders the same
+   partials. The first paint is meaningful with JavaScript
+   disabled; the Alpine + HTMX layer is a progressive
+   enhancement.
+
+   No JS chart library is loaded — every bar is a Tailwind
+   ``<div>`` with ``style="width: X%"``. The bar width is
+   computed server-side (the spec scenario
+   "Each month renders a Tailwind bar with ``style=...``" is
+   the contract). The test surface in
+   :mod:`tests.test_web_phase3` asserts the ``style="width: X%"``
+   strings are present in the response body.                       #}
+
+{% block title %}{{ app_name }} &mdash; Dashboard{% endblock %}
+
+{% block content %}
+<section class="max-w-6xl mx-auto"
+         x-data="dashboardPicker()"
+         x-init="init()">
+
+    <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100"
+        data-testid="dashboard-title">
+        Dashboard
+    </h1>
+    <p class="mt-2 text-gray-600 dark:text-gray-300">
+        Vista agregada del per&iacute;odo seleccionado, sin librer&iacute;as de gr&aacute;ficos.
+    </p>
+
+    {# --- Pickers ------------------------------------------------------ #}
+    {# Two Alpine-controlled <select>s. The change handler triggers
+       the HTMX refresh by re-issuing the section GETs. The
+       initial values come from the route handler (which reads the
+       URL query params so a no-JS deep link still works).        #}
+    <div class="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-4
+                p-4 bg-gray-50 dark:bg-gray-800 rounded-md border
+                border-gray-200 dark:border-gray-700"
+         data-testid="dashboard-pickers">
+
+        <div>
+            <label for="card-picker"
+                   class="block text-xs font-medium text-gray-700 dark:text-gray-200">
+                Tarjeta
+            </label>
+            <select id="card-picker"
+                    name="card_id"
+                    x-model="cardId"
+                    @change="reload()"
+                    data-testid="dashboard-card-picker"
+                    class="mt-1 block w-full pl-3 pr-10 py-1 text-base border-gray-300
+                           dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100
+                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
+                           sm:text-sm rounded-md">
+                <option value="all" {% if selected_card_id == 'all' %}selected{% endif %}>
+                    Todas las cards
+                </option>
+                {% for card in cards %}
+                    <option value="{{ card.id }}"
+                            {% if selected_card_id == card.id|string %}selected{% endif %}>
+                        {{ card.bank.display_name }} &mdash; {{ card.card_number_masked }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div>
+            <label for="range-picker"
+                   class="block text-xs font-medium text-gray-700 dark:text-gray-200">
+                Per&iacute;odo
+            </label>
+            <select id="range-picker"
+                    name="range"
+                    x-model="rangeMonths"
+                    @change="reload()"
+                    data-testid="dashboard-range-picker"
+                    class="mt-1 block w-full pl-3 pr-10 py-1 text-base border-gray-300
+                           dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100
+                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
+                           sm:text-sm rounded-md">
+                <option value="0" {% if selected_range == 0 %}selected{% endif %}>
+                    Mes actual
+                </option>
+                <option value="3" {% if selected_range == 3 %}selected{% endif %}>
+                    &Uacute;ltimos 3 meses
+                </option>
+                <option value="6" {% if selected_range == 6 %}selected{% endif %}>
+                    &Uacute;ltimos 6 meses
+                </option>
+                <option value="12" {% if selected_range == 12 %}selected{% endif %}>
+                    &Uacute;ltimos 12 meses
+                </option>
+                <option value="-1" {% if selected_range == -1 %}selected{% endif %}>
+                    Todo el historial
+                </option>
+            </select>
+        </div>
+    </div>
+
+    {# --- Section: KPI grid ------------------------------------------- #}
+    {# HTMX target for the partial. The hx-get URL is wired with
+       query params derived from the current Alpine state so a
+       picker change reloads only this section. ``request`` is
+       auto-injected into the Jinja context by FastAPI's
+       ``Jinja2Templates`` (the Starlette pattern), so we can
+       call ``request.url_for(...)`` directly without a custom
+       global.                                                       #}
+    <div id="dashboard-summary"
+         class="mt-6"
+         hx-get="{{ request.url_for('dashboard_section_summary') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
+         hx-trigger="picker-change from:body"
+         hx-swap="innerHTML"
+         data-testid="dashboard-summary-target">
+        {% include "partials/dashboard_summary.html" %}
+    </div>
+
+    {# --- Section: Categories (12 closed-set rows) ------------------- #}
+    <div id="dashboard-categories"
+         class="mt-6"
+         hx-get="{{ request.url_for('dashboard_section_categories') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
+         hx-trigger="picker-change from:body"
+         hx-swap="innerHTML"
+         data-testid="dashboard-categories-target">
+        {% include "partials/dashboard_categories.html" %}
+    </div>
+
+    {# --- Section: Top merchants ------------------------------------- #}
+    <div id="dashboard-merchants"
+         class="mt-6"
+         hx-get="{{ request.url_for('dashboard_section_merchants') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
+         hx-trigger="picker-change from:body"
+         hx-swap="innerHTML"
+         data-testid="dashboard-merchants-target">
+        {% include "partials/dashboard_merchants.html" %}
+    </div>
+
+    {# --- Section: Monthly bar chart --------------------------------- #}
+    <div id="dashboard-monthly"
+         class="mt-6"
+         hx-get="{{ request.url_for('dashboard_section_monthly') }}?range={{ selected_range }}&card_id={{ selected_card_id }}"
+         hx-trigger="picker-change from:body"
+         hx-swap="innerHTML"
+         data-testid="dashboard-monthly-target">
+        {% include "partials/dashboard_monthly.html" %}
+    </div>
+
+    {# --- Section: Recurring rules ----------------------------------- #}
+    <div id="dashboard-recurring"
+         class="mt-6 mb-12"
+         hx-get="{{ request.url_for('dashboard_section_recurring') }}?period={{ selected_period }}&card_id={{ selected_card_id }}"
+         hx-trigger="picker-change from:body"
+         hx-swap="innerHTML"
+         data-testid="dashboard-recurring-target">
+        {% include "partials/dashboard_recurring.html" %}
+    </div>
+
+</section>
+
+<script>
+    // Alpine component for the dashboard pickers. Exposes a
+    // ``reload()`` method that:
+    //
+    // 1. Updates the hx-get URLs on every section to reflect the
+    //    current picker state, so HTMX re-fetches with the new
+    //    query params.
+    // 2. Dispatches a synthetic ``picker-change`` event so the
+    //    ``hx-trigger="picker-change from:body"`` listeners fire.
+    //
+    // The component is registered on ``alpine:init`` so it is
+    // available to the ``x-data="dashboardPicker()"`` binding on
+    // the enclosing section. The initial state is taken from the
+    // server-rendered ``selected_card_id`` and ``selected_range``
+    // so a no-JS deep link still picks up the right defaults.
+    document.addEventListener('alpine:init', function () {
+        window.Alpine.data('dashboardPicker', function () {
+            return {
+                cardId: '{{ selected_card_id }}',
+                rangeMonths: '{{ selected_range }}',
+                init: function () {
+                    /* The hx-get URLs are server-rendered with the
+                       initial values; we just need to keep them in
+                       sync when the pickers change. */
+                },
+                reload: function () {
+                    var cardId = this.cardId;
+                    var range = this.rangeMonths;
+
+                    /* The monthly endpoint takes ``range``; the
+                       others take ``period`` (current month) +
+                       ``range`` (just for the period label). The
+                       current-month period is computed server-side
+                       from today. */
+                    var period = '{{ selected_period }}';
+                    var sections = [
+                        { id: 'dashboard-summary',
+                          url: '/dashboard/sections/summary?period=' + period
+                              + '&range=' + range + '&card_id=' + cardId },
+                        { id: 'dashboard-categories',
+                          url: '/dashboard/sections/categories?period=' + period
+                              + '&range=' + range + '&card_id=' + cardId },
+                        { id: 'dashboard-merchants',
+                          url: '/dashboard/sections/merchants?period=' + period
+                              + '&range=' + range + '&card_id=' + cardId },
+                        { id: 'dashboard-monthly',
+                          url: '/dashboard/sections/monthly?range=' + range
+                              + '&card_id=' + cardId },
+                        { id: 'dashboard-recurring',
+                          url: '/dashboard/sections/recurring?period=' + period
+                              + '&card_id=' + cardId },
+                    ];
+                    sections.forEach(function (s) {
+                        var el = document.getElementById(s.id);
+                        if (el) {
+                            el.setAttribute('hx-get', s.url);
+                        }
+                    });
+                    /* ``htmx.process(document.body)`` re-evaluates
+                       the hx-* attributes on the body so the new
+                       URLs are picked up; ``body:htmx:configRequest``
+                       would also work but ``process`` is simpler
+                       for this case. */
+                    if (window.htmx) {
+                        window.htmx.process(document.body);
+                        window.htmx.trigger(document.body, 'picker-change');
+                    }
+                },
+            };
+        });
+    });
+</script>
+{% endblock %}
