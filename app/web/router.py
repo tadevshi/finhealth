@@ -736,11 +736,29 @@ async def dashboard_section_summary(
     parsed_card_id = _parse_card_filter(card_id)
     service = DashboardService(session)
     summary = await service.summary(period=period_date, card_id=parsed_card_id)
+
+    # ``Suscripciones`` KPI card needs the live recurring rules, not a
+    # hard-coded count. We re-use the same service call the rest of
+    # the dashboard makes; the rules are already filtered by the
+    # service for in-band occurrences in the period.
+    recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
+    recur_count = len(recurring_rows)
+    # Sum the per-rule minimum amount (CLP only — USD is rare in the
+    # recurring dataset and would skew the total without FX conversion).
+    recur_monthly = 0
+    for row in recurring_rows:
+        amount = row.get("amount_min", 0) or 0
+        currency = row.get("currency", "CLP")
+        if currency == "CLP":
+            recur_monthly += int(amount)
+
     context: dict[str, Any] = {
         "summary": summary,
         "period_label": period,
         "card_label": _card_label(card_id, cards),
         "range_label": "",
+        "recur_count": recur_count,
+        "recur_monthly": recur_monthly,
     }
     return templates.TemplateResponse(
         request=request,
@@ -813,31 +831,17 @@ async def dashboard_section_anomalies(
     dashboard (see ``openspec/specs/phase3-dashboard/spec.md``):
     primary red ``#ff5451`` for high-severity, tertiary pink
     ``#ffb3ad`` for medium-severity.
+
+    Phase 3 deferred anomaly *detection* to a later phase. The
+    endpoint returns an empty list for now; the partial renders
+    an empty state when ``anomalies`` is empty (no fake
+    placeholders). When the detector lands, this endpoint
+    replaces the empty list with
+    ``await detector.find_anomalies(period)`` and the partial
+    starts rendering real alerts.
     """
     cards = await _list_active_cards(session)
-    anomalies = [
-        {
-            "merchant": "Amazon (Shopping)",
-            "amount": "$ 450.000",
-            "date": "12/06",
-            "reason": "Monto 3x mayor al promedio",
-            "severity": "high",
-        },
-        {
-            "merchant": "Starbucks",
-            "amount": "$ 12.500",
-            "date": "14/06",
-            "reason": "Comercio nuevo no visto",
-            "severity": "medium",
-        },
-        {
-            "merchant": "Apple Services",
-            "amount": "$ 15.000",
-            "date": "20/06",
-            "reason": "Suscripcion duplicada",
-            "severity": "medium",
-        },
-    ]
+    anomalies: list[dict[str, object]] = []
     context: dict[str, Any] = {
         "anomalies": anomalies,
         "period_label": period,

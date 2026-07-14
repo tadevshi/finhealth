@@ -149,17 +149,32 @@
        data-testid="dashboard-main">
 
     {# --- Hero: total gastado + period segmented control -------- #}
+    {# The hero number comes from the live ``summary`` (the same
+       value the KPI grid's first card shows), not a placeholder.
+       When the period has no transactions the total is 0 and we
+       render a single em-dash so the page never lies about a
+       non-existent total. The period label is converted from
+       ``YYYY-MM`` to a Spanish month name so the hero is
+       self-explanatory without a separate label row.        #}
+    {% set hero_clp = (summary.total_per_currency or {}).get('CLP', 0) %}
+    {% set _month_names = {
+        '01':'ENERO','02':'FEBRERO','03':'MARZO','04':'ABRIL',
+        '05':'MAYO','06':'JUNIO','07':'JULIO','08':'AGOSTO',
+        '09':'SEPTIEMBRE','10':'OCTUBRE','11':'NOVIEMBRE','12':'DICIEMBRE',
+    } %}
+    {% set _month_key = selected_period[5:7] if selected_period and selected_period|length >= 7 else '' %}
+    {% set _month_label = _month_names.get(_month_key, '') %}
     <div class="flex items-end justify-between gap-8"
          data-testid="dashboard-hero">
       <div>
         <p class="font-mono text-[11px] font-semibold text-text-subtle
                   tracking-[2px]">
-          TOTAL GASTADO (JUNIO)
+          TOTAL GASTADO ({{ _month_label or 'PERIODO ACTUAL' }})
         </p>
         <p class="font-mono text-[56px] font-bold text-text-primary
                   tracking-[-1.5px] mt-2"
            data-testid="hero-amount">
-          $1.450.000
+          {% if hero_clp %}$ {{ "{:,.0f}".format(hero_clp) }}{% else %}&mdash;{% endif %}
           <span class="font-display text-base font-normal text-text-subtle ml-3">CLP</span>
         </p>
       </div>

@@ -26,8 +26,11 @@
 {% set usd_daily = summary.daily_avg_per_currency.get('USD') %}
 {% set clp_comp = summary.comparison_to_prev_period_pct_per_currency.get('CLP') %}
 {% set txn_count = summary.transaction_count or 0 %}
-{% set recur_count = 8 %}
-{% set recur_monthly = 65400 %}
+{# ``recur_count`` and ``recur_monthly`` come from the live
+   service call in ``dashboard_section_summary`` (see the docstring).
+   They are ``0`` when no recurring rules match the period.            #}
+{% set recur_count = recur_count|default(0) %}
+{% set recur_monthly = recur_monthly|default(0) %}
 
 <div data-testid="dashboard-summary"
      class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -143,6 +146,10 @@
   </div>
 
   {# --- Card 4: Suscripciones ------------------------------------ #}
+  {# Real data: ``recur_count`` and ``recur_monthly`` come from the
+   live service call (see the endpoint docstring). When the count
+   is 0 the card shows a single em-dash so the user is never
+   misled about the recurring detection state.                 #}
   <div class="rounded-2xl border border-border bg-surface
               p-6 flex flex-col gap-4">
     <h3 class="text-[13px] text-text-subtle font-medium">
@@ -151,14 +158,11 @@
     <div class="flex flex-col gap-3.5">
       <div class="flex flex-col gap-1">
         <p class="font-mono text-[26px] font-bold text-text-primary tracking-[-0.5px]">
-          {{ recur_count }}
+          {% if recur_count %}{{ recur_count }}{% else %}&mdash;{% endif %}
         </p>
-        <p class="text-xs text-text-subtle">$ {{ "{:,.0f}".format(recur_monthly) }} / mes</p>
-      </div>
-      <div class="h-px bg-surface-container-high"></div>
-      <div class="flex flex-col gap-1">
-        <p class="text-xs text-text-subtle">+ 1 nueva este mes</p>
-        <p class="text-[11px] text-danger-soft">Apple Services</p>
+        <p class="text-xs text-text-subtle">
+          {% if recur_monthly %}$ {{ "{:,.0f}".format(recur_monthly) }} / mes{% else %}sin cargos detectados{% endif %}
+        </p>
       </div>
     </div>
   </div>
