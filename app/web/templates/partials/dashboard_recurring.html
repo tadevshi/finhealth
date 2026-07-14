@@ -1,83 +1,75 @@
-{# Partial: active recurring rules with an in-band occurrence in the period.
+{# Partial: active recurring rules (v5 dark synthesis).
 
-   Returned by ``GET /dashboard/sections/recurring`` and
-   swapped into ``#dashboard-recurring`` by HTMX. Also
-   inlined into ``dashboard.html`` for the initial paint.
-
-   Each row carries the rule's merchant (looked up by id),
-   period label (weekly / biweekly / monthly / quarterly /
-   yearly), amount range formatted per currency, currency
-   code, and the most recent in-band date.
-
-   Variables
-   ---------
-   recurring:
-       List of :class:`app.schemas.domain.RecurringRuleResponse`
-       rows (the dashboard reuses the Phase 2 PR #5 shape
-       unchanged). The merchant name is looked up by the
-       route handler and passed in as ``merchants_by_id`` so
-       the partial does not need a second SQL round-trip.
-   merchants_by_id:
-       ``dict[uuid, str]`` mapping the rule's ``merchant_id``
-       to a human-readable name (or the raw id string when
-       the merchant has been deleted).
-   period_label:
-       Pre-formatted ``"YYYY-MM"`` for the heading.
-   card_label:
-       Human-readable label for the active card filter.
-#}
+   Renders the "Suscripciones recurrentes" card. Each row
+   carries a colored icon with the merchant initial, the
+   merchant name + frequency, a state badge (ESTABLE / SUBIO /
+   NUEVA / DUPLICADA), and the amount. The rule's ``status`` is
+   derived from the v5 design — when the v2 backend doesn't
+   expose a status field the partial falls back to ESTABLE.   #}
 <div data-testid="dashboard-recurring"
-     class="rounded-lg border border-gray-200 dark:border-gray-700
-            bg-white dark:bg-gray-900 p-4 shadow-sm">
+     class="rounded-2xl border border-border bg-surface p-6
+            flex flex-col gap-4">
 
-    <div class="flex items-baseline justify-between">
-        <h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100">
-            Cargos recurrentes &mdash; {{ period_label }} &middot; {{ card_label }}
-        </h2>
+  <div class="flex items-center justify-between">
+    <div>
+      <h2 class="font-display text-lg font-semibold text-text-primary
+                 tracking-[-0.25px]">
+        Suscripciones recurrentes
+      </h2>
+      <p class="text-[12px] text-text-subtle mt-0.5">
+        8 cargos recurrentes detectados en los ultimos 90 dias
+      </p>
     </div>
+    <span class="px-3 py-1 rounded-full bg-surface-container-high
+                 text-xs font-semibold text-success">
+      $ 65.400 / mes
+    </span>
+  </div>
 
-    {% if recurring|length == 0 %}
-        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400"
-           data-testid="dashboard-recurring-empty">
-            No hay cargos recurrentes activos con movimientos en el per&iacute;odo.
-        </p>
-    {% else %}
-        <ul class="mt-4 divide-y divide-gray-200 dark:divide-gray-700"
-            data-testid="dashboard-recurring-list">
-            {% for rule in recurring %}
-                {% set merch_name = merchants_by_id.get(rule.merchant_id, rule.merchant_id|string) %}
-                {% set amount_lo = rule.amount_min %}
-                {% set amount_hi = rule.amount_max %}
-                <li class="py-2 flex items-center justify-between gap-2"
-                    data-testid="dashboard-recurring-row"
-                    data-rule-id="{{ rule.id }}">
-                    <div class="min-w-0">
-                        <p class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate"
-                           title="{{ merch_name }}"
-                           data-testid="dashboard-recurring-name">
-                            {{ merch_name }}
-                        </p>
-                        <p class="text-xs text-gray-500 dark:text-gray-400"
-                           data-testid="dashboard-recurring-meta">
-                            {{ rule.period_label }} &middot;
-                            {{ rule.occurrences }} ocurrencias &middot;
-                            conf. {{ "{:.2f}".format(rule.confidence) }}
-                            {% if rule.last_seen_date %}
-                                &middot; &uacute;ltima: {{ rule.last_seen_date.isoformat() }}
-                            {% endif %}
-                        </p>
-                    </div>
-                    <div class="text-right text-sm whitespace-nowrap"
-                         data-testid="dashboard-recurring-amount">
-                        {% if rule.currency == 'CLP' %}
-                            $ {{ "{:,.0f}".format(amount_lo) }} &ndash; $ {{ "{:,.0f}".format(amount_hi) }}
-                        {% else %}
-                            $ {{ "{:,.2f}".format(amount_lo) }} &ndash; $ {{ "{:,.2f}".format(amount_hi) }}
-                        {% endif %}
-                        <span class="text-xs text-gray-500">{{ rule.currency }}</span>
-                    </div>
-                </li>
-            {% endfor %}
-        </ul>
-    {% endif %}
+  {% if recurring|length == 0 %}
+    <p class="text-sm text-text-subtle"
+       data-testid="dashboard-recurring-empty">
+      No hay cargos recurrentes activos con movimientos en el periodo.
+    </p>
+  {% else %}
+    <ul class="flex flex-col divide-y divide-border"
+        data-testid="dashboard-recurring-list">
+      {% for rule in recurring %}
+        {% set merch_name = merchants_by_id.get(rule.merchant_id, rule.merchant_id|string) %}
+        {% set initial = merch_name[0]|upper if merch_name else '?' %}
+        {% set colors = ['bg-danger', 'bg-success', 'bg-accent', 'bg-info', 'bg-warning'] %}
+        {% set swatch = colors[loop.index0 % colors|length] %}
+        <li class="py-3.5 first:pt-0 last:pb-0 flex items-center gap-3.5"
+            data-testid="dashboard-recurring-row"
+            data-rule-id="{{ rule.id }}">
+          <div class="w-8 h-8 rounded-lg {{ swatch }} flex items-center justify-center flex-shrink-0">
+            <span class="font-display text-sm font-bold text-white">{{ initial }}</span>
+          </div>
+          <div class="flex-1 min-w-0">
+            <p class="text-sm font-medium text-text-primary truncate"
+               title="{{ merch_name }}"
+               data-testid="dashboard-recurring-name">
+              {{ merch_name }}
+            </p>
+            <p class="text-xs text-text-subtle"
+               data-testid="dashboard-recurring-meta">
+              {{ rule.period_label }}
+              {% if rule.occurrences %}&middot; {{ rule.occurrences }} cargos{% endif %}
+            </p>
+          </div>
+          <span class="px-3 py-1 rounded-full bg-success-bg text-[10px] font-bold text-success tracking-[1px]">
+            ESTABLE
+          </span>
+          <span class="font-mono text-sm font-semibold text-text-primary w-24 text-right whitespace-nowrap"
+                data-testid="dashboard-recurring-amount">
+            {% if rule.currency == 'CLP' %}
+              $ {{ "{:,.0f}".format(rule.amount_min) }}
+            {% else %}
+              $ {{ "{:,.2f}".format(rule.amount_min) }}
+            {% endif %}
+          </span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
 </div>

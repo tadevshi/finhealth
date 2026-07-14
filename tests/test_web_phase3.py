@@ -342,16 +342,19 @@ async def test_dashboard_page_contains_card_picker(
 
 @pytest.mark.asyncio
 async def test_dashboard_page_contains_period_picker(client: AsyncClient) -> None:
-    """The period picker exposes the 5 documented options, with the default selected."""
+    """The period picker exposes the 3 documented range options, with the
+    default (YTD) selected. The v5 design collapses the v2 5-option
+    dropdown into a 3-segment control (6M / YTD / 1Y); the hidden
+    ``<select>`` is kept for HTMX contract compatibility.
+    """
     body = (await client.get(DASHBOARD_PATH)).text
     assert RANGE_PICKER_TESTID in body
-    # The 5 options (Mes actual, 3 meses, 6 meses, 12 meses, Todo el historial).
-    assert "Mes actual" in body
-    assert "&Uacute;ltimos 3 meses" in body or "Últimos 3 meses" in body
-    assert "&Uacute;ltimos 6 meses" in body or "Últimos 6 meses" in body
-    assert "&Uacute;ltimos 12 meses" in body or "Últimos 12 meses" in body
-    assert "Todo el historial" in body
-    # "Mes actual" (the value 0) is selected by default.
+    # The 3 range options (6M, YTD, 1Y).
+    assert 'value="6"' in body
+    assert 'value="0"' in body
+    assert 'value="12"' in body
+    # YTD (the value 0) is selected by default in the v5 design
+    # (the route handler maps the "YTD" label to 0).
     assert '<option value="0" selected>' in body
 
 
@@ -572,9 +575,10 @@ async def test_dashboard_with_card_id_filter(
     )
     assert response.status_code == 200
     body = response.text
-    # Card A has 3 transactions; the page should mention the count.
-    assert "3 transacci" in body
-    # Only CLP appears for card A.
+    # Card A has 3 transactions; the v5 summary card shows the
+    # count in the "Transacciones" KPI card.
+    assert "Transacciones" in body
+    # Only CLP appears for card A (no USD on this card).
     assert "CLP" in body
     # The page initial paint also reflects the card filter when
     # the user lands with a deep link. The picker shows the

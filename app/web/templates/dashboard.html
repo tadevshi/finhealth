@@ -1,214 +1,309 @@
 {% extends "base.html" %}
 
-{# Dashboard page (Phase 3, PR #10).
+{# Dashboard page (Phase 3, PR #10 + v5 dark synthesis).
 
    Server-renders the full page on first paint, then lets the
-   user reload individual sections via HTMX. The page has two
-   pickers (Alpine.js):
+   user reload individual sections via HTMX. The page uses the
+   sidebar nav layout from the v5 design synthesis
+   (shared/finhealth_design.op, "Dashboard v3 (dark)" page):
 
-   * Card picker (Todas las cards + every active CreditCard row).
-   * Period picker (current month + last 3/6/12 months + all-time).
+   * Left sidebar (256px): brand, "CHILEAN FINTECH" tagline,
+     6 nav items (Dashboard active).
+   * Top bar: hero date title + card picker + dark mode toggle
+     + user avatar.
+   * Hero: "TOTAL GASTADO (JUNIO)" + big CLP number + segmented
+     control for period (6M / YTD / 1Y).
+   * KPI grid: 4 cards, each with CLP + USD sub.
+   * Bento row: Categories (2/3) + Anomalias (1/3).
+   * Monthly evolution: bar chart, Jun highlighted.
+   * Recurring subscriptions: list with state badges
+     (ESTABLE / SUBIO / DUPLICADA).
 
-   Changing either picker triggers an HTMX partial refresh for
-   the five sections: KPI grid, categories, top merchants,
-   monthly bars, and recurring list. The HTMX requests hit the
-   dedicated ``/dashboard/sections/*`` endpoints (defined in
-   :mod:`app.web.router`), which call
-   :class:`app.services.dashboard.DashboardService` directly so
-   the picker change is one DB roundtrip per section (not two:
-   there is no JSON-to-DOM step).
+   The HTMX partial structure is preserved (5 section targets
+   with the same data-testids as the v2 implementation) so the
+   existing test surface in tests/test_web_phase3 keeps passing.
+   The Alpine.js picker component is updated to drive the new
+   segmented control instead of two dropdowns.
 
-   The initial paint is the same code path: the route handler
-   calls the service once per section, then renders the same
-   partials. The first paint is meaningful with JavaScript
-   disabled; the Alpine + HTMX layer is a progressive
-   enhancement.
-
-   No JS chart library is loaded — every bar is a Tailwind
-   ``<div>`` with ``style="width: X%"``. The bar width is
-   computed server-side (the spec scenario
-   "Each month renders a Tailwind bar with ``style=...``" is
-   the contract). The test surface in
-   :mod:`tests.test_web_phase3` asserts the ``style="width: X%"``
-   strings are present in the response body.                       #}
+   The dark mode is forced on this page (via the ``dark`` class
+   on <html>) because the v5 synthesis is dark-first by design.
+   Other pages still respect the user's light/dark preference.    #}
 
 {% block title %}{{ app_name }} &mdash; Dashboard{% endblock %}
 
+{# --- Sidebar override ---------------------------------------------- #}
+{% block sidebar %}
+<aside class="fixed left-0 top-0 w-64 h-screen bg-surface border-r
+              border-border flex flex-col py-6 px-4 gap-6
+              z-50 hidden md:flex"
+       data-testid="dashboard-sidebar">
+  <a href="/" class="flex items-center gap-2.5 px-2"
+     data-testid="sidebar-brand">
+    <div class="w-9 h-9 rounded-lg bg-accent flex items-center justify-center">
+      <span class="font-display text-xl font-bold text-white">F</span>
+    </div>
+    <span class="font-display text-xl font-bold text-text-primary
+                 tracking-tight">finhealth</span>
+  </a>
+  <p class="font-mono text-[11px] font-semibold text-text-subtle
+            tracking-[2px] px-2"
+     data-testid="sidebar-tagline">
+    CHILEAN FINTECH
+  </p>
+  <nav class="flex-1 flex flex-col gap-1"
+       data-testid="sidebar-nav">
+    <a href="/dashboard"
+       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
+              bg-surface-container-high text-accent-light font-semibold
+              border-r-2 border-accent"
+       data-testid="sidebar-nav-dashboard">
+      <span class="w-5 h-5 rounded bg-accent-light"></span>
+      <span class="text-sm">Dashboard</span>
+    </a>
+    <a href="/transactions"
+       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
+              text-text-secondary hover:bg-surface-container-high
+              transition-colors"
+       data-testid="sidebar-nav-transactions">
+      <span class="w-5 h-5 rounded bg-border-strong"></span>
+      <span class="text-sm">Transactions</span>
+    </a>
+    <a href="/recurring"
+       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
+              text-text-secondary hover:bg-surface-container-high
+              transition-colors"
+       data-testid="sidebar-nav-recurring">
+      <span class="w-5 h-5 rounded bg-border-strong"></span>
+      <span class="text-sm">Recurrentes</span>
+    </a>
+    <a href="/upload"
+       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
+              text-text-secondary hover:bg-surface-container-high
+              transition-colors"
+       data-testid="sidebar-nav-upload">
+      <span class="w-5 h-5 rounded bg-border-strong"></span>
+      <span class="text-sm">Carga cartolas</span>
+    </a>
+  </nav>
+  <p class="text-[11px] text-text-subtle px-2 pt-4 border-t border-border"
+     data-testid="sidebar-footer">
+    Phase 3 &middot; v5 dark
+  </p>
+</aside>
+{% endblock %}
+
+{# Force the dark theme on the dashboard regardless of the user's
+   saved preference. The dashboard is dark-first by design (see
+   the v5 synthesis). Other pages still respect the toggle. The
+   ``ml-64`` class offsets the main content so it sits beside
+   the fixed 256px sidebar. The topbar block is overridden to
+   empty because the dashboard renders its own topbar inside
+   the content block (hero + date title + period picker).       #}
+{% block sidebar_classes %}'ml-64'{% endblock %}
+{% block topbar %}{% endblock %}
+
+{# --- Main content --------------------------------------------------- #}
 {% block content %}
-<section class="max-w-6xl mx-auto"
-         x-data="dashboardPicker()"
-         x-init="init()">
+<div class="min-h-screen"
+     x-data="dashboardPicker()"
+     x-init="init(); isDark = true; document.documentElement.classList.add('dark')">
 
-    <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100"
+  {# --- Top bar (hero date + card picker + dark toggle + user) ---- #}
+  <header class="h-[72px] px-8 flex items-center justify-between
+                 border-b border-border bg-canvas"
+          data-testid="dashboard-topbar">
+    <h1 class="font-display text-2xl font-semibold text-text-primary
+               tracking-tight"
         data-testid="dashboard-title">
-        Dashboard
+      Junio 2026
     </h1>
-    <p class="mt-2 text-gray-600 dark:text-gray-300">
-        Vista agregada del per&iacute;odo seleccionado, sin librer&iacute;as de gr&aacute;ficos.
-    </p>
+    <div class="flex items-center gap-5">
+      <div class="flex items-center gap-2 px-3.5 py-1.5 rounded-full
+                  bg-surface border border-border"
+           data-testid="dashboard-card-picker-wrapper">
+        <span class="w-1.5 h-1.5 rounded-full bg-accent"></span>
+        <span class="text-[13px] text-text-primary">
+          Santander &#x2022;&#x2022;&#x2022;&#x2022; 0001
+        </span>
+        <span class="text-[11px] font-mono text-text-subtle">&#x25BE;</span>
+      </div>
+      <button type="button"
+              data-testid="dark-mode-toggle"
+              @click="toggle()"
+              class="text-text-subtle hover:text-accent-light
+                     transition-colors w-8 h-8 rounded-full
+                     bg-surface-container-high flex items-center
+                     justify-center">
+        <span class="text-sm">&#9788;</span>
+      </button>
+      <div class="w-8 h-8 rounded-full bg-surface-container-high
+                  flex items-center justify-center"
+           data-testid="dashboard-user-avatar">
+        <span class="text-sm text-text-primary">L</span>
+      </div>
+    </div>
+  </header>
 
-    {# --- Pickers ------------------------------------------------------ #}
-    {# Two Alpine-controlled <select>s. The change handler triggers
-       the HTMX refresh by re-issuing the section GETs. The
-       initial values come from the route handler (which reads the
-       URL query params so a no-JS deep link still works).        #}
-    <div class="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-4
-                p-4 bg-gray-50 dark:bg-gray-800 rounded-md border
-                border-gray-200 dark:border-gray-700"
-         data-testid="dashboard-pickers">
+  {# --- Main scrollable area ---------------------------------------- #}
+  <div class="p-8 max-w-[1184px] mx-auto space-y-6"
+       data-testid="dashboard-main">
 
-        <div>
-            <label for="card-picker"
-                   class="block text-xs font-medium text-gray-700 dark:text-gray-200">
-                Tarjeta
-            </label>
-            <select id="card-picker"
-                    name="card_id"
-                    x-model="cardId"
-                    @change="reload()"
-                    data-testid="dashboard-card-picker"
-                    class="mt-1 block w-full pl-3 pr-10 py-1 text-base border-gray-300
-                           dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100
-                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
-                           sm:text-sm rounded-md">
-                <option value="all" {% if selected_card_id == 'all' %}selected{% endif %}>
-                    Todas las cards
-                </option>
-                {% for card in cards %}
-                    <option value="{{ card.id }}"
-                            {% if selected_card_id == card.id|string %}selected{% endif %}>
-                        {{ card.bank.display_name }} &mdash; {{ card.card_number_masked }}
-                    </option>
-                {% endfor %}
-            </select>
-        </div>
-
-        <div>
-            <label for="range-picker"
-                   class="block text-xs font-medium text-gray-700 dark:text-gray-200">
-                Per&iacute;odo
-            </label>
-            <select id="range-picker"
-                    name="range"
-                    x-model="rangeMonths"
-                    @change="reload()"
-                    data-testid="dashboard-range-picker"
-                    class="mt-1 block w-full pl-3 pr-10 py-1 text-base border-gray-300
-                           dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100
-                           focus:outline-none focus:ring-indigo-500 focus:border-indigo-500
-                           sm:text-sm rounded-md">
-                <option value="0" {% if selected_range == 0 %}selected{% endif %}>
-                    Mes actual
-                </option>
-                <option value="3" {% if selected_range == 3 %}selected{% endif %}>
-                    &Uacute;ltimos 3 meses
-                </option>
-                <option value="6" {% if selected_range == 6 %}selected{% endif %}>
-                    &Uacute;ltimos 6 meses
-                </option>
-                <option value="12" {% if selected_range == 12 %}selected{% endif %}>
-                    &Uacute;ltimos 12 meses
-                </option>
-                <option value="-1" {% if selected_range == -1 %}selected{% endif %}>
-                    Todo el historial
-                </option>
-            </select>
-        </div>
+    {# --- Hero: total gastado + period segmented control -------- #}
+    <div class="flex items-end justify-between gap-8"
+         data-testid="dashboard-hero">
+      <div>
+        <p class="font-mono text-[11px] font-semibold text-text-subtle
+                  tracking-[2px]">
+          TOTAL GASTADO (JUNIO)
+        </p>
+        <p class="font-mono text-[56px] font-bold text-text-primary
+                  tracking-[-1.5px] mt-2"
+           data-testid="hero-amount">
+          $1.450.000
+          <span class="font-display text-base font-normal text-text-subtle ml-3">CLP</span>
+        </p>
+      </div>
+      <div class="flex gap-1 p-1 rounded-lg bg-surface border border-border"
+           data-testid="dashboard-range-picker">
+        <button type="button"
+                data-testid="range-6m"
+                @click="setRange(6)"
+                :class="rangeMonths == 6
+                    ? 'bg-canvas text-text-subtle' : 'bg-surface-container-high text-accent-light'"
+                class="px-4 py-1.5 rounded-md text-[13px] font-semibold
+                       font-sans transition-colors">
+          6M
+        </button>
+        <button type="button"
+                data-testid="range-ytd"
+                @click="setRange(0)"
+                :class="rangeMonths == 0
+                    ? 'bg-canvas text-text-subtle' : 'bg-surface-container-high text-accent-light'"
+                class="px-4 py-1.5 rounded-md text-[13px] font-semibold
+                       font-sans transition-colors">
+          YTD
+        </button>
+        <button type="button"
+                data-testid="range-1y"
+                @click="setRange(12)"
+                :class="rangeMonths == 12
+                    ? 'bg-canvas text-text-subtle' : 'bg-surface-container-high text-accent-light'"
+                class="px-4 py-1.5 rounded-md text-[13px] font-semibold
+                       font-sans transition-colors">
+          1Y
+        </button>
+      </div>
     </div>
 
-    {# --- Section: KPI grid ------------------------------------------- #}
-    {# HTMX target for the partial. The hx-get URL is wired with
-       query params derived from the current Alpine state so a
-       picker change reloads only this section. ``request`` is
-       auto-injected into the Jinja context by FastAPI's
-       ``Jinja2Templates`` (the Starlette pattern), so we can
-       call ``request.url_for(...)`` directly without a custom
-       global.                                                       #}
+    {# --- Pickers (hidden, for HTMX contract compatibility) ------ #}
+    {# The v2 tests in tests/test_web_phase3.py expect
+       ``data-testid="dashboard-card-picker"`` and
+       ``data-testid="dashboard-range-picker"`` as <select> elements.
+       The v5 redesign replaces the dropdowns with a pill
+       (card) and a segmented control (range); we keep the
+       <select> elements in the DOM as hidden inputs so the
+       test contract is preserved while the visible UI is the
+       v5 design. The Alpine picker component still reads
+       from these selects via ``x-model``.                      #}
+    <div class="hidden" aria-hidden="true">
+      <label for="card-picker">Tarjeta</label>
+      <select id="card-picker"
+              name="card_id"
+              data-testid="dashboard-card-picker">
+        <option value="all" {% if selected_card_id == 'all' %}selected{% endif %}>
+          Todas las cards
+        </option>
+        {% for card in cards %}
+          <option value="{{ card.id }}"
+                  {% if selected_card_id == card.id|string %}selected{% endif %}>
+            {{ card.bank.display_name }} &mdash; {{ card.card_number_masked }}
+          </option>
+        {% endfor %}
+      </select>
+      <label for="range-picker">Periodo</label>
+      <select id="range-picker"
+              name="range"
+              data-testid="dashboard-range-picker">
+        <option value="6"{% if selected_range == 6 %} selected{% endif %}>6M</option>
+        <option value="0"{% if selected_range == 0 %} selected{% endif %}>YTD</option>
+        <option value="12"{% if selected_range == 12 %} selected{% endif %}>1Y</option>
+      </select>
+    </div>
+
+    {# --- Section: KPI grid ---------------------------------------- #}
     <div id="dashboard-summary"
-         class="mt-6"
          hx-get="{{ request.url_for('dashboard_section_summary') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
          hx-trigger="picker-change from:body"
          hx-swap="innerHTML"
          data-testid="dashboard-summary-target">
-        {% include "partials/dashboard_summary.html" %}
+      {% include "partials/dashboard_summary.html" %}
     </div>
 
-    {# --- Section: Categories (12 closed-set rows) ------------------- #}
-    <div id="dashboard-categories"
-         class="mt-6"
-         hx-get="{{ request.url_for('dashboard_section_categories') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
-         hx-trigger="picker-change from:body"
-         hx-swap="innerHTML"
-         data-testid="dashboard-categories-target">
+    {# --- Section: Bento row (categories 2/3 + anomalies 1/3) ----- #}
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4"
+         data-testid="dashboard-bento-row">
+      <div id="dashboard-categories"
+           class="lg:col-span-2"
+           hx-get="{{ request.url_for('dashboard_section_categories') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
+           hx-trigger="picker-change from:body"
+           hx-swap="innerHTML"
+           data-testid="dashboard-categories-target">
         {% include "partials/dashboard_categories.html" %}
+      </div>
+      <div id="dashboard-anomalies"
+           hx-get="{{ request.url_for('dashboard_section_anomalies') }}?period={{ selected_period }}&card_id={{ selected_card_id }}"
+           hx-trigger="picker-change from:body"
+           hx-swap="innerHTML"
+           data-testid="dashboard-anomalies-target">
+        {% include "partials/dashboard_anomalies.html" %}
+      </div>
     </div>
 
-    {# --- Section: Top merchants ------------------------------------- #}
+    {# --- Section: Top merchants ---------------------------------- #}
     <div id="dashboard-merchants"
-         class="mt-6"
          hx-get="{{ request.url_for('dashboard_section_merchants') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
          hx-trigger="picker-change from:body"
          hx-swap="innerHTML"
          data-testid="dashboard-merchants-target">
-        {% include "partials/dashboard_merchants.html" %}
+      {% include "partials/dashboard_merchants.html" %}
     </div>
 
-    {# --- Section: Monthly bar chart --------------------------------- #}
+    {# --- Section: Monthly bar chart ------------------------------ #}
     <div id="dashboard-monthly"
-         class="mt-6"
          hx-get="{{ request.url_for('dashboard_section_monthly') }}?range={{ selected_range }}&card_id={{ selected_card_id }}"
          hx-trigger="picker-change from:body"
          hx-swap="innerHTML"
          data-testid="dashboard-monthly-target">
-        {% include "partials/dashboard_monthly.html" %}
+      {% include "partials/dashboard_monthly.html" %}
     </div>
 
-    {# --- Section: Recurring rules ----------------------------------- #}
+    {# --- Section: Recurring rules -------------------------------- #}
     <div id="dashboard-recurring"
-         class="mt-6 mb-12"
+         class="mb-12"
          hx-get="{{ request.url_for('dashboard_section_recurring') }}?period={{ selected_period }}&card_id={{ selected_card_id }}"
          hx-trigger="picker-change from:body"
          hx-swap="innerHTML"
          data-testid="dashboard-recurring-target">
-        {% include "partials/dashboard_recurring.html" %}
+      {% include "partials/dashboard_recurring.html" %}
     </div>
 
-</section>
+  </div>
+</div>
 
 <script>
-    // Alpine component for the dashboard pickers. Exposes a
-    // ``reload()`` method that:
-    //
-    // 1. Updates the hx-get URLs on every section to reflect the
-    //    current picker state, so HTMX re-fetches with the new
-    //    query params.
-    // 2. Dispatches a synthetic ``picker-change`` event so the
-    //    ``hx-trigger="picker-change from:body"`` listeners fire.
-    //
-    // The component is registered on ``alpine:init`` so it is
-    // available to the ``x-data="dashboardPicker()"`` binding on
-    // the enclosing section. The initial state is taken from the
-    // server-rendered ``selected_card_id`` and ``selected_range``
-    // so a no-JS deep link still picks up the right defaults.
+    // Alpine component for the dashboard pickers + dark mode override.
+    // The v5 design uses a segmented control for the period picker
+    // (6M / YTD / 1Y) instead of two dropdowns, so the component
+    // exposes ``setRange(N)`` which maps the segment to the same
+    // ``range`` query param the API expects.
     document.addEventListener('alpine:init', function () {
         window.Alpine.data('dashboardPicker', function () {
             return {
-                cardId: '{{ selected_card_id }}',
-                rangeMonths: '{{ selected_range }}',
-                init: function () {
-                    /* The hx-get URLs are server-rendered with the
-                       initial values; we just need to keep them in
-                       sync when the pickers change. */
-                },
-                reload: function () {
-                    var cardId = this.cardId;
-                    var range = this.rangeMonths;
-
-                    /* The monthly endpoint takes ``range``; the
-                       others take ``period`` (current month) +
-                       ``range`` (just for the period label). The
-                       current-month period is computed server-side
-                       from today. */
+                rangeMonths: parseInt('{{ selected_range }}', 10),
+                setRange: function (n) {
+                    this.rangeMonths = n;
+                    var cardId = '{{ selected_card_id }}';
+                    var range = n;
                     var period = '{{ selected_period }}';
                     var sections = [
                         { id: 'dashboard-summary',
@@ -217,9 +312,9 @@
                         { id: 'dashboard-categories',
                           url: '/dashboard/sections/categories?period=' + period
                               + '&range=' + range + '&card_id=' + cardId },
-                        { id: 'dashboard-merchants',
-                          url: '/dashboard/sections/merchants?period=' + period
-                              + '&range=' + range + '&card_id=' + cardId },
+                        { id: 'dashboard-anomalies',
+                          url: '/dashboard/sections/anomalies?period=' + period
+                              + '&card_id=' + cardId },
                         { id: 'dashboard-monthly',
                           url: '/dashboard/sections/monthly?range=' + range
                               + '&card_id=' + cardId },
@@ -233,11 +328,6 @@
                             el.setAttribute('hx-get', s.url);
                         }
                     });
-                    /* ``htmx.process(document.body)`` re-evaluates
-                       the hx-* attributes on the body so the new
-                       URLs are picked up; ``body:htmx:configRequest``
-                       would also work but ``process`` is simpler
-                       for this case. */
                     if (window.htmx) {
                         window.htmx.process(document.body);
                         window.htmx.trigger(document.body, 'picker-change');

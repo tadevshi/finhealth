@@ -789,6 +789,68 @@ async def dashboard_section_categories(
 
 
 @web_router.get(
+    "/dashboard/sections/anomalies",
+    response_class=HTMLResponse,
+    summary="HTMX partial: anomaly alerts for the period",
+    include_in_schema=False,
+)
+async def dashboard_section_anomalies(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    period: Annotated[str, Query(description="ISO 'YYYY-MM' month label.")],
+    card_id: Annotated[str, Query(description="UUID or 'all'.")] = "all",
+) -> HTMLResponse:
+    """HTMX partial: render the anomaly alerts panel for the period.
+
+    Phase 3 has the *detection* deferred to a later phase. The
+    v5 dark synthesis hard-codes a representative sample of the
+    three most common alert types (over-typical-amount, new
+    merchant, duplicate subscription) so the panel is visually
+    complete. When the detector lands, this endpoint swaps the
+    hard-coded list for ``await detector.find_anomalies(period)``.
+
+    The panel uses the same color tokens as the rest of the
+    dashboard (see ``openspec/specs/phase3-dashboard/spec.md``):
+    primary red ``#ff5451`` for high-severity, tertiary pink
+    ``#ffb3ad`` for medium-severity.
+    """
+    cards = await _list_active_cards(session)
+    anomalies = [
+        {
+            "merchant": "Amazon (Shopping)",
+            "amount": "$ 450.000",
+            "date": "12/06",
+            "reason": "Monto 3x mayor al promedio",
+            "severity": "high",
+        },
+        {
+            "merchant": "Starbucks",
+            "amount": "$ 12.500",
+            "date": "14/06",
+            "reason": "Comercio nuevo no visto",
+            "severity": "medium",
+        },
+        {
+            "merchant": "Apple Services",
+            "amount": "$ 15.000",
+            "date": "20/06",
+            "reason": "Suscripcion duplicada",
+            "severity": "medium",
+        },
+    ]
+    context: dict[str, Any] = {
+        "anomalies": anomalies,
+        "period_label": period,
+        "card_label": _card_label(card_id, cards),
+    }
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/dashboard_anomalies.html",
+        context=context,
+    )
+
+
+@web_router.get(
     "/dashboard/sections/merchants",
     response_class=HTMLResponse,
     summary="HTMX partial: top-N merchants for the period",

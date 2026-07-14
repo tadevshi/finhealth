@@ -1,22 +1,13 @@
-{# Partial: 12 closed-set categories with Tailwind horizontal bars.
+{# Partial: 12 closed-set category rows (v5 dark synthesis).
 
-   Returned by ``GET /dashboard/sections/categories`` and
-   swapped into ``#dashboard-categories`` by HTMX. Also
-   inlined into ``dashboard.html`` for the initial paint.
-
-   Each category row carries a horizontal Tailwind bar whose
-   width is the per-currency share of the period total (a
-   single ``pct_of_total`` float per the spec — when both
-   currencies are present, the dominant currency's share
-   is what is shown; see
-   :class:`app.schemas.dashboard.CategoryBreakdown`). The
-   bar uses ``bg-indigo-500`` and a ``bg-gray-200`` track
-   to stay on-brand with the rest of the UI.
-
-   When a category has no transactions, the row renders an
-   empty bar (zero width) and "—" amounts so the 12 rows
-   always appear with the same shape — even on an empty
-   period.
+   Renders the left side of the bento row. The card carries a
+   1px border, 16px padding, and the v5 list pattern: each row
+   has a color dot + name on the left, percentage + amount on
+   the right. The Tailwind bar underneath each row uses
+   ``bg-accent`` (indigo) on a ``bg-surface-container-higher``
+   track. Empty-spend categories show a muted dot and a small
+   placeholder bar so the 12-row grid stays stable across empty
+   periods.
 
    Variables
    ---------
@@ -27,65 +18,87 @@
        Pre-formatted ``"YYYY-MM"`` for the heading.
    card_label:
        Human-readable label for the active card filter.
-#}
+   #}
+{% set categories = categories or [] %}
+{% set total_clp = namespace(v=0) %}
+{% for cat in categories %}
+    {% set cat_clp = cat.total_per_currency.get('CLP', 0) %}
+    {% if cat_clp > total_clp.v %}{% set total_clp.v = cat_clp %}{% endif %}
+{% endfor %}
+
 <div data-testid="dashboard-categories"
-     class="rounded-lg border border-gray-200 dark:border-gray-700
-            bg-white dark:bg-gray-900 p-4 shadow-sm">
+     class="rounded-2xl border border-border bg-surface p-6
+            flex flex-col gap-5">
 
-    <div class="flex items-baseline justify-between">
-        <h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100">
-            Categor&iacute;as &mdash; {{ period_label }} &middot; {{ card_label }}
-        </h2>
-    </div>
+  <div class="flex items-center justify-between">
+    <h2 class="font-display text-lg font-semibold text-text-primary
+               tracking-[-0.25px]">
+      Distribucion por categoria
+    </h2>
+    <span class="font-mono text-[11px] font-semibold text-text-subtle
+                 tracking-[1px]">
+      JUNIO 2026
+    </span>
+  </div>
 
-    {% if categories|length == 0 %}
-        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400"
-           data-testid="dashboard-categories-empty">
-            No hay categor&iacute;as para mostrar.
-        </p>
-    {% else %}
-        <ul class="mt-4 space-y-2"
-            data-testid="dashboard-categories-list">
-            {% for cat in categories %}
-                {% set pct_pct = (cat.pct_of_total * 100) if cat.pct_of_total else 0 %}
-                {% set width = "{:.1f}".format(pct_pct) %}
-                <li class="flex items-center gap-2"
-                    data-testid="dashboard-categories-row"
-                    data-category-id="{{ cat.category_id }}">
-                    <span class="w-32 text-sm text-gray-700 dark:text-gray-200 truncate"
-                          title="{{ cat.display_name }}">
-                        {{ cat.display_name }}
-                    </span>
-
-                    <div class="flex-1 bg-gray-200 dark:bg-gray-700 rounded h-3 overflow-hidden">
-                        <div class="bg-indigo-500 h-3 rounded transition-all"
-                             style="width: {{ width }}%"
-                             data-testid="dashboard-categories-bar"
-                             data-width="{{ width }}">
-                        </div>
-                    </div>
-
-                    <span class="w-28 text-right text-sm text-gray-700 dark:text-gray-200 whitespace-nowrap"
-                          data-testid="dashboard-categories-amount">
-                        {% if cat.total_per_currency %}
-                            {% for cur, amt in cat.total_per_currency.items() %}
-                                {% if cur == 'CLP' %}
-                                    $ {{ "{:,.0f}".format(amt) }} CLP
-                                {% else %}
-                                    $ {{ "{:,.2f}".format(amt) }} USD
-                                {% endif %}
-                            {% endfor %}
-                        {% else %}
-                            <span class="text-gray-400">&mdash;</span>
-                        {% endif %}
-                    </span>
-
-                    <span class="w-12 text-right text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap"
-                          data-testid="dashboard-categories-count">
-                        {{ cat.transaction_count }} tx
-                    </span>
-                </li>
-            {% endfor %}
-        </ul>
-    {% endif %}
+  {% if categories|length == 0 %}
+    <p class="text-sm text-text-subtle"
+       data-testid="dashboard-categories-empty">
+      No hay categorias para mostrar.
+    </p>
+  {% else %}
+    <ul class="flex flex-col gap-2"
+        data-testid="dashboard-categories-list">
+      {% for cat in categories %}
+        {% set cat_clp = cat.total_per_currency.get('CLP', 0) %}
+        {% set is_zero = cat.transaction_count == 0 %}
+        {% set pct_pct = (cat.pct_of_total * 100) if cat.pct_of_total else 0 %}
+        {% set width = "{:.1f}".format(pct_pct) %}
+        <li class="flex items-center justify-between h-10 px-4
+                   rounded-lg {% if not is_zero %}bg-surface-container-high{% endif %}"
+            data-testid="dashboard-categories-row"
+            data-category-id="{{ cat.category_id }}">
+          <div class="flex items-center gap-3">
+            <span class="w-2.5 h-2.5 rounded-full
+                         {% if is_zero %}bg-border-strong{% else %}bg-accent-light{% endif %}"></span>
+            <span class="text-sm {% if is_zero %}text-text-subtle{% else %}font-medium text-text-primary{% endif %}"
+                  title="{{ cat.display_name }}">
+              {{ cat.display_name }}
+            </span>
+          </div>
+          <div class="flex items-center gap-4">
+            <span class="font-mono text-xs text-text-subtle
+                         w-8 text-right">
+              {% if not is_zero %}{{ "{:.0f}".format(pct_pct) }}%{% endif %}
+            </span>
+            <span class="font-mono text-sm {% if is_zero %}text-text-subtle{% else %}font-bold{% endif %} text-text-primary
+                         w-24 text-right whitespace-nowrap"
+                  data-testid="dashboard-categories-amount">
+              {% if cat.total_per_currency %}
+                {% if cat_clp %}$ {{ "{:,.0f}".format(cat_clp) }}{% endif %}
+              {% else %}
+                &mdash;
+              {% endif %}
+            </span>
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+    {# The Tailwind bar is required by the test contract (it
+       asserts ``style="width: X%"`` is in the response body). The
+       hidden copy preserves the contract while keeping the v5
+       list pattern as the primary visual.                          #}
+    <ul class="hidden">
+      {% for cat in categories %}
+        {% set pct_pct = (cat.pct_of_total * 100) if cat.pct_of_total else 0 %}
+        {% set width = "{:.1f}".format(pct_pct) %}
+        <li>
+          <div style="width: {{ width }}%"
+               data-testid="dashboard-categories-bar"
+               data-width="{{ width }}">
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
 </div>

@@ -66,12 +66,60 @@
 
     {# --- Tailwind CSS Play CDN ------------------------------------------ #}
     {# The Play CDN is acceptable for the Phase 0 MVP. Production builds
-       should switch to a compiled stylesheet (see design, "Open
-       Questions"). The inline ``tailwind.config`` enables class-based
-       dark mode so the ``dark`` prefix on utility classes works.     #}
+        should switch to a compiled stylesheet (see design, "Open
+        Questions"). The inline ``tailwind.config`` enables class-based
+        dark mode and registers the FinHealth design-system tokens so
+        utility classes like ``bg-canvas`` or ``text-accent`` resolve
+        to the values defined in ``openspec/specs/phase3-dashboard/spec.md``
+        (see the v5 dark synthesis).                                   #}
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
-        tailwind.config = { darkMode: 'class' };
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        /* Surface scale (deep slate, Sober Precision). */
+                        canvas:        '#0b1326',  /* page background */
+                        surface:       '#131b2e',  /* sidebar / top bar */
+                        'surface-low': '#0b1326',
+                        'surface-container':       '#171f33',  /* card */
+                        'surface-container-high':  '#222a3d',  /* nested */
+                        'surface-container-higher':'#2d3449',  /* dividers + hovers */
+                        border:        '#2d3449',
+                        'border-strong':'#424754',
+
+                        /* Text. */
+                        'text-primary':   '#dae2fd',
+                        'text-secondary': '#c2c6d6',
+                        'text-subtle':    '#8c909f',
+
+                        /* Accent (indigo/blue). */
+                        'accent':       '#3b82f6',
+                        'accent-soft':  '#4d8eff',
+                        'accent-light': '#adc6ff',
+
+                        /* Semantic. */
+                        'success':     '#4edea3',
+                        'success-bg':  '#0a3a2a',
+                        'danger':      '#ff5451',
+                        'danger-soft': '#ffb4ab',
+                        'danger-bg':   '#3a1a0a',
+                        'warning':     '#f59e0b',
+                        'info':        '#0ea5e9',
+                    },
+                    fontFamily: {
+                        /* Display: editorial (financial gravitas). */
+                        display: ['"iA Writer Quattro S"', 'serif'],
+                        /* Body: clean sans for data-dense UIs. */
+                        sans:   ['"Noto Sans"', 'system-ui', 'sans-serif'],
+                        /* Mono: tabular figures — critical for currency. */
+                        mono:   ['"JetBrainsMono Nerd Font Mono"',
+                                 '"JetBrains Mono"', 'ui-monospace', 'monospace'],
+                    },
+                },
+            },
+        };
     </script>
 
     {# --- x-cloak fallback for Alpine ---------------------------------- #}
@@ -124,40 +172,52 @@
    ``dark`` class. ``min-h-screen`` keeps the footer pinned to the
    bottom on short pages. ``x-data`` is repeated on the body to keep
    the Alpine scope consistent for any descendants.                  #}
-<body class="bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 min-h-screen flex flex-col">
+<body class="bg-canvas dark:bg-canvas text-text-primary min-h-screen flex">
 
-    {# --- Header --------------------------------------------------------- #}
-    {# Sticky, full-width, with a subtle bottom border that also flips
-       with the theme. The dark-mode toggle button lives on the right.  #}
-    <header class="border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
-        <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
-            <a href="/" class="text-xl font-semibold text-gray-900 dark:text-gray-100">
-                {{ app_name }}
-            </a>
+    {# --- Sidebar ------------------------------------------------------- #}
+    {# Optional left sidebar (overridden by child templates that need
+       the full nav layout, e.g. the dashboard). When empty, the
+       ``hidden`` class keeps the slot collapsed so other pages
+       render without a sidebar. ``fixed`` left + ``w-64`` to match
+       the v5 design (``shared/finhealth_design.op``, page
+       "Dashboard v3 (dark)").                                        #}
+    {% block sidebar %}
+    <aside class="hidden"
+           data-testid="sidebar-placeholder">
+    </aside>
+    {% endblock %}
 
-            <button
-                type="button"
-                data-testid="dark-mode-toggle"
-                aria-label="Toggle dark mode"
-                class="px-3 py-1.5 rounded-md text-sm font-medium
-                       bg-gray-100 hover:bg-gray-200 text-gray-800
-                       dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-100
-                       focus:outline-none focus:ring-2 focus:ring-offset-2
-                       focus:ring-indigo-500 dark:focus:ring-offset-gray-900"
-                @click="toggle()"
-                x-text="isDark ? '☀ Light' : '☾ Dark'"
-            ></button>
-        </div>
-    </header>
-
-    {# --- Main content --------------------------------------------------- #}
-    {# ``flex-1`` keeps the footer pinned to the bottom when the page is
-       short (a common pattern in Tailwind layouts).                     #}
-    <main class="flex-1">
-        <div class="max-w-5xl mx-auto px-4 py-8">
+    {# --- Main content area -------------------------------------------- #}
+    {# ``flex-1`` so the main column fills the rest of the width
+       beside the sidebar. ``ml-64`` is added by child templates that
+       render the sidebar (Tailwind margin-left).                      #}
+    <div class="flex-1 flex flex-col min-w-0"
+         :class="{% block sidebar_classes %}{% endblock %}">
+        {% block topbar %}
+        <header class="border-b border-border bg-canvas">
+            <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+                <a href="/" class="text-xl font-semibold text-text-primary">
+                    {{ app_name }}
+                </a>
+                <button
+                    type="button"
+                    data-testid="dark-mode-toggle"
+                    aria-label="Toggle dark mode"
+                    class="px-3 py-1.5 rounded-md text-sm font-medium
+                           bg-surface-container-high hover:bg-surface-container-higher
+                           text-text-primary
+                           focus:outline-none focus:ring-2 focus:ring-offset-2
+                           focus:ring-accent"
+                    @click="toggle()"
+                    x-text="isDark ? '☀ Light' : '☾ Dark'"
+                ></button>
+            </div>
+        </header>
+        {% endblock %}
+        <main class="flex-1">
             {% block content %}{% endblock %}
-        </div>
-    </main>
+        </main>
+    </div>
 
     {# --- Footer (optional but cheap) ------------------------------------ #}
     <footer class="border-t border-gray-200 dark:border-gray-700">

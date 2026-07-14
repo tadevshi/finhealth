@@ -51,11 +51,12 @@ TAILWIND_DARKMODE_CLASS = "darkMode: 'class'"
 
 # Tailwind utility classes that must appear in the rendered body.
 # Picked from base.html and index.html so a typo in either file fails
-# the test.
+# the test. The v5 redesign swaps ``bg-white dark:bg-gray-900`` for
+# the deep slate ``bg-canvas`` token (see the Tailwind config in
+# base.html).
 EXPECTED_TAILWIND_CLASSES = (
     "min-h-screen",  # base.html body
-    "bg-white",  # base.html body
-    "dark:bg-gray-900",  # base.html body
+    "bg-canvas",  # base.html body
 )
 
 

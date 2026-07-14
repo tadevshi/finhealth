@@ -1,75 +1,69 @@
-{# Partial: top merchants with per-currency amounts.
+{# Partial: top merchants with per-currency amounts (v5 dark).
 
-   Returned by ``GET /dashboard/sections/merchants`` and
-   swapped into ``#dashboard-merchants`` by HTMX. Also
-   inlined into ``dashboard.html`` for the initial paint.
-
-   Renders one row per merchant (up to the configured
-   ``limit``, default 10). When the dataset is empty the
-   section shows an empty-state message; the test surface
-   relies on this to keep the page meaningful in a
-   fresh-checkout scenario.
-
-   Variables
-   ---------
-   merchants:
-       List of :class:`app.schemas.dashboard.MerchantBreakdown`
-       rows (length ``min(limit, distinct_merchants_in_period)``).
-   period_label:
-       Pre-formatted ``"YYYY-MM"`` for the heading.
-   card_label:
-       Human-readable label for the active card filter.
-#}
+   Renders the "Comercios top" card. Each row carries a rounded
+   color swatch + merchant name on the left and the per-currency
+   amount on the right. The card uses the same surface tokens
+   as the rest of the dashboard.                                #}
 <div data-testid="dashboard-merchants"
-     class="rounded-lg border border-gray-200 dark:border-gray-700
-            bg-white dark:bg-gray-900 p-4 shadow-sm">
+     class="rounded-2xl border border-border bg-surface p-6
+            flex flex-col gap-5">
 
-    <div class="flex items-baseline justify-between">
-        <h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100">
-            Top comercios &mdash; {{ period_label }} &middot; {{ card_label }}
-        </h2>
+  <div class="flex items-center justify-between">
+    <div>
+      <h2 class="font-display text-lg font-semibold text-text-primary
+                 tracking-[-0.25px]">
+        Comercios top
+      </h2>
+      <p class="text-[13px] text-text-secondary mt-0.5">
+        Julio 2026
+      </p>
     </div>
+    <span class="font-mono text-[11px] font-semibold text-text-subtle
+                 tracking-[1px]">
+      Top 5
+    </span>
+  </div>
 
-    {% if merchants|length == 0 %}
-        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400"
-           data-testid="dashboard-merchants-empty">
-            No hay comercios con transacciones en el per&iacute;odo.
-        </p>
-    {% else %}
-        <ul class="mt-4 divide-y divide-gray-200 dark:divide-gray-700"
-            data-testid="dashboard-merchants-list">
-            {% for merch in merchants %}
-                <li class="py-2 flex items-center justify-between gap-2"
-                    data-testid="dashboard-merchants-row"
-                    data-merchant-id="{{ merch.merchant_id }}">
-                    <div class="min-w-0">
-                        <p class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate"
-                           title="{{ merch.display_name }}"
-                           data-testid="dashboard-merchants-name">
-                            {{ merch.display_name }}
-                        </p>
-                        <p class="text-xs text-gray-500 dark:text-gray-400"
-                           data-testid="dashboard-merchants-meta">
-                            {{ merch.transaction_count }} tx
-                            {% if merch.last_seen_date %}
-                                &middot; &uacute;ltima: {{ merch.last_seen_date.isoformat() }}
-                            {% endif %}
-                        </p>
-                    </div>
-                    <div class="text-right text-sm whitespace-nowrap"
-                         data-testid="dashboard-merchants-amounts">
-                        {% for cur, amt in merch.total_per_currency.items() %}
-                            <div>
-                                {% if cur == 'CLP' %}
-                                    $ {{ "{:,.0f}".format(amt) }} <span class="text-xs text-gray-500">CLP</span>
-                                {% else %}
-                                    $ {{ "{:,.2f}".format(amt) }} <span class="text-xs text-gray-500">USD</span>
-                                {% endif %}
-                            </div>
-                        {% endfor %}
-                    </div>
-                </li>
+  {% if merchants|length == 0 %}
+    <p class="text-sm text-text-subtle"
+       data-testid="dashboard-merchants-empty">
+      No hay comercios con transacciones en el periodo.
+    </p>
+  {% else %}
+    <ul class="flex flex-col divide-y divide-border"
+        data-testid="dashboard-merchants-list">
+      {% for merch in merchants %}
+        <li class="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3"
+            data-testid="dashboard-merchants-row"
+            data-merchant-id="{{ merch.merchant_id }}">
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-8 h-8 rounded-lg bg-accent-light/20 flex items-center justify-center">
+              <span class="font-display text-sm font-bold text-accent-light">
+                {{ merch.display_name[0]|upper }}
+              </span>
+            </div>
+            <div class="min-w-0">
+              <p class="text-sm font-medium text-text-primary truncate"
+                 title="{{ merch.display_name }}"
+                 data-testid="dashboard-merchants-name">
+                {{ merch.display_name }}
+              </p>
+              <p class="text-xs text-text-subtle"
+                 data-testid="dashboard-merchants-meta">
+                {{ merch.transaction_count }} compras
+              </p>
+            </div>
+          </div>
+          <div class="text-right text-sm whitespace-nowrap font-mono font-semibold text-text-primary"
+               data-testid="dashboard-merchants-amounts">
+            {% for cur, amt in merch.total_per_currency.items() %}
+              <div>
+                {% if cur == 'CLP' %}$ {{ "{:,.0f}".format(amt) }}{% else %}$ {{ "{:,.2f}".format(amt) }}{% endif %}
+              </div>
             {% endfor %}
-        </ul>
-    {% endif %}
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
 </div>
