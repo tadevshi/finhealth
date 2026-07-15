@@ -234,8 +234,12 @@ async def seed_demo() -> None:
         print(f"[seed] {len(merchants)} merchants ready")
 
         # --- Categories ---------------------------------------------
+        # Categories in the DB are seeded by migration 0005 with
+        # display names like 'Groceries' / 'Dining Out' (mixed case).
+        # The TX_PLAN uses lowercase slugs ('groceries', 'dining'),
+        # so the lookup is case-insensitive here.
         cat_rows = (await session.execute(select(Category))).scalars().all()
-        categories_by_name = {c.name: c for c in cat_rows}
+        categories_by_name = {c.name.lower(): c for c in cat_rows}
         if not categories_by_name:
             print("[seed] WARNING: no categories found. Run migrations first.")
         else:
@@ -305,7 +309,7 @@ async def seed_demo() -> None:
             slot = slot_per_month.get(key, 0)
             slot_per_month[key] = slot + 1
             txn_date = _tx_date_for_month(year, month, slot)
-            category = categories_by_name.get(cat_slug)
+            category = categories_by_name.get(cat_slug.lower())
             session.add(
                 Transaction(
                     statement_id=stmt.id,

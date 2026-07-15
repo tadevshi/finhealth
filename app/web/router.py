@@ -667,6 +667,17 @@ async def dashboard_page(
     merchants = await service.merchants(period=period_date, card_id=parsed_card_id)
     monthly = await service.monthly(range_months=normalised_range, card_id=parsed_card_id)
     recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
+    # The Suscripciones KPI card (4th in the summary grid) needs
+    # the live count and CLP-summed monthly total. Compute them
+    # here so the inline render of ``dashboard_summary.html`` in
+    # the initial paint has the same data the HTMX endpoint
+    # returns (otherwise the inline render shows em-dashes).
+    recur_count = len(recurring_rows)
+    recur_monthly = sum(
+        int(row.get("amount_min", 0) or 0)
+        for row in recurring_rows
+        if row.get("currency") == "CLP"
+    )
     merchant_names = await _lookup_merchant_names(
         session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
     )
@@ -696,6 +707,8 @@ async def dashboard_page(
         "selected_period": period_str,
         "selected_range": range_months,
         "selected_card_id": card_id,
+        "recur_count": recur_count,
+        "recur_monthly": recur_monthly,
     }
     return templates.TemplateResponse(
         request=request,
