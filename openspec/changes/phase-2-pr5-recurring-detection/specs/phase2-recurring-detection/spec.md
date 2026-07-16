@@ -103,17 +103,19 @@ The detector MUST classify the cadence from the median interval between consecut
 - **WHEN** the detector runs
 - **THEN** the rule has `period_label="biweekly"` and `period_days=14`
 
-#### Scenario: Quarterly classification (median interval 90 days)
+#### Scenario: Quarterly threshold mapping (median interval 90 days)
 
-- **GIVEN** a group with 3 occurrences 90 days apart
-- **WHEN** the detector runs
-- **THEN** the rule has `period_label="quarterly"` and `period_days=90`
+- **GIVEN** a qualifying in-band candidate interval of 90 days
+- **WHEN** period classification is applied
+- **THEN** the classification result is `period_label="quarterly"` and `period_days=90`
+- **AND** the detector MUST NOT expand the 90-day scan window to force a three-occurrence quarterly rule, because three 90-day intervals would span 180 days and violate the required scan window
 
-#### Scenario: Yearly classification (median interval 365 days)
+#### Scenario: Yearly threshold mapping (median interval 365 days)
 
-- **GIVEN** a group with 3 occurrences 365 days apart
-- **WHEN** the detector runs
-- **THEN** the rule has `period_label="yearly"` and `period_days=365`
+- **GIVEN** a qualifying in-band candidate interval of 365 days
+- **WHEN** period classification is applied
+- **THEN** the classification result is `period_label="yearly"` and `period_days=365`
+- **AND** the detector MUST NOT expand the 90-day scan window to force a three-occurrence yearly rule, because three 365-day intervals would span 730 days and violate the required scan window
 
 ### Requirement: Confidence Reflects Pattern Strength and Amount Consistency
 
@@ -166,11 +168,12 @@ The detector MUST look up an existing rule by the composite key `(merchant_id, a
 - **WHEN** the detector runs on a NEW pattern at $11.00–$11.50 (same merchant, same period)
 - **THEN** a second rule is created (the upsert key matches on `amount_min` and `amount_max`, so the new band does not match the existing one)
 
-#### Scenario: Different period creates a separate rule
+#### Scenario: Different in-window period creates a separate rule
 
 - **GIVEN** an existing monthly rule for MCDONALDS at $10.00–$10.50
-- **WHEN** the detector runs on a NEW quarterly pattern (90 days apart) at the same amount
-- **THEN** a second rule is created (the upsert key matches on `period_days` too, so the monthly key does not match the quarterly key)
+- **WHEN** the detector runs on a NEW biweekly pattern (14 days apart) at the same amount
+- **THEN** a second rule is created (the upsert key matches on `period_days` too, so the monthly key does not match the biweekly key)
+- **AND** quarterly and yearly cadence values remain covered by the period-classification threshold scenarios, not by unreachable full-detector positive scenarios under the 90-day scan window
 
 ### Requirement: `GET /api/v1/recurring` Lists Active Rules; `PATCH /api/v1/recurring/{id}` Toggles `is_active`
 
