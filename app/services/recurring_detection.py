@@ -55,8 +55,14 @@ Algorithm
 5. **Upsert by composite key.** Look up an existing rule
    by ``(merchant_id, amount_min, amount_max, currency, period_days)``.
    On hit, UPDATE ``last_seen_date`` / ``occurrences`` /
-   ``confidence`` on the existing row. On miss, INSERT a
-   new row with ``is_active=True`` and
+   ``confidence`` on the existing row. ``occurrences`` is
+   cumulative: a hit increments by the just-ingested
+   statement's in-band rows that are not already linked to
+   the rule, so historical rows included in an earlier
+   count are not counted again when their FK is still null.
+   Re-running the detector on an unchanged statement is
+   idempotent.
+   On miss, INSERT a new row with ``is_active=True`` and
    ``occurrences=in_band_count``. The upsert key
    intentionally ignores ``is_active`` (per design D) so
    a deactivated rule is still updated on the next
@@ -288,6 +294,10 @@ class RecurringDetector:
         directly) — the join is pushed to the database so
         the in-memory cost is bounded by the 90-day
         window, not the full historical table.
+
+        ``populate_existing=True`` refreshes already-loaded
+        :class:`Transaction` identities after FK backfill so
+        idempotent re-runs do not double-count stale rows.
         """
         stmt = (
             select(Transaction)
@@ -301,6 +311,7 @@ class RecurringDetector:
                 )
             )
             .order_by(Transaction.date.asc())
+            .execution_options(populate_existing=True)
         )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
@@ -392,16 +403,17 @@ class RecurringDetector:
             period_days=period_days,
         )
 
-        new_in_band_count = len(in_band)
+        in_band_count = len(in_band)
         last_seen_date = max(row.date for row in in_band)
-        confidence = self._compute_confidence(
-            occurrences=new_in_band_count,
-            amount_min=amount_min,
-            amount_max=amount_max,
-            median_amount=median_amount,
-        )
 
         if existing is None:
+            occurrences = in_band_count
+            confidence = self._compute_confidence(
+                occurrences=occurrences,
+                amount_min=amount_min,
+                amount_max=amount_max,
+                median_amount=median_amount,
+            )
             rule = RecurringRule(
                 merchant_id=merchant_id,
                 period_days=period_days,
@@ -412,14 +424,26 @@ class RecurringDetector:
                 is_active=True,
                 confidence=confidence,
                 last_seen_date=last_seen_date,
-                occurrences=new_in_band_count,
+                occurrences=occurrences,
             )
             self._session.add(rule)
             await self._session.flush()  # populate rule.id for the FK backfill
         else:
+            additional_occurrences = sum(
+                1
+                for row in in_band
+                if row.statement_id == statement.id and row.recurring_rule_id != existing.id
+            )
+            occurrences = existing.occurrences + additional_occurrences
+            confidence = self._compute_confidence(
+                occurrences=occurrences,
+                amount_min=amount_min,
+                amount_max=amount_max,
+                median_amount=median_amount,
+            )
             existing.period_label = period_label
             existing.last_seen_date = last_seen_date
-            existing.occurrences = new_in_band_count
+            existing.occurrences = occurrences
             existing.confidence = confidence
             await self._session.flush()
             rule = existing
@@ -457,6 +481,11 @@ class RecurringDetector:
     ) -> RecurringRule | None:
         """Look up a rule by the composite upsert key.
 
+        Production MUST include migration 0008's UNIQUE constraint.
+        Older/concurrent DBs may still have duplicates, so this logs
+        and returns the deterministic 0008-style survivor without
+        mutating data.
+
         The composite index
         ``ix_recurring_rules_merchant_currency_period``
         on ``(merchant_id, currency, period_days)``
@@ -474,7 +503,22 @@ class RecurringDetector:
             )
         )
         result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        rules = list(result.scalars().all())
+        if not rules:
+            return None
+        if len(rules) == 1:
+            return rules[0]
+
+        rules.sort(
+            key=lambda rule: (-rule.confidence, -rule.last_seen_date.toordinal(), str(rule.id))
+        )
+        logger.warning(
+            "Found %d duplicate RecurringRule rows for upsert key; "
+            "using rule=%s. Run migration 0008 to enforce uq_recurring_rules_upsert_key.",
+            len(rules),
+            rules[0].id,
+        )
+        return rules[0]
 
     @staticmethod
     def _classify_period(median_interval_days: int) -> tuple[str, int]:

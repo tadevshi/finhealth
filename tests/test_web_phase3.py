@@ -37,6 +37,7 @@ module only tests the *web* layer.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
@@ -74,6 +75,7 @@ CATEGORIES_PATH = "/dashboard/sections/categories"
 MERCHANTS_PATH = "/dashboard/sections/merchants"
 MONTHLY_PATH = "/dashboard/sections/monthly"
 RECURRING_PATH = "/dashboard/sections/recurring"
+SECTIONS_PATH = "/dashboard/sections"
 
 CARD_PICKER_TESTID = 'data-testid="dashboard-card-picker"'
 RANGE_PICKER_TESTID = 'data-testid="dashboard-range-picker"'
@@ -83,6 +85,7 @@ CATEGORIES_TARGET_TESTID = 'data-testid="dashboard-categories-target"'
 MERCHANTS_TARGET_TESTID = 'data-testid="dashboard-merchants-target"'
 MONTHLY_TARGET_TESTID = 'data-testid="dashboard-monthly-target"'
 RECURRING_TARGET_TESTID = 'data-testid="dashboard-recurring-target"'
+SECTIONS_TARGET_TESTID = 'data-testid="dashboard-sections-target"'
 SUMMARY_TESTID = 'data-testid="dashboard-summary"'
 SUMMARY_EMPTY_TESTID = 'data-testid="dashboard-summary-empty"'
 CATEGORIES_TESTID = 'data-testid="dashboard-categories"'
@@ -102,7 +105,7 @@ RECURRING_LIST_TESTID = 'data-testid="dashboard-recurring-list"'
 # Alpine to drive the HTMX refresh; the test surface does not
 # need Alpine to be active — it just asserts the markup
 # wires the right URLs and the pickers are present.
-ALL_CARDS_LABEL = "Todas las cards"
+ALL_CARDS_LABEL = "Todas"
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +318,10 @@ async def test_dashboard_page_returns_200(client: AsyncClient) -> None:
     assert response.headers["content-type"].startswith("text/html")
     body = response.text
     assert DASHBOARD_TITLE_TESTID in body
+    assert 'data-testid="dashboard-desktop-sidebar"' in body
+    assert 'data-testid="dashboard-mobile-topbar"' in body
+    assert 'data-testid="dashboard-mobile-nav"' in body
+    assert 'data-testid="dashboard-content-shell"' in body
     # The 5 section targets are wired with hx-get.
     assert SUMMARY_TARGET_TESTID in body
     assert CATEGORIES_TARGET_TESTID in body
@@ -324,10 +331,45 @@ async def test_dashboard_page_returns_200(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dashboard_shell_navigation_uses_valid_active_links(client: AsyncClient) -> None:
+    """Desktop and mobile navigation expose only valid dashboard destinations."""
+    body = (await client.get(DASHBOARD_PATH)).text
+    assert 'href="/dashboard"' in body
+    assert 'href="/transactions"' in body
+    assert 'href="/upload"' in body
+    assert 'href="#dashboard-recurring"' in body
+    assert 'href="/recurring"' not in body
+    assert 'href="/settings"' not in body
+    assert 'href="/anomaly"' not in body
+    assert 'aria-current="page"' in body
+    assert body.count('data-testid="dashboard-nav-link"') == 4
+    assert body.count('data-testid="dashboard-mobile-nav-link"') == 4
+    assert body.count('min-h-11') >= 8
+
+    for path in ("/dashboard", "/transactions", "/upload"):
+        response = await client.get(path)
+        assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_dashboard_responsive_layout_contract(client: AsyncClient) -> None:
+    """Markup carries the approved desktop and 390px-safe responsive geometry."""
+    body = (await client.get(DASHBOARD_PATH)).text
+    assert "w-60" in body
+    assert "lg:pl-60" in body
+    assert "max-w-[1136px]" in body
+    assert "px-4 sm:px-6 lg:px-8" in body
+    assert "overflow-x-hidden" in body
+    assert "min-w-0" in body
+    assert "grid-cols-4" in body
+    assert "lg:grid-cols-[minmax(0,680px)_minmax(0,440px)]" in body
+
+
+@pytest.mark.asyncio
 async def test_dashboard_page_contains_card_picker(
     client: AsyncClient, seeded_world: dict[str, object]
 ) -> None:
-    """The card picker exposes ``Todas las cards`` + every active card."""
+    """The card picker exposes ``Todas`` + every active card."""
     body = (await client.get(DASHBOARD_PATH)).text
     assert CARD_PICKER_TESTID in body
     assert ALL_CARDS_LABEL in body
@@ -336,26 +378,56 @@ async def test_dashboard_page_contains_card_picker(
     # Each active card's value appears in the picker.
     assert f'value="{card_a}"' in body
     assert f'value="{card_b}"' in body
-    # "Todas las cards" is the default selected option.
+    # "Todas" is the default selected option.
     assert '<option value="all" selected>' in body or 'value="all" selected' in body
 
 
 @pytest.mark.asyncio
 async def test_dashboard_page_contains_period_picker(client: AsyncClient) -> None:
-    """The period picker exposes the 3 documented range options, with the
-    default (YTD) selected. The v5 design collapses the v2 5-option
-    dropdown into a 3-segment control (6M / YTD / 1Y); the hidden
-    ``<select>`` is kept for HTMX contract compatibility.
-    """
+    """The period picker exposes current, rolling, YTD, and all-time web modes."""
     body = (await client.get(DASHBOARD_PATH)).text
     assert RANGE_PICKER_TESTID in body
-    # The 3 range options (6M, YTD, 1Y).
-    assert 'value="6"' in body
-    assert 'value="0"' in body
-    assert 'value="12"' in body
-    # YTD (the value 0) is selected by default in the v5 design
-    # (the route handler maps the "YTD" label to 0).
-    assert '<option value="0" selected>' in body
+    assert 'value="current"' in body
+    assert 'value="rolling_3"' in body
+    assert 'value="rolling_6"' in body
+    assert 'value="rolling_12"' in body
+    assert 'value="ytd"' in body
+    assert 'value="all_time"' in body
+
+
+@pytest.mark.asyncio
+async def test_dashboard_single_htmx_form_refreshes_all_sections(client: AsyncClient) -> None:
+    """Threat matrix: one HTMX form carries period/card/range mode and swaps all 5 sections."""
+    body = (await client.get(DASHBOARD_PATH)).text
+    assert 'data-testid="dashboard-selection-form"' in body
+    assert body.count('id="dashboard-sections"') == 1
+    assert body.count('hx-get="/dashboard/sections"') == 1
+    assert 'hx-get="/dashboard/sections"' in body
+    assert 'name="period"' in body
+    assert 'name="card_id"' in body
+    assert 'name="range_mode"' in body
+    assert 'hx-target="#dashboard-sections"' in body
+    assert 'hx-swap="outerHTML"' in body
+    assert SECTIONS_TARGET_TESTID in body
+    assert "dashboard_anomalies" not in body
+    assert "Sin anomalias" not in body
+    assert "anomaly" not in body.lower()
+
+    response = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "ytd"},
+    )
+    assert response.status_code == 200
+    sections = response.text
+    assert sections.count('id="dashboard-sections"') == 1
+    assert sections.count('hx-get="/dashboard/sections"') == 1
+    assert 'hx-swap="outerHTML"' in sections
+    assert 'data-testid="dashboard-hero"' in sections
+    assert SUMMARY_TESTID in sections
+    assert CATEGORIES_TESTID in sections
+    assert MERCHANTS_TESTID in sections
+    assert MONTHLY_TESTID in sections
+    assert RECURRING_TESTID in sections
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +480,9 @@ async def test_dashboard_categories_partial_returns_12_rows(
     assert body.count(CATEGORIES_ROW_TESTID) == 12
     # The Groceries row carries a non-zero bar width.
     assert "Groceries" in body
-    assert CATEGORIES_BAR_TESTID in body
+    assert body.count(CATEGORIES_BAR_TESTID) == 12
+    assert 'style="width:' in body
+    assert re.search(r'class="[^"]*(^|\s)hidden(\s|$)', body) is None
 
 
 @pytest.mark.asyncio
@@ -480,7 +554,7 @@ async def test_dashboard_monthly_partial_returns_time_series(
     assert MONTHLY_TESTID in body
     assert MONTHLY_LIST_TESTID in body
     # At least one Tailwind bar carries ``style="width: X%"``.
-    assert "style=\"width:" in body
+    assert 'style="width:' in body
     assert MONTHLY_BAR_TESTID in body
     # The chart has 6 month rows (the default range).
     assert body.count('data-testid="dashboard-monthly-row"') == 6
@@ -570,27 +644,49 @@ async def test_dashboard_with_card_id_filter(
         )
         await session.commit()
 
-    response = await client.get(
-        SUMMARY_PATH, params={"period": "2026-07", "card_id": str(card_a)}
-    )
+    response = await client.get(SUMMARY_PATH, params={"period": "2026-07", "card_id": str(card_a)})
     assert response.status_code == 200
     body = response.text
     # Card A has 3 transactions; the v5 summary card shows the
     # count in the "Transacciones" KPI card.
     assert "Transacciones" in body
+    assert "3 movimientos" in body or "3" in body
     # Only CLP appears for card A (no USD on this card).
     assert "CLP" in body
     # The page initial paint also reflects the card filter when
     # the user lands with a deep link. The picker shows the
     # bank display name + masked number, not the cardholder.
-    page_response = await client.get(
-        DASHBOARD_PATH, params={"card_id": str(card_a)}
-    )
+    page_response = await client.get(DASHBOARD_PATH, params={"card_id": str(card_a)})
     assert page_response.status_code == 200
     assert "XXXX XXXX XXXX 1001" in page_response.text
     # The USD cardholder is not in the picker when the filter
     # narrows the page (the picker is always the full list —
     # this assertion is on the partial's filtered totals).
+
+
+@pytest.mark.asyncio
+async def test_dashboard_card_picker_excludes_inactive_cards(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """The card picker renders active cards only and excludes inactive cards."""
+    bank_id = seeded_world["bank_id"]  # type: ignore[arg-type]
+    async with session_factory() as session:
+        inactive = CreditCard(
+            bank_id=bank_id,
+            card_number_masked="XXXX XXXX XXXX 9998",
+            cardholder="INACTIVE USER",
+            currency="CLP",
+            is_active=False,
+        )
+        session.add(inactive)
+        await session.commit()
+
+    body = (await client.get(DASHBOARD_PATH)).text
+    assert "XXXX XXXX XXXX 1001" in body
+    assert "XXXX XXXX XXXX 1002" in body
+    assert "XXXX XXXX XXXX 9998" not in body
 
 
 @pytest.mark.asyncio
@@ -716,6 +812,115 @@ async def test_dashboard_multi_currency_side_by_side(
     assert "250.00" in body
 
 
+@pytest.mark.asyncio
+async def test_dashboard_full_page_hero_and_cards_use_payload_data(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """The live hero and KPI cards render real CLP/USD values inside the swap root."""
+    statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    statement_b = seeded_world["statement_b_id"]  # type: ignore[arg-type]
+    merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    merchant_usd = seeded_world["merchant_usd_id"]  # type: ignore[arg-type]
+
+    async with session_factory() as session:
+        _add_transaction(
+            session,
+            statement_id=statement_a,
+            merchant_id=merchant_clp,
+            amount="123000.00",
+            txn_date=date(2026, 7, 5),
+            currency="CLP",
+        )
+        _add_transaction(
+            session,
+            statement_id=statement_b,
+            merchant_id=merchant_usd,
+            amount="45.67",
+            txn_date=date(2026, 7, 10),
+            currency="USD",
+        )
+        await session.commit()
+
+    response = await client.get(DASHBOARD_PATH, params={"period": "2026-07"})
+    assert response.status_code == 200
+    body = response.text
+    assert 'data-testid="dashboard-hero"' in body
+    assert 'data-testid="dashboard-hero-currency"' in body
+    assert 'data-currency="CLP"' in body
+    assert 'data-currency="USD"' in body
+    assert "123,000" in body
+    assert "45.67" in body
+    assert "2" in body
+
+
+@pytest.mark.asyncio
+async def test_dashboard_summary_renders_usd_count_from_payload(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """The unified sections partial renders the USD transaction count from payload data."""
+    statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    statement_b = seeded_world["statement_b_id"]  # type: ignore[arg-type]
+    merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    merchant_usd = seeded_world["merchant_usd_id"]  # type: ignore[arg-type]
+
+    async with session_factory() as session:
+        for day in (1, 2, 3, 4, 5):
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="1000.00",
+                txn_date=date(2026, 7, day),
+                currency="CLP",
+            )
+        for day in (6, 7):
+            _add_transaction(
+                session,
+                statement_id=statement_b,
+                merchant_id=merchant_usd,
+                amount="10.00",
+                txn_date=date(2026, 7, day),
+                currency="USD",
+            )
+        await session.commit()
+
+    response = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert response.status_code == 200
+    body = response.text
+    assert 'data-currency="USD"' in body
+    assert "2 compras" in body
+    assert "5 CLP &middot; 2 USD" in body
+
+
+@pytest.mark.asyncio
+async def test_dashboard_empty_states_render_inside_single_swap_target(client: AsyncClient) -> None:
+    """Empty states for the five dashboard sections stay inside the unified HTMX root."""
+    response = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert response.status_code == 200
+    body = response.text
+    assert body.count('id="dashboard-sections"') == 1
+    start = body.index('id="dashboard-sections"')
+    scoped = body[start:]
+    for marker in (
+        'data-testid="dashboard-summary-empty"',
+        'data-testid="dashboard-categories-empty"',
+        'data-testid="dashboard-merchants-empty"',
+        'data-testid="dashboard-monthly-empty"',
+        'data-testid="dashboard-recurring-empty"',
+    ):
+        assert marker in scoped
+
+
 # ---------------------------------------------------------------------------
 # Tailwind-only / no-JS-chart-library guard
 # ---------------------------------------------------------------------------
@@ -738,3 +943,16 @@ async def test_dashboard_does_not_load_js_chart_library(client: AsyncClient) -> 
     # common cdn paths to keep the test honest.
     assert "d3js.org" not in body
     assert "cdn.jsdelivr.net/npm/d3" not in body
+
+
+@pytest.mark.asyncio
+async def test_dashboard_has_no_hidden_duplicates_or_fake_anomaly(client: AsyncClient) -> None:
+    """The redesigned UI has no hidden test-only category bars or anomaly/status invention."""
+    categories = (await client.get(CATEGORIES_PATH, params={"period": "2026-07"})).text
+    assert CATEGORIES_BAR_TESTID in categories
+    assert re.search(r'class="[^"]*(^|\s)hidden(\s|$)', categories) is None
+
+    page = (await client.get(DASHBOARD_PATH)).text.lower()
+    assert "anomaly" not in page
+    assert "anomalias" not in page
+    assert "estable" not in page

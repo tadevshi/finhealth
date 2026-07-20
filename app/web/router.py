@@ -30,8 +30,17 @@ from app.models.bank import Bank
 from app.models.category import Category
 from app.models.credit_card import CreditCard
 from app.models.merchant import Merchant
+from app.models.statement import Statement
 from app.models.transaction import Transaction
 from app.services.dashboard import DashboardService
+from app.services.dashboard_selection import (
+    DashboardSelection,
+    RangeMode,
+    YearMonth,
+    parse_selection,
+    range_mode_options,
+    resolve_window,
+)
 
 # Templates directory resolved relative to this file so the router
 # works regardless of the working directory the app is launched from
@@ -523,6 +532,13 @@ def _current_period() -> str:
     return f"{today.year:04d}-{today.month:02d}"
 
 
+def _parse_dashboard_period(period: str) -> date_typ:
+    try:
+        return YearMonth.parse(period).first_day()
+    except ValueError:
+        return date_typ.today().replace(day=1)
+
+
 def _card_label(card_id: str, cards: list[CreditCard]) -> str:
     """Return the human-readable label for the active card filter.
 
@@ -563,6 +579,81 @@ def _parse_card_filter(card_id: str) -> uuid.UUID | Literal["all"]:
         return uuid.UUID(card_id)
     except ValueError:
         return "all"
+
+
+async def _earliest_transaction_date(
+    session: AsyncSession,
+    *,
+    card_id: uuid.UUID | Literal["all"],
+) -> date_typ | None:
+    stmt = select(func.min(Transaction.date))
+    if card_id != "all":
+        stmt = stmt.join(Transaction.statement).where(Statement.credit_card_id == card_id)
+    return await session.scalar(stmt)
+
+
+async def _dashboard_context(
+    request: Request,
+    session: AsyncSession,
+    *,
+    selection: DashboardSelection,
+    full_page: bool,
+) -> dict[str, Any]:
+    cards = await _list_active_cards(session)
+    card_label_text = _card_label(str(selection.card_id), cards)
+    labels = selection.labels(card_name=card_label_text)
+    earliest = await _earliest_transaction_date(session, card_id=selection.card_id)
+    window_start, window_end = resolve_window(
+        selection,
+        today=date_typ.today(),
+        earliest=earliest,
+    )
+    service = DashboardService(session)
+    period_date = selection.period.first_day()
+    summary = await service.summary(
+        period=period_date,
+        range_months=selection.range_mode.api_range(),
+        card_id=selection.card_id,
+        range_mode=selection.range_mode,
+    )
+    categories = await service.categories(period=period_date, card_id=selection.card_id)
+    merchants = await service.merchants(period=period_date, card_id=selection.card_id)
+    monthly = await service.monthly_window(
+        window_start=window_start, window_end=window_end, card_id=selection.card_id
+    )
+    recurring_rows = await service.recurring(period=period_date, card_id=selection.card_id)
+    merchant_names = await _lookup_merchant_names(
+        session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
+    )
+    recur_count = len(recurring_rows)
+    recur_monthly = sum(
+        int(row.get("amount_min", 0) or 0) for row in recurring_rows if row.get("currency") == "CLP"
+    )
+    context: dict[str, Any] = {
+        "request": request,
+        "cards": cards,
+        "summary": summary,
+        "categories": categories,
+        "merchants": merchants,
+        "monthly": monthly,
+        "recurring": recurring_rows,
+        "merchants_by_id": merchant_names,
+        "period_label": labels.period_label,
+        "period_iso": selection.period.iso(),
+        "card_label": labels.card_label,
+        "range_label": labels.range_label,
+        "range_mode_options": range_mode_options(),
+        "selected_period": selection.period.iso(),
+        "selected_range_mode": selection.range_mode.wire_value(),
+        "selected_card_id": str(selection.card_id),
+        "recur_count": recur_count,
+        "recur_monthly": recur_monthly,
+        "window_start": window_start,
+        "window_end": window_end,
+    }
+    if full_page:
+        context["app_name"] = request.app.state.settings.APP_NAME
+    return context
 
 
 async def _list_active_cards(session: AsyncSession) -> list[CreditCard]:
@@ -618,22 +709,20 @@ async def _lookup_merchant_names(
 async def dashboard_page(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    range_months: Annotated[
-        int,
+    period: Annotated[
+        str,
         Query(
-            description=(
-                "Period picker value. ``0`` = current month, ``3/6/12`` = "
-                "rolling window in months, ``-1`` = all-time."
-            ),
+            description="ISO 'YYYY-MM' period label.",
         ),
-    ] = _DASHBOARD_DEFAULT_RANGE,
+    ] = "",
+    range_mode: Annotated[
+        str,
+        Query(description="Dashboard web range mode."),
+    ] = "current",
     card_id: Annotated[
         str,
         Query(
-            description=(
-                "Card filter — ``'all'`` for every card, or a UUID for a "
-                "single card."
-            ),
+            description=("Card filter — ``'all'`` for every card, or a UUID for a single card."),
         ),
     ] = "all",
 ) -> HTMLResponse:
@@ -653,66 +742,42 @@ async def dashboard_page(
     fall back to ``"all"`` so a tampered URL is still safe
     (the API surface returns 400 for the same input).
     """
-    normalised_range = _parse_range_option(range_months)
-    parsed_card_id = _parse_card_filter(card_id)
-    cards = await _list_active_cards(session)
-    service = DashboardService(session)
-    period_str = _current_period()
-    period_date = date_typ.today().replace(day=1)
-
-    summary = await service.summary(
-        period=period_date, range_months=normalised_range, card_id=parsed_card_id
-    )
-    categories = await service.categories(period=period_date, card_id=parsed_card_id)
-    merchants = await service.merchants(period=period_date, card_id=parsed_card_id)
-    monthly = await service.monthly(range_months=normalised_range, card_id=parsed_card_id)
-    recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
-    # The Suscripciones KPI card (4th in the summary grid) needs
-    # the live count and CLP-summed monthly total. Compute them
-    # here so the inline render of ``dashboard_summary.html`` in
-    # the initial paint has the same data the HTMX endpoint
-    # returns (otherwise the inline render shows em-dashes).
-    recur_count = len(recurring_rows)
-    recur_monthly = sum(
-        int(row.get("amount_min", 0) or 0)
-        for row in recurring_rows
-        if row.get("currency") == "CLP"
-    )
-    merchant_names = await _lookup_merchant_names(
-        session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
-    )
-
-    range_label_map = {0: "Mes actual", 3: "3 meses", 6: "6 meses", 12: "12 meses"}
-    if normalised_range == 0 and range_months != 0:
-        range_label = "Todo el historial"
-    elif normalised_range == 0:
-        range_label = range_label_map[0]
-    else:
-        range_label = range_label_map.get(normalised_range, f"{normalised_range} meses")
-    card_label_text = _card_label(card_id, cards)
-
-    app_name: str = request.app.state.settings.APP_NAME
-    context: dict[str, Any] = {
-        "app_name": app_name,
-        "cards": cards,
-        "summary": summary,
-        "categories": categories,
-        "merchants": merchants,
-        "monthly": monthly,
-        "recurring": recurring_rows,
-        "merchants_by_id": merchant_names,
-        "period_label": period_str,
-        "card_label": card_label_text,
-        "range_label": range_label,
-        "selected_period": period_str,
-        "selected_range": range_months,
-        "selected_card_id": card_id,
-        "recur_count": recur_count,
-        "recur_monthly": recur_monthly,
-    }
+    period_value = period or _current_period()
+    try:
+        selection = parse_selection(period=period_value, card_id=card_id, range_mode=range_mode)
+    except (ValueError, TypeError):
+        selection = DashboardSelection(
+            period=YearMonth.parse(_current_period()),
+            card_id="all",
+            range_mode=RangeMode.current(),
+        )
+    context = await _dashboard_context(request, session, selection=selection, full_page=True)
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
+        context=context,
+    )
+
+
+@web_router.get(
+    "/dashboard/sections",
+    response_class=HTMLResponse,
+    summary="HTMX partial: all dashboard sections for one selection",
+    include_in_schema=False,
+)
+async def dashboard_sections(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    period: Annotated[str, Query(description="ISO 'YYYY-MM' period label.")],
+    card_id: Annotated[str, Query(description="UUID or 'all'.")] = "all",
+    range_mode: Annotated[str, Query(description="Dashboard web range mode.")] = "current",
+) -> HTMLResponse:
+    """Render all five dashboard sections from one selection state."""
+    selection = parse_selection(period=period, card_id=card_id, range_mode=range_mode)
+    context = await _dashboard_context(request, session, selection=selection, full_page=False)
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/dashboard_sections.html",
         context=context,
     )
 
@@ -815,54 +880,6 @@ async def dashboard_section_categories(
     return templates.TemplateResponse(
         request=request,
         name="partials/dashboard_categories.html",
-        context=context,
-    )
-
-
-@web_router.get(
-    "/dashboard/sections/anomalies",
-    response_class=HTMLResponse,
-    summary="HTMX partial: anomaly alerts for the period",
-    include_in_schema=False,
-)
-async def dashboard_section_anomalies(
-    request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
-    period: Annotated[str, Query(description="ISO 'YYYY-MM' month label.")],
-    card_id: Annotated[str, Query(description="UUID or 'all'.")] = "all",
-) -> HTMLResponse:
-    """HTMX partial: render the anomaly alerts panel for the period.
-
-    Phase 3 has the *detection* deferred to a later phase. The
-    v5 dark synthesis hard-codes a representative sample of the
-    three most common alert types (over-typical-amount, new
-    merchant, duplicate subscription) so the panel is visually
-    complete. When the detector lands, this endpoint swaps the
-    hard-coded list for ``await detector.find_anomalies(period)``.
-
-    The panel uses the same color tokens as the rest of the
-    dashboard (see ``openspec/specs/phase3-dashboard/spec.md``):
-    primary red ``#ff5451`` for high-severity, tertiary pink
-    ``#ffb3ad`` for medium-severity.
-
-    Phase 3 deferred anomaly *detection* to a later phase. The
-    endpoint returns an empty list for now; the partial renders
-    an empty state when ``anomalies`` is empty (no fake
-    placeholders). When the detector lands, this endpoint
-    replaces the empty list with
-    ``await detector.find_anomalies(period)`` and the partial
-    starts rendering real alerts.
-    """
-    cards = await _list_active_cards(session)
-    anomalies: list[dict[str, object]] = []
-    context: dict[str, Any] = {
-        "anomalies": anomalies,
-        "period_label": period,
-        "card_label": _card_label(card_id, cards),
-    }
-    return templates.TemplateResponse(
-        request=request,
-        name="partials/dashboard_anomalies.html",
         context=context,
     )
 

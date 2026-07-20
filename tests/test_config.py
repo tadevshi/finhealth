@@ -16,8 +16,9 @@ def _clear_settings_cache() -> Iterator[None]:
     get_settings.cache_clear()
 
 
-def test_settings_defaults() -> None:
+def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """Defaults match the documented values when no env is set."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     # _env_file=None forces Settings to read only from the process env,
     # not from a local .env file (which may override defaults in dev).
     settings = Settings(_env_file=None)
@@ -25,12 +26,19 @@ def test_settings_defaults() -> None:
     assert settings.APP_NAME == "finhealth"
     assert settings.DEBUG is False
     assert settings.SECRET_KEY == "change-me-in-production"
-    assert settings.DATABASE_URL == "sqlite+aiosqlite:///./finhealth.db"
+    assert settings.DATABASE_URL == "sqlite+aiosqlite:///data/finhealth.db"
     assert settings.CORS_ORIGINS == ["http://localhost:8000"]
     # LLM defaults: OpenCode Zen with a free model — no API key required to start.
     assert settings.LLM_PROVIDER == "opencode_zen"
     assert settings.LLM_API_ENDPOINT == "https://opencode.ai/zen/v1"
     assert settings.LLM_MODEL == "deepseek-v4-flash-free"
+
+
+def test_default_database_url_is_canonical_data_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local default uses the canonical data/finhealth.db SQLite path."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    assert Settings(_env_file=None).DATABASE_URL == "sqlite+aiosqlite:///data/finhealth.db"
 
 
 def test_settings_env_override(
@@ -41,9 +49,7 @@ def test_settings_env_override(
     monkeypatch.setenv("DEBUG", "true")
     monkeypatch.setenv("SECRET_KEY", "super-secret")
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./custom-test.db")
-    monkeypatch.setenv(
-        "CORS_ORIGINS", '["https://example.com","https://api.example.com"]'
-    )
+    monkeypatch.setenv("CORS_ORIGINS", '["https://example.com","https://api.example.com"]')
     monkeypatch.setenv("LLM_PROVIDER", "ollama")
     monkeypatch.setenv("LLM_API_ENDPOINT", "http://test-llm:11434")
 

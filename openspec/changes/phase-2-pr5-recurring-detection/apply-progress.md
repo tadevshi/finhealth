@@ -130,23 +130,100 @@ The chunk loop, `try/finally`, `first_successful_chunk_seen` flag, `last_chunk_e
 | Cherry-pick isolation audit | **PASS** — only 4 additive source-LOC in `ingestion.py` |
 | Coverage ≥ 83.17% (PR #2 baseline) | **84.31%** with full test suite |
 
+## Remediation Progress — 2026-07-16 (first verification remediation)
+
+### Scope
+
+This remediation repairs only the two change-scoped verification blockers called out in `verify-report.md`:
+
+1. Recurring-rule upsert `occurrences` semantics.
+2. Quarterly/yearly detector scenario coherence with the normative 90-day scan window.
+
+The user explicitly authorized bypassing the newly introduced early review-gate discrepancy for this repair only. Test/spec correctness gates were not bypassed. No dashboard or PostgreSQL files were modified.
+
+### Changes
+
+| File | Action | What changed |
+|------|--------|--------------|
+| `app/services/recurring_detection.py` | Modified | Existing-rule upserts now increment cumulative `occurrences` only by in-band rows not already linked to the rule; `_scan_window` uses `populate_existing=True` so reruns see current FK state and do not double-count stale identity-map rows. |
+| `tests/test_recurring.py` | Modified | Upsert test now proves 3 → 4 after one new in-band occurrence and remains 4 on an unchanged rerun; quarterly/yearly threshold examples are covered explicitly while full-detector behavior remains bound to the 90-day window. |
+| `openspec/changes/phase-2-pr5-recurring-detection/specs/phase2-recurring-detection/spec.md` | Modified | Quarterly/yearly scenarios now state threshold mapping explicitly and preserve the normative 90-day scan-window constraint instead of requiring unreachable three-occurrence detector rules. |
+
+### Work Unit Evidence
+
+| Evidence | Required value |
+|---|---|
+| Focused test command and exact result | `python -m pytest tests/test_recurring.py -q` → exit 0; `31 passed`; recurring detector coverage 96.18%. |
+| Runtime harness command/scenario and exact result | `python -m pytest tests/test_recurring.py tests/test_alembic.py tests/test_ingestion.py::TestRecurringDetectorIntegration -q` → exit 0; `54 passed`; recurring detector coverage 96.18%. |
+| Rollback boundary | Revert `app/services/recurring_detection.py`, `tests/test_recurring.py`, and the recurring-detection delta spec edits in `openspec/changes/phase-2-pr5-recurring-detection/specs/phase2-recurring-detection/spec.md`. |
+
+### Additional Checks
+
+| Check | Exit | Result |
+|---|---:|---|
+| `python -m ruff check app/services/recurring_detection.py tests/test_recurring.py` | 0 | All checks passed. |
+| `python -m ruff format --check app/services/recurring_detection.py tests/test_recurring.py` | 0 | 2 files already formatted. |
+| `python -m pytest tests/ -q` | 1 | `544 passed, 23 failed`; coverage 82.76%. Failures remain the known unrelated/baseline set outside recurring detection and were not modified in this batch. |
+
+### Resolution Notes
+
+- Upsert semantics now follow the normative requirement: on hit, `occurrences` is incremented by new in-band occurrences rather than overwritten with the current 90-day scan count. Rows already linked to the same rule are not counted again.
+- The quarterly/yearly mismatch was resolved without weakening the 90-day scan requirement: `_classify_period(90)` and `_classify_period(365)` remain tested as threshold mappings, while the full detector explicitly does not create quarterly/yearly rules that cannot meet the three-occurrence threshold inside the 90-day window.
+- No native remediation lineage was fabricated; the persisted review transaction remains unavailable, as recorded in the prior verify report.
+
+## Remediation Progress — 2026-07-16 (fresh verification follow-up)
+
+### Scope
+
+This follow-up repairs only the two fresh targeted blockers from `verify-report.md`:
+
+1. Cross-statement occurrence accounting produced `created=3, updated=6` instead of `created=3, updated=4`.
+2. The upsert delta spec still retained an unreachable positive quarterly full-detector scenario under the normative 90-day scan window.
+
+### Changes
+
+| File | Action | What changed |
+|------|--------|--------------|
+| `app/services/recurring_detection.py` | Modified | Existing-rule occurrence increments now count only in-band rows from the just-ingested statement whose FK is not already linked to the rule. Historical rows included in a previous cumulative count are no longer re-counted merely because their FK is null. |
+| `tests/test_recurring.py` | Modified | Added `test_upsert_counts_only_current_statement_new_occurrences`, a production-shaped sequential-statement regression that locks the exact `3 -> 4` behavior and would fail as `3 -> 6` under the previous FK-ledger logic. |
+| `openspec/changes/phase-2-pr5-recurring-detection/specs/phase2-recurring-detection/spec.md` | Modified | Replaced the unreachable positive quarterly different-period upsert scenario with an in-window biweekly scenario, while preserving quarterly/yearly threshold mapping as classifier-only behavior under the 90-day scan contract. |
+
+### Work Unit Evidence
+
+| Evidence | Required value |
+|---|---|
+| Focused test command and exact result | `python -m pytest tests/test_recurring.py -q` → exit 0; `32 passed`; recurring detector coverage 96.18%. |
+| Runtime harness command/scenario and exact result | `python -m pytest tests/test_recurring.py::TestRecurringDetectorAlgorithm::test_upsert_counts_only_current_statement_new_occurrences -q` → exit 0; `1 passed`; regression covers the exact prior `3 -> 6` cross-statement failure and asserts `3 -> 4`. |
+| Rollback boundary | Revert the latest edits to `app/services/recurring_detection.py`, `tests/test_recurring.py`, and `openspec/changes/phase-2-pr5-recurring-detection/specs/phase2-recurring-detection/spec.md`; prior PR #5 implementation and prior remediation remain intact. |
+
+### Additional Checks
+
+| Check | Exit | Result |
+|---|---:|---|
+| `python -m pytest tests/test_recurring.py tests/test_alembic.py tests/test_ingestion.py::TestRecurringDetectorIntegration -q` | 0 | `55 passed`; recurring detector coverage 96.18%. |
+| `python -m ruff check app/services/recurring_detection.py tests/test_recurring.py` | 0 | All checks passed. |
+| `python -m ruff format --check app/services/recurring_detection.py tests/test_recurring.py` | 0 | 2 files already formatted. |
+| `git diff --check` | 0 | No whitespace errors. |
+
+### Resolution Notes
+
+- The occurrence ledger is the current ingest boundary, not historical FK linkage. On an existing-rule hit, only rows from `statement.id` that are in-band and not already linked are new occurrences.
+- This preserves idempotence for repeated detection on the same statement and safety across sequential statements where earlier historical rows were counted during rule creation but intentionally not backfilled.
+- The spec remains strict on the 90-day detector window. Quarterly/yearly remain meaningful as threshold-mapping behavior (`_classify_period(90)`, `_classify_period(365)`) plus explicit no-rule full-detector tests for unreachable three-occurrence cases.
+
 ## Deviations from Design
 
-### 1. `occurrences` semantics — overwritten, not incremented (deviation, then corrected in test)
+### 1. `occurrences` semantics — cumulative increment on existing rules (remediated)
 
-The spec scenario for "Second ingest updates the same rule" implies `occurrences` is the total in-band count (3 → 4 after one new row). My initial implementation incremented by the run's in-band count, which produced 3+4=7 on the test scenario (3 old + 1 new, with the second run seeing 4 in-band).
-
-The spec scenario "occurrences becomes 4" maps cleanly to "overwrite with current run's in-band count" — both interpretations land on `4` for the documented scenario. I changed the implementation to overwrite (cleaner, matches the documented scenario verbatim, and avoids double-counting). The `_compute_confidence` formula now uses the in-band count as the occurrences input. **No spec scenario is broken**; the behaviour matches the documented "Second ingest" example.
-
-The task description in `tasks.md` says "**5) ... 4) `confidence = round(min(1.0, occurrences/5) * ...`** " — ambiguous on whether occurrences is cumulative or per-run. The spec scenario pinned it down to per-run.
+The normative spec says an existing rule's `occurrences` is incremented by the new in-band count. The 2026-07-16 remediation changed the implementation from overwriting with the current 90-day scan count to cumulative semantics: rows already linked to the same rule are not counted again, and not-yet-linked in-band rows increment the stored value. The focused test now proves 3 → 4 after one new occurrence and remains 4 on an unchanged rerun.
 
 ### 2. Confidence value for 3-occurrence scenario (test precision)
 
 The spec scenario quotes `confidence ≈ 0.543` for 3 occurrences at $10.00 / $10.50 / $11.00. The exact computation is `0.6 * (1.0 - 1.0/10.5) = 0.6 * 0.90476... = 0.542857...` rounded to 4 decimals = `0.5429`. The spec quotes `0.543` as the *approximate* value; the test asserts the exact `0.5429`. **No spec deviation** — the spec uses `~` and the test pins the exact deterministic result.
 
-### 3. Period classification quarterly/yearly — limited in-window reachability (no deviation)
+### 3. Period classification quarterly/yearly — 90-day window preserved (remediated)
 
-The spec scenarios for quarterly and yearly classification (3 occurrences 90 / 365 days apart) are unreachable in a 90-day detector window — a 90-day interval pattern has only 2 occurrences in the 90-day window, which fails the 3-occurrence threshold. The threshold logic for these buckets is exercised by the `test_period_classification_thresholds` unit test (which calls `_classify_period` directly with the documented input values). **No spec deviation** — the threshold mapping is correct; the in-window scenarios are out of reach by definition.
+The original positive full-detector scenarios for quarterly and yearly cadence were unreachable under the same spec's 90-day scan window and ≥3 occurrence threshold. The 2026-07-16 remediation made the delta spec explicit: quarterly/yearly values are threshold-mapping cases (`90 → quarterly`, `365 → yearly`), while the full detector must not expand the 90-day window to force unreachable rules. Focused tests cover both the threshold mapping and the no-rule detector behavior for quarterly/yearly date sets.
 
 ## Risks
 

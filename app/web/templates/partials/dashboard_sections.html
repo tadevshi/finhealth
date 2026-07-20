@@ -1,0 +1,109 @@
+{% set total_map = summary.total_per_currency if summary.total_per_currency is defined else {} %}
+<div id="dashboard-sections"
+     data-testid="dashboard-sections-target"
+     class="space-y-6 min-w-0">
+
+  <section class="overflow-hidden rounded-[28px] border border-border bg-surface p-5 shadow-2xl shadow-black/10 sm:p-6 lg:p-8"
+           data-testid="dashboard-hero">
+    <div class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(280px,360px)] lg:items-start">
+      <div class="min-w-0 space-y-5">
+        <div class="space-y-3">
+          <p class="text-sm font-medium text-accent-light">{{ range_label }} &middot; {{ card_label }}</p>
+          <h1 class="font-display text-3xl font-bold tracking-[-0.75px] text-text-primary sm:text-4xl lg:text-5xl"
+              data-testid="dashboard-title">
+            {{ period_label }}
+          </h1>
+          <p class="max-w-2xl text-sm leading-6 text-text-secondary sm:text-base">
+            Live overview for the selected card, period, and range. Amounts stay separated by currency; no FX conversion is applied.
+          </p>
+        </div>
+
+        {% if total_map %}
+        <div class="grid gap-3 sm:grid-cols-2" data-testid="dashboard-hero-currencies">
+          {% for cur, amt in total_map.items() %}
+          <div class="rounded-2xl border border-border bg-surface-container p-4"
+               data-testid="dashboard-hero-currency"
+               data-currency="{{ cur }}">
+            <p class="font-mono text-[11px] font-semibold tracking-[1px] text-text-subtle">{{ cur }}</p>
+            <p class="mt-2 font-mono text-2xl font-bold tracking-[-0.5px] text-text-primary">
+              {% if cur == 'CLP' %}$ {{ "{:,.0f}".format(amt) }}{% else %}$ {{ "{:,.2f}".format(amt) }}{% endif %}
+            </p>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="rounded-2xl border border-dashed border-border-strong bg-surface-container p-4 text-sm text-text-secondary"
+             data-testid="dashboard-hero-empty">
+          No transactions found for this selection yet. The sections below remain available with data-backed empty states.
+        </div>
+        {% endif %}
+      </div>
+
+      <form data-testid="dashboard-selection-form"
+            hx-get="/dashboard/sections"
+            hx-target="#dashboard-sections"
+            hx-swap="outerHTML"
+            hx-trigger="change, submit"
+            class="grid gap-4 rounded-2xl border border-border bg-surface-container p-4">
+        <label class="flex flex-col gap-2 text-sm font-medium text-text-secondary" for="dashboard-period">
+          Period
+          <input id="dashboard-period"
+                 type="month"
+                 name="period"
+                 value="{{ selected_period }}"
+                 class="min-h-11 rounded-xl border border-border bg-surface px-3 text-text-primary focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30">
+        </label>
+        <label class="flex flex-col gap-2 text-sm font-medium text-text-secondary" for="dashboard-card-id">
+          Card
+          <select id="dashboard-card-id"
+                  name="card_id"
+                  data-testid="dashboard-card-picker"
+                  class="min-h-11 rounded-xl border border-border bg-surface px-3 text-text-primary focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30">
+            <option value="all" {% if selected_card_id == 'all' %}selected{% endif %}>Todas</option>
+            {% for card in cards %}
+              <option value="{{ card.id }}" {% if selected_card_id == card.id|string %}selected{% endif %}>
+                {{ card.bank.display_name }} &mdash; {{ card.card_number_masked }}
+              </option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="flex flex-col gap-2 text-sm font-medium text-text-secondary" for="dashboard-range-mode">
+          Range
+          <select id="dashboard-range-mode"
+                  name="range_mode"
+                  data-testid="dashboard-range-picker"
+                  class="min-h-11 rounded-xl border border-border bg-surface px-3 text-text-primary focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30">
+            {% for value, label in range_mode_options %}
+              <option value="{{ value }}" {% if selected_range_mode == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button type="submit" class="min-h-11 rounded-xl bg-accent px-4 text-sm font-semibold text-white focus:outline-none focus:ring-2 focus:ring-accent-light">
+          Refresh dashboard
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <div data-testid="dashboard-summary-target">
+    {% include "partials/dashboard_summary.html" %}
+  </div>
+
+  <div class="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,680px)_minmax(0,440px)]" data-testid="dashboard-primary-grid">
+    <div class="min-w-0" data-testid="dashboard-categories-target">
+      {% include "partials/dashboard_categories.html" %}
+    </div>
+    <div class="min-w-0" data-testid="dashboard-merchants-target">
+      {% include "partials/dashboard_merchants.html" %}
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,680px)_minmax(0,440px)]" data-testid="dashboard-secondary-grid">
+    <div class="min-w-0" data-testid="dashboard-monthly-target">
+      {% include "partials/dashboard_monthly.html" %}
+    </div>
+    <div class="min-w-0" data-testid="dashboard-recurring-target">
+      {% include "partials/dashboard_recurring.html" %}
+    </div>
+  </div>
+</div>

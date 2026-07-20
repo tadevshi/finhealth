@@ -8,14 +8,14 @@ Phase 1 ingests every line-item in a bank statement, and Phase 2 enriches each r
 
 ### Requirement: `DashboardService.summary` Returns KPI Aggregates for a Period
 
-`DashboardService.summary(period, range, card_id)` MUST return aggregated KPI data for the calendar month `period` (ISO `YYYY-MM`) restricted to the lookback window `range` (one of `3`, `6`, `12`, or `0` for all-time) and to a single card when `card_id` is a UUID, or to every card when `card_id == "all"`. The response MUST include: `total_per_currency` (dict `{currency: amount}`, no FX conversion), `daily_avg_per_currency` (total / number of distinct calendar days in the period that have at least one transaction, per currency), `transaction_count` (int), `top_category_id` + `top_category_total_per_currency` (the closed-set category with the largest sum in any currency, broken down by currency), `top_merchant_id` + `top_merchant_total_per_currency` (analogous for merchant), `comparison_to_prev_period_pct_per_currency` (signed % change vs. the same period in the previous month, or `{}` if the previous month has no transactions in that currency), `period_start` + `period_end` (ISO dates), and `card_id` (echo of the input). `top_category_total_per_currency` and `top_merchant_total_per_currency` are also multi-currency dicts. (Q1, Q2, Q3, Q4, Q8)
+`DashboardService.summary(period, range, card_id)` MUST return aggregated KPI data for the calendar month `period` (ISO `YYYY-MM`) restricted to the lookback window `range` (one of `3`, `6`, `12`, or `0` for all-time) and to a single card when `card_id` is a UUID, or to every card when `card_id == "all"`. The response MUST include: `total_per_currency` (dict `{currency: amount}`, no FX conversion), `daily_avg_per_currency` (`{currency: total / calendar days of the period month}` — July divides by 31, Feb by 28/29, independent of transaction-date density), `transaction_count` (int), `transaction_count_per_currency` (`{currency: count}`; absent for empty currencies), `top_category_id` + `top_category_total_per_currency` (the closed-set category with the largest sum in any currency, broken down by currency), `top_merchant_id` + `top_merchant_total_per_currency` (analogous for merchant), `comparison_to_prev_period_pct_per_currency` (signed % change vs. the same period in the previous month, or `{}` if the previous month has no transactions in that currency), `period_start` + `period_end` (ISO dates), and `card_id` (echo of the input). `top_category_total_per_currency` and `top_merchant_total_per_currency` are also multi-currency dicts. (Q1, Q2, Q3, Q4, Q8)
 
 #### Scenario: Summary for a single-currency period
 
 - **GIVEN** 5 CLP transactions in `2026-07` across the "Groceries" and "Dining Out" categories
 - **WHEN** the service calls `summary(period="2026-07", range=6, card_id="all")`
 - **THEN** the response carries `total_per_currency == {"CLP": <sum>}` and `transaction_count == 5`
-- **AND** `daily_avg_per_currency["CLP"] == total_per_currency["CLP"] / <distinct days>`
+- **AND** `daily_avg_per_currency["CLP"] == total_per_currency["CLP"] / <calendar days of the period month>`
 - **AND** `period_start == "2026-07-01"` and `period_end == "2026-07-31"`
 - **AND** `card_id == "all"`
 
@@ -37,7 +37,7 @@ Phase 1 ingests every line-item in a bank statement, and Phase 2 enriches each r
 
 - **GIVEN** transactions span `2025-01` through `2026-07`
 - **WHEN** the service calls `summary(period="2026-07", range=0, card_id="all")`
-- **THEN** the previous-period comparison is computed against `2026-06` (not against the dataset minimum), and `daily_avg_per_currency` uses the period's distinct days, not the full history
+- **THEN** the previous-period comparison is computed against `2026-06` (not against the dataset minimum), and `daily_avg_per_currency` uses the calendar days of the period month, not the full history
 
 #### Scenario: Empty period returns zeros, not an error
 

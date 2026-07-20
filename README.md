@@ -171,7 +171,7 @@ the money actually goes.
 - A POSIX shell (bash, zsh). Windows works under WSL.
 
 > No database server is required: finhealth uses a local SQLite file
-> (`./finhealth.db`) created on first migration.
+> (`data/finhealth.db`) created on first migration.
 
 ### LLM endpoint
 
@@ -229,7 +229,7 @@ Open `.env` in your editor. At minimum:
 alembic upgrade head
 ```
 
-The SQLite database (`./finhealth.db`) is created on first run. The
+The SQLite database (`data/finhealth.db`) is created on first run. The
 Phase 1 migration seeds the three known banks (Santander, Itaú, Banco
 de Chile) with the right password formulas.
 
@@ -361,6 +361,17 @@ skip coverage:
 ```bash
 pytest --no-cov
 ```
+
+For Phase 3 dashboard hardening verification, run the focused harness:
+
+```bash
+./scripts/verify.sh
+```
+
+The script runs the dashboard/seed/SQLite/documentation/Docker lifecycle
+focused pytest suite, Ruff, `compileall`, and the disposable Docker checks.
+The Docker lifecycle test uses an isolated Compose project and xfails cleanly
+when Docker is unavailable.
 
 The Phase 1 E2E test (`tests/test_e2e_phase1.py`) requires the sample
 PDFs in `shared/account-state-examples/`. The repo does not commit
@@ -500,7 +511,7 @@ project root). See `.env.example` for the full list. Key entries:
 | `APP_NAME`          | `finhealth`                            | Display name + OpenAPI title                  |
 | `DEBUG`             | `false`                                | Verbose errors / autoreload hint              |
 | `SECRET_KEY`        | `change-me-in-production`              | Secret used for signing tokens                |
-| `DATABASE_URL`      | `sqlite+aiosqlite:///./finhealth.db`   | Async SQLAlchemy URL                          |
+| `DATABASE_URL`      | `sqlite+aiosqlite:///data/finhealth.db` | Async SQLAlchemy URL                          |
 | `CORS_ORIGINS`      | `["http://localhost:8000", ...]`       | Allowed CORS origins                          |
 | `LLM_PROVIDER`      | `opencode_go`                          | LLM provider identifier                       |
 | `LLM_API_ENDPOINT`  | `http://localhost:11434`               | Base URL for the LLM provider's HTTP API      |
@@ -677,9 +688,9 @@ Docker deployment are:
 
 The compose file bind-mounts two host directories into the
 container. They survive `docker compose down` and any number of
-container restarts. `docker compose down -v` would *also* wipe
-the host directories — only pass `-v` when you really want a
-clean slate.
+container restarts. `docker compose down -v` removes Docker named
+volumes, but it does **not** delete bind-mounted host directories
+such as `./data` or `./shared`.
 
 | Host path   | Container path  | Purpose                                                                 |
 | ----------- | --------------- | ----------------------------------------------------------------------- |
@@ -690,6 +701,52 @@ Both directories are tracked as empty in git via `.gitkeep`
 files, so a fresh `git clone` produces the directories Docker
 needs to bind-mount. Anything you drop in there is ignored by
 git (see `.gitignore`).
+
+### SQLite backup and restore
+
+The canonical database path is `data/finhealth.db` locally and
+`/app/data/finhealth.db` inside Docker. Because SQLite may use WAL
+files, do not copy a live database file blindly. Use the verified
+helper, which uses SQLite's backup API, runs `PRAGMA integrity_check`,
+and writes a row-count manifest for `transactions`, `statements`,
+`credit_cards`, and `banks`:
+
+```bash
+python -m app.cli.sqlite_ops backup \
+  sqlite:///data/finhealth.db \
+  backups/finhealth-$(date +%F).db
+```
+
+To restore, stop the app first, validate and atomically replace the DB,
+then restart and check health:
+
+```bash
+docker compose stop finhealth
+python -m app.cli.sqlite_ops restore \
+  backups/finhealth-YYYY-MM-DD.db \
+  sqlite:///data/finhealth.db
+docker compose up -d finhealth
+curl http://localhost:8000/api/v1/health
+```
+
+For a stopped-container backup variant, stop the container and copy the
+database directory snapshot with the same helper used by the tests:
+
+```bash
+python -c "from app.cli.sqlite_ops import copy_stopped_container_db; copy_stopped_container_db('data', 'backups/finhealth-stopped.db')"
+```
+
+The exact bind-mount lifecycle `docker compose down && docker compose up -d`
+preserves `./data/finhealth.db` because `./data` is a host directory, not a
+named Docker volume. Likewise, `docker compose down -v does **not** delete bind-mounted host directories`;
+it removes named volumes only.
+
+Restore removes stale `data/finhealth.db-wal` and
+`data/finhealth.db-shm` before replacement. A corrupt backup or a
+non-SQLite URL is rejected before the destination is mutated. After
+restore, compare the generated `.manifest.json` counts with the
+post-restore manifest and smoke-test `/dashboard` plus the JSON health
+endpoint.
 
 ### File ownership (HOST_UID / HOST_GID)
 

@@ -534,9 +534,11 @@ class TestRecurringDetectorAlgorithm:
         assert RecurringDetector._classify_period(45) == ("monthly", 45)
         # Monthly overflows → quarterly.
         assert RecurringDetector._classify_period(46) == ("quarterly", 46)
+        assert RecurringDetector._classify_period(90) == ("quarterly", 90)
         assert RecurringDetector._classify_period(120) == ("quarterly", 120)
         # Quarterly overflows → yearly.
         assert RecurringDetector._classify_period(121) == ("yearly", 121)
+        assert RecurringDetector._classify_period(365) == ("yearly", 365)
         assert RecurringDetector._classify_period(400) == ("yearly", 400)
         # Above the top threshold still maps to "yearly"
         # (no "unknown" bucket in v1).
@@ -589,11 +591,14 @@ class TestRecurringDetectorAlgorithm:
     ) -> None:
         """Re-running the detector on the same pattern updates the existing rule.
 
-        The first run creates a new ``RecurringRule``;
-        the second run on the same pattern (with one
-        additional in-band occurrence) updates the
-        existing row's ``occurrences``, ``last_seen_date``,
-        and ``confidence`` — no second rule is inserted.
+        The first run creates a new ``RecurringRule``.
+        The second run on the same pattern, with one
+        additional not-yet-linked in-band occurrence,
+        increments the existing row's cumulative
+        ``occurrences`` from 3 to 4 — no second rule is
+        inserted. A third unchanged run remains at 4,
+        proving the detector does not double-count the
+        same 90-day window.
         The upsert key matches on the full composite
         ``(merchant_id, amount_min, amount_max, currency, period_days)``.
         """
@@ -638,6 +643,195 @@ class TestRecurringDetectorAlgorithm:
             # Same row, updated — not a new rule.
             assert second[0].id == first_id
             assert second[0].occurrences == 4
+
+            third = await RecurringDetector(session, partial_success=False).detect(statement)
+            assert len(third) == 1
+            assert third[0].id == first_id
+            assert third[0].occurrences == 4
+
+    @pytest.mark.asyncio
+    async def test_upsert_counts_only_current_statement_new_occurrences(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Sequential statements update occurrences from 3 to 4, not 6.
+
+        The production-shaped path creates a rule while
+        scanning historical statements, but FK backfill is
+        intentionally scoped to the just-ingested statement.
+        Historical rows may therefore be included in the
+        initial count without being linked to the rule. On
+        the next statement, those historical rows MUST NOT
+        be treated as new occurrences just because their FK
+        is still null.
+        """
+        card_id = seeded_world["card_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+
+        async with session_factory() as session:
+            statements: list[Statement] = []
+            for index, txn_date in enumerate(
+                (date(2026, 4, 1), date(2026, 5, 1), date(2026, 6, 1)),
+                start=1,
+            ):
+                statement = Statement(
+                    credit_card_id=card_id,
+                    period_start=txn_date.replace(day=1),
+                    period_end=txn_date,
+                    statement_date=txn_date,
+                    file_path=f"/tmp/recurring-sequential-{index}.pdf",
+                    file_hash=f"{index}" * 64,
+                    status=StatementStatus.COMPLETED,
+                )
+                session.add(statement)
+                await session.commit()
+                await session.refresh(statement)
+                statements.append(statement)
+                _add_transaction(
+                    session,
+                    statement_id=statement.id,
+                    merchant_id=merchant_id,
+                    amount="9.99",
+                    txn_date=txn_date,
+                )
+                await session.commit()
+
+            created = await RecurringDetector(session, partial_success=False).detect(statements[-1])
+            assert len(created) == 1
+            assert created[0].occurrences == 3
+            first_id = created[0].id
+
+            next_statement = Statement(
+                credit_card_id=card_id,
+                period_start=date(2026, 6, 1),
+                period_end=date(2026, 6, 30),
+                statement_date=date(2026, 6, 30),
+                file_path="/tmp/recurring-sequential-4.pdf",
+                file_hash="4" * 64,
+                status=StatementStatus.COMPLETED,
+            )
+            session.add(next_statement)
+            await session.commit()
+            await session.refresh(next_statement)
+            _add_transaction(
+                session,
+                statement_id=next_statement.id,
+                merchant_id=merchant_id,
+                amount="9.99",
+                txn_date=date(2026, 6, 20),
+            )
+            await session.commit()
+
+            updated = await RecurringDetector(session, partial_success=False).detect(next_statement)
+
+        assert len(updated) == 1
+        assert updated[0].id == first_id
+        assert updated[0].occurrences == 4
+
+    @pytest.mark.asyncio
+    async def test_find_rule_tolerates_duplicate_existing_rows(
+        self,
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Duplicate existing upsert-key rows do not crash detection."""
+        merchant_id = seeded_world["merchant_id"]  # type: ignore[arg-type]
+
+        def _rule(rule_id: str, confidence: float, last_seen: date) -> RecurringRule:
+            return RecurringRule(
+                id=uuid.UUID(rule_id),
+                merchant_id=merchant_id,
+                period_days=30,
+                period_label="monthly",
+                amount_min=Decimal("9.99"),
+                amount_max=Decimal("9.99"),
+                currency="USD",
+                is_active=True,
+                confidence=confidence,
+                last_seen_date=last_seen,
+                occurrences=3,
+            )
+
+        older = _rule("11111111-1111-1111-1111-111111111111", 0.7, date(2026, 5, 20))
+        winner = _rule("22222222-2222-2222-2222-222222222222", 0.9, date(2026, 5, 15))
+
+        class _Result:
+            def all(self) -> list[RecurringRule]:
+                return [older, winner]
+
+            def scalars(self) -> _Result:
+                return self
+
+        class _Session:
+            async def execute(self, _stmt: object) -> _Result:
+                return _Result()
+
+        detector = RecurringDetector(_Session(), partial_success=False)  # type: ignore[arg-type]
+        found = await detector._find_rule(
+            merchant_id=merchant_id,
+            amount_min=Decimal("9.99"),
+            amount_max=Decimal("9.99"),
+            currency="USD",
+            period_days=30,
+        )
+
+        assert found is winner
+
+    @pytest.mark.asyncio
+    async def test_quarterly_and_yearly_patterns_do_not_fit_90_day_window(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Quarterly/yearly threshold examples do not create detector rules.
+
+        The normative scan window is 90 days and the
+        normative qualification threshold is 3 in-band
+        occurrences. Three dates 90 days apart span 180
+        days, so only two are visible to the detector;
+        three dates 365 days apart span 730 days, so only
+        one is visible. The threshold mapping remains
+        covered by ``test_period_classification_thresholds``;
+        this test locks the full detector behavior to the
+        90-day window instead of weakening that window to
+        make unreachable scenarios pass.
+        """
+        statement_id = seeded_world["statement_id"]  # type: ignore[arg-type]
+        async with session_factory() as session:
+            merchants: list[uuid.UUID] = []
+            for name in ("quarterly_m", "yearly_m"):
+                merchant = Merchant(name=name, is_active=True)
+                session.add(merchant)
+                await session.commit()
+                await session.refresh(merchant)
+                merchants.append(merchant.id)
+
+            # period_end = 2026-06-30 → cutoff = 2026-04-01.
+            # Quarterly example: two visible rows (2026-04-01, 2026-06-30),
+            # one excluded row (2026-01-01) → below the 3-occurrence threshold.
+            for d in (date(2026, 1, 1), date(2026, 4, 1), date(2026, 6, 30)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchants[0],
+                    amount="9.99",
+                    txn_date=d,
+                )
+            # Yearly example: only the current-year row is visible.
+            for d in (date(2024, 6, 30), date(2025, 6, 30), date(2026, 6, 30)):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchants[1],
+                    amount="19.99",
+                    txn_date=d,
+                )
+            await session.commit()
+
+            statement = await session.get(Statement, statement_id)
+            rules = await RecurringDetector(session, partial_success=False).detect(statement)
+
+        assert rules == []
 
     @pytest.mark.asyncio
     async def test_fk_backfill_sets_recurring_rule_id(

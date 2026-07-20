@@ -48,6 +48,9 @@ from app.main import create_app
 from app.models import Bank, Category, CreditCard, Merchant, RecurringRule, Statement, Transaction
 from app.models.base import Base
 from app.models.statement import StatementStatus
+from app.schemas.dashboard import SummaryResponse
+from app.services.dashboard import DashboardService
+from app.services.dashboard_selection import RangeMode
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -319,6 +322,8 @@ class TestDashboardSummary:
 
         assert body["total_per_currency"] == {"CLP": "80000.00"}
         assert body["transaction_count"] == 5
+        assert body["transaction_count_per_currency"] == {"CLP": 5}
+        assert body["daily_avg_per_currency"] == {"CLP": "2580.65"}
         assert body["period_start"] == "2026-07-01"
         assert body["period_end"] == "2026-07-31"
         assert body["card_id"] == "all"
@@ -422,6 +427,7 @@ class TestDashboardSummary:
         assert response_a.status_code == 200
         body_a = response_a.json()
         assert body_a["transaction_count"] == 3
+        assert body_a["transaction_count_per_currency"] == {"CLP": 3}
         assert body_a["card_id"] == str(card_a)
         assert body_a["total_per_currency"] == {"CLP": "30000.00"}
 
@@ -432,8 +438,102 @@ class TestDashboardSummary:
         assert response_b.status_code == 200
         body_b = response_b.json()
         assert body_b["transaction_count"] == 2
+        assert body_b["transaction_count_per_currency"] == {"USD": 2}
         assert body_b["card_id"] == str(card_b)
         assert body_b["total_per_currency"] == {"USD": "100.00"}
+
+    @pytest.mark.asyncio
+    async def test_summary_range_zero_reaches_resolver_with_all_time(
+        self,
+        api_client: AsyncClient,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Endpoint range=0 forwards all-time mode through the service resolver path."""
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            for txn_date, amount in (
+                (date(2025, 3, 5), "100.00"),
+                (date(2026, 1, 5), "200.00"),
+                (date(2026, 6, 5), "50.00"),
+                (date(2026, 7, 5), "300.00"),
+            ):
+                _add_transaction(
+                    session,
+                    statement_id=statement_a,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=txn_date,
+                    currency="CLP",
+                    category_id=groceries.id,
+                )
+            await session.commit()
+
+        response = await api_client.get(
+            "/api/v1/dashboard/summary",
+            params={"period": "2026-07", "range": 0, "card_id": "all"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["transaction_count"] == 4
+        assert body["total_per_currency"] == {"CLP": "650.00"}
+        assert body["daily_avg_per_currency"] == {"CLP": "20.97"}
+        assert body["comparison_to_prev_period_pct_per_currency"] == {"CLP": 500.0}
+
+    @pytest.mark.asyncio
+    async def test_summary_range_zero_service_receives_all_time_inference(
+        self,
+        api_client: AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """API range=0 forwards both the legacy integer and typed all-time mode."""
+        captured: dict[str, object] = {}
+
+        async def _capture_summary(
+            self: DashboardService,
+            *,
+            period: date,
+            range_months: int = 6,
+            card_id="all",
+            range_mode: RangeMode | None = None,
+        ) -> SummaryResponse:
+            del self
+            captured.update(
+                period=period,
+                range_months=range_months,
+                card_id=card_id,
+                range_mode=range_mode,
+            )
+            return SummaryResponse(
+                total_per_currency={},
+                daily_avg_per_currency={},
+                transaction_count=0,
+                transaction_count_per_currency={},
+                top_category_id=None,
+                top_category_total_per_currency={},
+                top_merchant_id=None,
+                top_merchant_total_per_currency={},
+                comparison_to_prev_period_pct_per_currency={},
+                period_start=date(2026, 7, 1),
+                period_end=date(2026, 7, 31),
+                card_id="all",
+            )
+
+        monkeypatch.setattr(DashboardService, "summary", _capture_summary)
+
+        response = await api_client.get(
+            "/api/v1/dashboard/summary",
+            params={"period": "2026-07", "range": 0, "card_id": "all"},
+        )
+
+        assert response.status_code == 200
+        assert captured["range_months"] == 0
+        assert captured["range_mode"] == RangeMode.all_time()
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +999,7 @@ class TestCardIdAllSentinel:
         body_summary = response_summary.json()
         assert body_summary["card_id"] == "all"
         assert body_summary["transaction_count"] == 2
+        assert body_summary["transaction_count_per_currency"] == {"CLP": 1, "USD": 1}
         assert body_summary["total_per_currency"] == {"CLP": "10000.00", "USD": "50.00"}
 
         response_categories = await api_client.get(

@@ -8,7 +8,9 @@ are also wired with ``PRAGMA journal_mode=WAL`` for better concurrent
 read behavior.
 """
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote, urlparse
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -56,6 +58,20 @@ def create_engine(settings: Settings) -> AsyncEngine:
         A ready-to-use async engine. The caller owns its lifecycle and
         must call ``engine.dispose()`` when done.
     """
+    parsed = urlparse(settings.DATABASE_URL)
+    if parsed.scheme in {"sqlite", "sqlite+aiosqlite"} and parsed.path:
+        if settings.DATABASE_URL.startswith(
+            f"{parsed.scheme}:///"
+        ) and not settings.DATABASE_URL.startswith(f"{parsed.scheme}:////"):
+            db_path = unquote(settings.DATABASE_URL.split(":///", 1)[1])
+        else:
+            db_path = unquote(parsed.path)
+            if db_path.startswith("//"):
+                db_path = db_path[1:]
+        parent = Path(db_path).parent
+        if str(parent) not in {"", "."}:
+            parent.mkdir(parents=True, exist_ok=True)
+
     engine = create_async_engine(
         settings.DATABASE_URL,
         echo=settings.DEBUG,

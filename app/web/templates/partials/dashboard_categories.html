@@ -21,9 +21,11 @@
    #}
 {% set categories = categories or [] %}
 {% set total_clp = namespace(v=0) %}
+{% set total_txns = namespace(v=0) %}
 {% for cat in categories %}
     {% set cat_clp = cat.total_per_currency.get('CLP', 0) %}
     {% if cat_clp > total_clp.v %}{% set total_clp.v = cat_clp %}{% endif %}
+    {% set total_txns.v = total_txns.v + cat.transaction_count %}
 {% endfor %}
 
 <div data-testid="dashboard-categories"
@@ -37,7 +39,7 @@
     </h2>
     <span class="font-mono text-[11px] font-semibold text-text-subtle
                  tracking-[1px]">
-      JUNIO 2026
+      {{ period_label }}
     </span>
   </div>
 
@@ -47,6 +49,12 @@
       No hay categorias para mostrar.
     </p>
   {% else %}
+    {% if total_txns.v == 0 %}
+    <div class="rounded-xl border border-dashed border-border-strong bg-surface-container p-3 text-sm text-text-secondary"
+         data-testid="dashboard-categories-empty">
+      No category spend for this selection. All 12 categories are still shown so the closed-set dashboard remains stable.
+    </div>
+    {% endif %}
     <ul class="flex flex-col gap-2"
         data-testid="dashboard-categories-list">
       {% for cat in categories %}
@@ -54,48 +62,41 @@
         {% set is_zero = cat.transaction_count == 0 %}
         {% set pct_pct = (cat.pct_of_total * 100) if cat.pct_of_total else 0 %}
         {% set width = "{:.1f}".format(pct_pct) %}
-        <li class="flex items-center justify-between h-10 px-4
-                   rounded-lg {% if not is_zero %}bg-surface-container-high{% endif %}"
+        <li class="rounded-xl px-4 py-3 {% if not is_zero %}bg-surface-container-high{% else %}bg-surface-container/40{% endif %}"
             data-testid="dashboard-categories-row"
             data-category-id="{{ cat.category_id }}">
-          <div class="flex items-center gap-3">
-            <span class="w-2.5 h-2.5 rounded-full
-                         {% if is_zero %}bg-border-strong{% else %}bg-accent-light{% endif %}"></span>
-            <span class="text-sm {% if is_zero %}text-text-subtle{% else %}font-medium text-text-primary{% endif %}"
-                  title="{{ cat.display_name }}">
-              {{ cat.display_name }}
-            </span>
+          <div class="flex items-center justify-between gap-4">
+            <div class="flex min-w-0 items-center gap-3">
+              <span class="h-2.5 w-2.5 flex-none rounded-full
+                           {% if is_zero %}bg-border-strong{% else %}bg-accent-light{% endif %}"></span>
+              <span class="truncate text-sm {% if is_zero %}text-text-subtle{% else %}font-medium text-text-primary{% endif %}"
+                    title="{{ cat.display_name }}">
+                {{ cat.display_name }}
+              </span>
+            </div>
+            <div class="flex flex-none items-center gap-3">
+              <span class="w-10 text-right font-mono text-xs text-text-subtle">
+                {{ "{:.0f}".format(pct_pct) }}%
+              </span>
+              <span class="w-28 whitespace-nowrap text-right font-mono text-sm {% if is_zero %}text-text-subtle{% else %}font-bold text-text-primary{% endif %}"
+                    data-testid="dashboard-categories-amount">
+                {% if cat.total_per_currency %}
+                  {% for cur, amt in cat.total_per_currency.items() %}
+                    <span data-currency="{{ cur }}">{% if cur == 'CLP' %}$ {{ "{:,.0f}".format(amt) }}{% else %}$ {{ "{:,.2f}".format(amt) }} {{ cur }}{% endif %}</span>{% if not loop.last %}<br>{% endif %}
+                  {% endfor %}
+                {% else %}
+                  &mdash;
+                {% endif %}
+              </span>
+            </div>
           </div>
-          <div class="flex items-center gap-4">
-            <span class="font-mono text-xs text-text-subtle
-                         w-8 text-right">
-              {% if not is_zero %}{{ "{:.0f}".format(pct_pct) }}%{% endif %}
-            </span>
-            <span class="font-mono text-sm {% if is_zero %}text-text-subtle{% else %}font-bold{% endif %} text-text-primary
-                         w-24 text-right whitespace-nowrap"
-                  data-testid="dashboard-categories-amount">
-              {% if cat.total_per_currency %}
-                {% if cat_clp %}$ {{ "{:,.0f}".format(cat_clp) }}{% endif %}
-              {% else %}
-                &mdash;
-              {% endif %}
-            </span>
-          </div>
-        </li>
-      {% endfor %}
-    </ul>
-    {# The Tailwind bar is required by the test contract (it
-       asserts ``style="width: X%"`` is in the response body). The
-       hidden copy preserves the contract while keeping the v5
-       list pattern as the primary visual.                          #}
-    <ul class="hidden">
-      {% for cat in categories %}
-        {% set pct_pct = (cat.pct_of_total * 100) if cat.pct_of_total else 0 %}
-        {% set width = "{:.1f}".format(pct_pct) %}
-        <li>
-          <div style="width: {{ width }}%"
-               data-testid="dashboard-categories-bar"
-               data-width="{{ width }}">
+          <div class="mt-2 h-2 overflow-hidden rounded-full bg-surface-container-higher"
+               aria-label="{{ cat.display_name }} share {{ width }}%">
+            <div class="h-2 rounded-full {% if is_zero %}bg-border-strong{% else %}bg-accent{% endif %}"
+                 style="width: {{ width }}%"
+                 data-testid="dashboard-categories-bar"
+                 data-width="{{ width }}">
+            </div>
           </div>
         </li>
       {% endfor %}

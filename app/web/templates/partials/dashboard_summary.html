@@ -1,12 +1,11 @@
-{# Partial: KPI grid (summary) for the dashboard (v5 dark synthesis).
+{# Partial: KPI grid (summary) for the dashboard.
 
    Renders 4 cards in a single row, each with a primary CLP block
    and a secondary USD sub-block (when USD data is present).
    The shapes mirror :class:`app.schemas.dashboard.SummaryResponse`
-   for the CLP data; the "Suscripciones" card shows the count of
-   active recurring rules for the period (hard-coded to 8 from
-   the v5 design — the real value will come from the recurring
-   service in a later phase).
+   for the CLP data; the "Suscripciones" card renders live
+   ``recur_count`` and ``recur_monthly`` values from the recurring
+   dashboard service for the selected period.
 
    Preserves these testids from the v2 implementation so the
    existing test surface in tests/test_web_phase3 keeps passing:
@@ -18,14 +17,20 @@
      * data-testid="dashboard-summary-comparison"
    #}
 {% set summary = summary or {} %}
-{% set currencies = summary.total_per_currency.keys()|list %}
+{% set total_map = summary.total_per_currency if summary.total_per_currency is defined else {} %}
+{% set daily_map = summary.daily_avg_per_currency if summary.daily_avg_per_currency is defined else {} %}
+{% set comparison_map = summary.comparison_to_prev_period_pct_per_currency if summary.comparison_to_prev_period_pct_per_currency is defined else {} %}
+{% set count_map = summary.transaction_count_per_currency if summary.transaction_count_per_currency is defined else {} %}
+{% set currencies = total_map.keys()|list %}
 {% set has_usd = 'USD' in currencies %}
-{% set clp_total = summary.total_per_currency.get('CLP', 0) %}
-{% set usd_total = summary.total_per_currency.get('USD', 0) %}
-{% set clp_daily = summary.daily_avg_per_currency.get('CLP') %}
-{% set usd_daily = summary.daily_avg_per_currency.get('USD') %}
-{% set clp_comp = summary.comparison_to_prev_period_pct_per_currency.get('CLP') %}
-{% set txn_count = summary.transaction_count or 0 %}
+{% set clp_total = total_map.get('CLP', 0) %}
+{% set usd_total = total_map.get('USD', 0) %}
+{% set clp_daily = daily_map.get('CLP') %}
+{% set usd_daily = daily_map.get('USD') %}
+{% set clp_comp = comparison_map.get('CLP') %}
+{% set txn_count = summary.transaction_count if summary.transaction_count is defined else 0 %}
+{% set clp_count = count_map.get('CLP', 0) %}
+{% set usd_count = count_map.get('USD', 0) %}
 {# ``recur_count`` and ``recur_monthly`` come from the live
    service call in ``dashboard_section_summary`` (see the docstring).
    They are ``0`` when no recurring rules match the period.            #}
@@ -33,7 +38,7 @@
 {% set recur_monthly = recur_monthly|default(0) %}
 
 <div data-testid="dashboard-summary"
-     class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+     class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 
   {# --- Card 1: Total del mes (CLP + USD) ------------------------- #}
   <div class="rounded-2xl border border-border bg-surface
@@ -77,7 +82,7 @@
           {% if usd_total %}$ {{ "{:,.2f}".format(usd_total) }}{% else %}&mdash;{% endif %}
         </p>
         <p class="text-[11px] text-text-subtle">
-          {{ summary.transaction_count or 0 }} compras
+          {{ usd_count }} compras
         </p>
       </div>
       {% endif %}
@@ -127,7 +132,7 @@
         <p class="font-mono text-[26px] font-bold text-text-primary tracking-[-0.5px]">
           {{ txn_count }}
         </p>
-        <p class="text-xs text-text-subtle">Movimientos este mes</p>
+        <p class="text-xs text-text-subtle">{{ clp_count }} CLP{% if usd_count %} &middot; {{ usd_count }} USD{% endif %}</p>
       </div>
       {% if has_usd %}
       <div class="h-px bg-surface-container-high"></div>
@@ -137,7 +142,7 @@
           <span class="font-mono text-[10px] font-semibold text-text-subtle tracking-[1px]">USD</span>
         </div>
         <p class="font-mono text-[18px] font-semibold text-text-secondary">
-          3
+          {{ usd_count }}
         </p>
         <p class="text-[11px] text-text-subtle">en dolares</p>
       </div>
@@ -146,10 +151,7 @@
   </div>
 
   {# --- Card 4: Suscripciones ------------------------------------ #}
-  {# Real data: ``recur_count`` and ``recur_monthly`` come from the
-   live service call (see the endpoint docstring). When the count
-   is 0 the card shows a single em-dash so the user is never
-   misled about the recurring detection state.                 #}
+  {# ``recur_count`` and ``recur_monthly`` are live service values. #}
   <div class="rounded-2xl border border-border bg-surface
               p-6 flex flex-col gap-4">
     <h3 class="text-[13px] text-text-subtle font-medium">
@@ -167,11 +169,11 @@
     </div>
   </div>
 
-  {% if summary.transaction_count == 0 %}
-  <p class="col-span-full text-sm text-text-subtle"
-     data-testid="dashboard-summary-empty">
-    No hay transacciones en el periodo seleccionado.
-  </p>
-  {% endif %}
+   {% if txn_count == 0 %}
+   <div class="col-span-full rounded-2xl border border-dashed border-border-strong bg-surface-container p-4 text-sm text-text-secondary"
+        data-testid="dashboard-summary-empty">
+     No transactions in this period yet. Totals, averages, and comparisons will appear here once imported movements match the current filters.
+   </div>
+   {% endif %}
 
 </div>

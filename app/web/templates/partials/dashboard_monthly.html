@@ -1,29 +1,8 @@
-{# Partial: monthly time series with Tailwind horizontal bars (v5 dark).
-
-   Renders a full-width card with a "Evolucion mensual" header.
-   Each month is a 28px-tall horizontal bar on a
-   ``bg-surface-container-higher`` track. The bar width is
-   ``(total / max) * 100%``. The most recent month (the one
-   that matches ``period_label``) is highlighted with the
-   lighter ``bg-accent-light`` color so the user can see the
-   current period at a glance.
-
-   Variables
-   ---------
-   monthly:
-       List of :class:`app.schemas.dashboard.MonthlyDataPoint`
-       rows, ordered by ``month`` ascending.
-   period_label:
-       Pre-formatted ``"YYYY-MM"`` for the current period
-       (used to highlight the matching month).
-   card_label:
-       Human-readable label for the active card filter.
-   range_label:
-       Human-readable label for the active period picker.
-   #}
+{# Partial: monthly time series with server-rendered Tailwind bars. #}
 {% set monthly = monthly or [] %}
-{% set ns = namespace(max_clp=0, max_usd=0) %}
+{% set ns = namespace(max_clp=0, max_usd=0, txns=0) %}
 {% for point in monthly %}
+    {% set ns.txns = ns.txns + point.transaction_count %}
     {% if point.total_per_currency.get('CLP') and point.total_per_currency['CLP'] > ns.max_clp %}
         {% set ns.max_clp = point.total_per_currency['CLP'] %}
     {% endif %}
@@ -31,79 +10,95 @@
         {% set ns.max_usd = point.total_per_currency['USD'] %}
     {% endif %}
 {% endfor %}
-{% set show_usd = ns.max_usd > 0 %}
-{% set show_clp = ns.max_clp > 0 %}
-{# Pad ``YYYY-MM`` to ``YYYY-MM-01`` for the string compare so
-   we can match the data point without a full date parse.       #}
-{% set period_key = period_label ~ '-01' if period_label and period_label|length == 7 else '' %}
+{% set period_key = period_iso if period_iso is defined else '' %}
 
 <div data-testid="dashboard-monthly"
-     class="rounded-2xl border border-border bg-surface p-6
-            flex flex-col gap-5">
+     class="rounded-2xl border border-border bg-surface p-6 flex min-w-0 flex-col gap-5">
 
-  <div class="flex items-center justify-between">
-    <h2 class="font-display text-lg font-semibold text-text-primary
-               tracking-[-0.25px]">
+  <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+    <h2 class="font-display text-lg font-semibold text-text-primary tracking-[-0.25px]">
       Evolucion mensual
     </h2>
     <span class="font-mono text-xs text-text-secondary">
-      YTD 2026 &middot; CLP
+      {{ range_label }} &middot; {{ card_label }}
     </span>
   </div>
 
   {% if monthly|length == 0 %}
-    <p class="text-sm text-text-subtle"
-       data-testid="dashboard-monthly-empty">
-      No hay meses con transacciones en el periodo.
-    </p>
+    <div class="rounded-xl border border-dashed border-border-strong bg-surface-container p-3 text-sm text-text-secondary"
+         data-testid="dashboard-monthly-empty">
+      No monthly history is available for this selection yet.
+    </div>
   {% else %}
-    <ul class="flex flex-col gap-2.5"
-        data-testid="dashboard-monthly-list">
+    {% if ns.txns == 0 %}
+    <div class="rounded-xl border border-dashed border-border-strong bg-surface-container p-3 text-sm text-text-secondary"
+         data-testid="dashboard-monthly-empty">
+      The selected window has no transactions. The chart keeps the month slots visible so changes are easy to compare later.
+    </div>
+    {% endif %}
+    <ul class="flex min-w-0 flex-col gap-3" data-testid="dashboard-monthly-list">
       {% for point in monthly %}
         {% set has_clp = point.total_per_currency.get('CLP') %}
         {% set has_usd = point.total_per_currency.get('USD') %}
         {% set is_current = (point.month == period_key) %}
         {% set bar_color = 'bg-accent-light' if is_current else 'bg-accent' %}
-        <li class="flex items-center gap-3 h-10"
+        {% set clp_width = "{:.1f}".format((has_clp / ns.max_clp * 100) if ns.max_clp and has_clp else 0) %}
+        {% set usd_width = "{:.1f}".format((has_usd / ns.max_usd * 100) if ns.max_usd and has_usd else 0) %}
+        <li class="grid min-w-0 grid-cols-[3rem_minmax(0,1fr)] gap-3 rounded-xl bg-surface-container/40 p-3 sm:grid-cols-[3rem_minmax(0,1fr)_7rem]"
             data-testid="dashboard-monthly-row"
             data-month="{{ point.month }}">
-
-          <span class="w-12 font-mono text-xs {% if is_current %}font-semibold text-accent-light{% else %}text-text-subtle{% endif %} whitespace-nowrap"
+          <span class="pt-1 font-mono text-xs {% if is_current %}font-semibold text-accent-light{% else %}text-text-subtle{% endif %} whitespace-nowrap"
                 data-testid="dashboard-monthly-label">
             {{ point.month[5:] }}
           </span>
 
-          <div class="flex-1 h-7 rounded-md bg-surface-container-higher overflow-hidden">
-            {% if show_clp and has_clp %}
-              {% set clp_pct = (has_clp / ns.max_clp * 100) if ns.max_clp else 0 %}
-              {% set clp_width = "{:.1f}".format(clp_pct) %}
-              <div class="{{ bar_color }} h-7 rounded-md"
-                   style="width: {{ clp_width }}%"
-                   data-testid="dashboard-monthly-bar"
-                   data-width="{{ clp_width }}">
+          <div class="min-w-0 space-y-2">
+            <div class="min-w-0">
+              <div class="mb-1 flex items-center justify-between gap-2 text-[11px] text-text-subtle">
+                <span class="font-mono">CLP</span>
+                <span class="font-mono">{% if has_clp %}$ {{ "{:,.0f}".format(has_clp) }}{% else %}&mdash;{% endif %}</span>
               </div>
+              <div class="h-2.5 overflow-hidden rounded-full bg-surface-container-higher">
+                <div class="{{ bar_color }} h-2.5 rounded-full"
+                     style="width: {{ clp_width }}%"
+                     data-testid="dashboard-monthly-bar"
+                     data-currency="CLP"
+                     data-width="{{ clp_width }}"></div>
+              </div>
+            </div>
+            {% if ns.max_usd > 0 or has_usd %}
+            <div class="min-w-0">
+              <div class="mb-1 flex items-center justify-between gap-2 text-[11px] text-text-subtle">
+                <span class="font-mono">USD</span>
+                <span class="font-mono">{% if has_usd %}$ {{ "{:,.2f}".format(has_usd) }}{% else %}&mdash;{% endif %}</span>
+              </div>
+              <div class="h-2.5 overflow-hidden rounded-full bg-surface-container-higher">
+                <div class="bg-success h-2.5 rounded-full"
+                     style="width: {{ usd_width }}%"
+                     data-testid="dashboard-monthly-bar"
+                     data-currency="USD"
+                     data-width="{{ usd_width }}"></div>
+              </div>
+            </div>
             {% endif %}
           </div>
 
-          <span class="w-28 text-right font-mono text-xs
-                       {% if is_current %}font-semibold text-accent-light{% else %}text-text-primary{% endif %} whitespace-nowrap"
-                data-testid="dashboard-monthly-amount">
-            {% if has_clp %}$ {{ "{:,.0f}".format(has_clp) }}{% endif %}
-          </span>
-
-          {% set comp = point.prev_month_pct_per_currency.get('CLP') %}
-          {% if comp is not none %}
-          <span class="w-14 text-right text-xs
-                       {% if comp >= 0 %}text-success{% else %}text-danger-soft{% endif %} whitespace-nowrap"
-                data-testid="dashboard-monthly-comparison">
-            {% if comp >= 0 %}+{% endif %}{{ "{:.1f}".format(comp) }}%
-          </span>
-          {% else %}
-          <span class="w-14 text-right text-xs text-text-subtle whitespace-nowrap"
-                data-testid="dashboard-monthly-comparison-empty">
-            &mdash;
-          </span>
-          {% endif %}
+          <div class="col-span-2 flex items-center justify-between gap-2 font-mono text-xs sm:col-span-1 sm:flex-col sm:items-end sm:justify-center">
+            {% set comp = point.prev_month_pct_per_currency.get('CLP') %}
+            {% if comp is not none %}
+            <span class="{% if comp >= 0 %}text-success{% else %}text-danger-soft{% endif %}" data-testid="dashboard-monthly-comparison">
+              CLP {% if comp >= 0 %}+{% endif %}{{ "{:.1f}".format(comp) }}%
+            </span>
+            {% else %}
+            <span class="text-text-subtle" data-testid="dashboard-monthly-comparison-empty">CLP &mdash;</span>
+            {% endif %}
+            {% set usd_comp = point.prev_month_pct_per_currency.get('USD') %}
+            {% if usd_comp is not none %}
+            <span class="{% if usd_comp >= 0 %}text-success{% else %}text-danger-soft{% endif %}" data-testid="dashboard-monthly-comparison">
+              USD {% if usd_comp >= 0 %}+{% endif %}{{ "{:.1f}".format(usd_comp) }}%
+            </span>
+            {% endif %}
+          </div>
         </li>
       {% endfor %}
     </ul>

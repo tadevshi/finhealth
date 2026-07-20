@@ -220,10 +220,12 @@
     </div>
 
     {# --- Footer (optional but cheap) ------------------------------------ #}
+    {% block dashboard_footer %}
     <footer class="border-t border-gray-200 dark:border-gray-700">
         <div class="max-w-5xl mx-auto px-4 py-4 text-sm text-gray-500 dark:text-gray-400">
             {{ app_name }} &mdash; Phase 0 foundation.
         </div>
     </footer>
+    {% endblock %}
 </body>
 </html>
