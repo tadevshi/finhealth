@@ -15,29 +15,29 @@
         Comercios top
       </h2>
       <p class="text-[13px] text-text-secondary mt-0.5">
-        Julio 2026
+        {{ period_label }} &middot; {{ card_label }}
       </p>
     </div>
     <span class="font-mono text-[11px] font-semibold text-text-subtle
                  tracking-[1px]">
-      Top 5
+      Top {{ merchants|length }}
     </span>
   </div>
 
   {% if merchants|length == 0 %}
-    <p class="text-sm text-text-subtle"
+    <div class="rounded-xl border border-dashed border-border-strong bg-surface-container p-3 text-sm text-text-secondary"
        data-testid="dashboard-merchants-empty">
-      No hay comercios con transacciones en el periodo.
-    </p>
+      No merchants have transactions for this selection yet. Import matching statements or change the filters to populate the ranking.
+    </div>
   {% else %}
     <ul class="flex flex-col divide-y divide-border"
         data-testid="dashboard-merchants-list">
       {% for merch in merchants %}
-        <li class="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3"
+        <li class="flex w-full items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
             data-testid="dashboard-merchants-row"
             data-merchant-id="{{ merch.merchant_id }}">
-          <div class="flex items-center gap-3 min-w-0">
-            <div class="w-8 h-8 rounded-lg bg-accent-light/20 flex items-center justify-center">
+          <div class="flex min-w-0 items-center gap-3">
+            <div class="size-8 flex-none rounded-lg bg-accent-light/20 grid place-items-center">
               <span class="font-display text-sm font-bold text-accent-light">
                 {{ merch.display_name[0]|upper }}
               </span>

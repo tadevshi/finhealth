@@ -1,355 +1,78 @@
 {% extends "base.html" %}
 
-{# Dashboard page (Phase 3, PR #10 + v5 dark synthesis).
-
-   Server-renders the full page on first paint, then lets the
-   user reload individual sections via HTMX. The page uses the
-   sidebar nav layout from the v5 design synthesis
-   (shared/finhealth_design.op, "Dashboard v3 (dark)" page):
-
-   * Left sidebar (256px): brand, "CHILEAN FINTECH" tagline,
-     6 nav items (Dashboard active).
-   * Top bar: hero date title + card picker + dark mode toggle
-     + user avatar.
-   * Hero: "TOTAL GASTADO (JUNIO)" + big CLP number + segmented
-     control for period (6M / YTD / 1Y).
-   * KPI grid: 4 cards, each with CLP + USD sub.
-   * Bento row: Categories (2/3) + Anomalias (1/3).
-   * Monthly evolution: bar chart, Jun highlighted.
-   * Recurring subscriptions: list with state badges
-     (ESTABLE / SUBIO / DUPLICADA).
-
-   The HTMX partial structure is preserved (5 section targets
-   with the same data-testids as the v2 implementation) so the
-   existing test surface in tests/test_web_phase3 keeps passing.
-   The Alpine.js picker component is updated to drive the new
-   segmented control instead of two dropdowns.
-
-   The dark mode is forced on this page (via the ``dark`` class
-   on <html>) because the v5 synthesis is dark-first by design.
-   Other pages still respect the user's light/dark preference.    #}
-
 {% block title %}{{ app_name }} &mdash; Dashboard{% endblock %}
 
-{# --- Sidebar override ---------------------------------------------- #}
 {% block sidebar %}
-<aside class="fixed left-0 top-0 w-64 h-screen bg-surface border-r
-              border-border flex flex-col py-6 px-4 gap-6
-              z-50 hidden md:flex"
-       data-testid="dashboard-sidebar">
-  <a href="/" class="flex items-center gap-2.5 px-2"
-     data-testid="sidebar-brand">
-    <div class="w-9 h-9 rounded-lg bg-accent flex items-center justify-center">
-      <span class="font-display text-xl font-bold text-white">F</span>
-    </div>
-    <span class="font-display text-xl font-bold text-text-primary
-                 tracking-tight">finhealth</span>
+<aside class="fixed inset-y-0 left-0 z-30 hidden w-60 flex-col border-r border-border bg-surface px-4 py-6 lg:flex"
+       data-testid="dashboard-desktop-sidebar">
+  <a href="/dashboard" class="mb-8 flex items-center gap-3 text-text-primary" aria-label="FinHealth dashboard home">
+    <span class="grid size-10 place-items-center rounded-2xl bg-accent/20 text-lg font-bold text-accent-light">F</span>
+    <span>
+      <span class="block font-display text-lg font-semibold tracking-[-0.25px]">FinHealth</span>
+      <span class="block text-xs text-text-subtle">Dashboard</span>
+    </span>
   </a>
-  <p class="font-mono text-[11px] font-semibold text-text-subtle
-            tracking-[2px] px-2"
-     data-testid="sidebar-tagline">
-    CHILEAN FINTECH
-  </p>
-  <nav class="flex-1 flex flex-col gap-1"
-       data-testid="sidebar-nav">
+
+  <nav class="flex flex-col gap-2" aria-label="Dashboard navigation">
     <a href="/dashboard"
-       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
-              bg-surface-container-high text-accent-light font-semibold
-              border-r-2 border-accent"
-       data-testid="sidebar-nav-dashboard">
-      <span class="w-5 h-5 rounded bg-accent-light"></span>
-      <span class="text-sm">Dashboard</span>
+       aria-current="page"
+       data-testid="dashboard-nav-link"
+       class="min-h-11 rounded-xl bg-accent/15 px-3 py-2.5 text-sm font-semibold text-accent-light ring-1 ring-accent/30">
+      Dashboard
     </a>
     <a href="/transactions"
-       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
-              text-text-secondary hover:bg-surface-container-high
-              transition-colors"
-       data-testid="sidebar-nav-transactions">
-      <span class="w-5 h-5 rounded bg-border-strong"></span>
-      <span class="text-sm">Transactions</span>
-    </a>
-    <a href="/recurring"
-       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
-              text-text-secondary hover:bg-surface-container-high
-              transition-colors"
-       data-testid="sidebar-nav-recurring">
-      <span class="w-5 h-5 rounded bg-border-strong"></span>
-      <span class="text-sm">Recurrentes</span>
+       data-testid="dashboard-nav-link"
+       class="min-h-11 rounded-xl px-3 py-2.5 text-sm font-medium text-text-secondary hover:bg-surface-container-high hover:text-text-primary">
+      Transactions
     </a>
     <a href="/upload"
-       class="flex items-center gap-3 px-3 py-2.5 rounded-lg
-              text-text-secondary hover:bg-surface-container-high
-              transition-colors"
-       data-testid="sidebar-nav-upload">
-      <span class="w-5 h-5 rounded bg-border-strong"></span>
-      <span class="text-sm">Carga cartolas</span>
+       data-testid="dashboard-nav-link"
+       class="min-h-11 rounded-xl px-3 py-2.5 text-sm font-medium text-text-secondary hover:bg-surface-container-high hover:text-text-primary">
+      Upload
+    </a>
+    <a href="#dashboard-recurring"
+       data-testid="dashboard-nav-link"
+       class="min-h-11 rounded-xl px-3 py-2.5 text-sm font-medium text-text-secondary hover:bg-surface-container-high hover:text-text-primary">
+      Recurring
     </a>
   </nav>
-  <p class="text-[11px] text-text-subtle px-2 pt-4 border-t border-border"
-     data-testid="sidebar-footer">
-    Phase 3 &middot; v5 dark
-  </p>
 </aside>
 {% endblock %}
 
-{# Force the dark theme on the dashboard regardless of the user's
-   saved preference. The dashboard is dark-first by design (see
-   the v5 synthesis). Other pages still respect the toggle. The
-   ``ml-64`` class offsets the main content so it sits beside
-   the fixed 256px sidebar. The topbar block is overridden to
-   empty because the dashboard renders its own topbar inside
-   the content block (hero + date title + period picker).       #}
-{% block sidebar_classes %}'ml-64'{% endblock %}
-{% block topbar %}{% endblock %}
+{% block sidebar_classes %}{% endblock %}
 
-{# --- Main content --------------------------------------------------- #}
+{% block topbar %}
+<header class="sticky top-0 z-20 border-b border-border bg-surface/95 backdrop-blur lg:hidden"
+        data-testid="dashboard-mobile-topbar">
+  <div class="mx-auto flex max-w-[1136px] items-center justify-between px-4 py-3">
+    <a href="/dashboard" class="flex min-h-11 items-center gap-3 text-text-primary" aria-label="FinHealth dashboard home">
+      <span class="grid size-9 place-items-center rounded-xl bg-accent/20 text-base font-bold text-accent-light">F</span>
+      <span class="font-display text-base font-semibold">FinHealth</span>
+    </a>
+    <button
+      type="button"
+      data-testid="dark-mode-toggle"
+      aria-label="Toggle dark mode"
+      class="min-h-11 rounded-xl bg-surface-container-high px-3 text-sm font-medium text-text-primary focus:outline-none focus:ring-2 focus:ring-accent"
+      @click="toggle()"
+      x-text="isDark ? 'Light' : 'Dark'"
+    ></button>
+  </div>
+  <nav class="mx-auto grid max-w-[1136px] grid-cols-4 gap-2 px-4 pb-3" aria-label="Mobile dashboard navigation" data-testid="dashboard-mobile-nav">
+    <a href="/dashboard" aria-current="page" data-testid="dashboard-mobile-nav-link" class="flex min-h-11 items-center justify-center rounded-xl bg-accent/15 px-2 text-center text-xs font-semibold text-accent-light ring-1 ring-accent/30">Dashboard</a>
+    <a href="/transactions" data-testid="dashboard-mobile-nav-link" class="flex min-h-11 items-center justify-center rounded-xl bg-surface-container-high px-2 text-center text-xs font-medium text-text-secondary">Transactions</a>
+    <a href="/upload" data-testid="dashboard-mobile-nav-link" class="flex min-h-11 items-center justify-center rounded-xl bg-surface-container-high px-2 text-center text-xs font-medium text-text-secondary">Upload</a>
+    <a href="#dashboard-recurring" data-testid="dashboard-mobile-nav-link" class="flex min-h-11 items-center justify-center rounded-xl bg-surface-container-high px-2 text-center text-xs font-medium text-text-secondary">Recurring</a>
+  </nav>
+</header>
+{% endblock %}
+
+{% block dashboard_footer %}{% endblock %}
+
 {% block content %}
-<div class="min-h-screen"
-     x-data="dashboardPicker()"
-     x-init="init(); isDark = true; document.documentElement.classList.add('dark')">
-
-  {# --- Top bar (hero date + card picker + dark toggle + user) ---- #}
-  <header class="h-[72px] px-8 flex items-center justify-between
-                 border-b border-border bg-canvas"
-          data-testid="dashboard-topbar">
-    <h1 class="font-display text-2xl font-semibold text-text-primary
-               tracking-tight"
-        data-testid="dashboard-title">
-      Junio 2026
-    </h1>
-    <div class="flex items-center gap-5">
-      <div class="flex items-center gap-2 px-3.5 py-1.5 rounded-full
-                  bg-surface border border-border"
-           data-testid="dashboard-card-picker-wrapper">
-        <span class="w-1.5 h-1.5 rounded-full bg-accent"></span>
-        <span class="text-[13px] text-text-primary">
-          Santander &#x2022;&#x2022;&#x2022;&#x2022; 0001
-        </span>
-        <span class="text-[11px] font-mono text-text-subtle">&#x25BE;</span>
-      </div>
-      <button type="button"
-              data-testid="dark-mode-toggle"
-              @click="toggle()"
-              class="text-text-subtle hover:text-accent-light
-                     transition-colors w-8 h-8 rounded-full
-                     bg-surface-container-high flex items-center
-                     justify-center">
-        <span class="text-sm">&#9788;</span>
-      </button>
-      <div class="w-8 h-8 rounded-full bg-surface-container-high
-                  flex items-center justify-center"
-           data-testid="dashboard-user-avatar">
-        <span class="text-sm text-text-primary">L</span>
-      </div>
-    </div>
-  </header>
-
-  {# --- Main scrollable area ---------------------------------------- #}
-  <div class="p-8 max-w-[1184px] mx-auto space-y-6"
-       data-testid="dashboard-main">
-
-    {# --- Hero: total gastado + period segmented control -------- #}
-    {# The hero number comes from the live ``summary`` (the same
-       value the KPI grid's first card shows), not a placeholder.
-       When the period has no transactions the total is 0 and we
-       render a single em-dash so the page never lies about a
-       non-existent total. The period label is converted from
-       ``YYYY-MM`` to a Spanish month name so the hero is
-       self-explanatory without a separate label row.        #}
-    {% set hero_clp = (summary.total_per_currency or {}).get('CLP', 0) %}
-    {% set _month_names = {
-        '01':'ENERO','02':'FEBRERO','03':'MARZO','04':'ABRIL',
-        '05':'MAYO','06':'JUNIO','07':'JULIO','08':'AGOSTO',
-        '09':'SEPTIEMBRE','10':'OCTUBRE','11':'NOVIEMBRE','12':'DICIEMBRE',
-    } %}
-    {% set _month_key = selected_period[5:7] if selected_period and selected_period|length >= 7 else '' %}
-    {% set _month_label = _month_names.get(_month_key, '') %}
-    <div class="flex items-end justify-between gap-8"
-         data-testid="dashboard-hero">
-      <div>
-        <p class="font-mono text-[11px] font-semibold text-text-subtle
-                  tracking-[2px]">
-          TOTAL GASTADO ({{ _month_label or 'PERIODO ACTUAL' }})
-        </p>
-        <p class="font-mono text-[56px] font-bold text-text-primary
-                  tracking-[-1.5px] mt-2"
-           data-testid="hero-amount">
-          {% if hero_clp %}$ {{ "{:,.0f}".format(hero_clp) }}{% else %}&mdash;{% endif %}
-          <span class="font-display text-base font-normal text-text-subtle ml-3">CLP</span>
-        </p>
-      </div>
-      <div class="flex gap-1 p-1 rounded-lg bg-surface border border-border"
-           data-testid="dashboard-range-picker">
-        <button type="button"
-                data-testid="range-6m"
-                @click="setRange(6)"
-                :class="rangeMonths == 6
-                    ? 'bg-canvas text-text-subtle' : 'bg-surface-container-high text-accent-light'"
-                class="px-4 py-1.5 rounded-md text-[13px] font-semibold
-                       font-sans transition-colors">
-          6M
-        </button>
-        <button type="button"
-                data-testid="range-ytd"
-                @click="setRange(0)"
-                :class="rangeMonths == 0
-                    ? 'bg-canvas text-text-subtle' : 'bg-surface-container-high text-accent-light'"
-                class="px-4 py-1.5 rounded-md text-[13px] font-semibold
-                       font-sans transition-colors">
-          YTD
-        </button>
-        <button type="button"
-                data-testid="range-1y"
-                @click="setRange(12)"
-                :class="rangeMonths == 12
-                    ? 'bg-canvas text-text-subtle' : 'bg-surface-container-high text-accent-light'"
-                class="px-4 py-1.5 rounded-md text-[13px] font-semibold
-                       font-sans transition-colors">
-          1Y
-        </button>
-      </div>
-    </div>
-
-    {# --- Pickers (hidden, for HTMX contract compatibility) ------ #}
-    {# The v2 tests in tests/test_web_phase3.py expect
-       ``data-testid="dashboard-card-picker"`` and
-       ``data-testid="dashboard-range-picker"`` as <select> elements.
-       The v5 redesign replaces the dropdowns with a pill
-       (card) and a segmented control (range); we keep the
-       <select> elements in the DOM as hidden inputs so the
-       test contract is preserved while the visible UI is the
-       v5 design. The Alpine picker component still reads
-       from these selects via ``x-model``.                      #}
-    <div class="hidden" aria-hidden="true">
-      <label for="card-picker">Tarjeta</label>
-      <select id="card-picker"
-              name="card_id"
-              data-testid="dashboard-card-picker">
-        <option value="all" {% if selected_card_id == 'all' %}selected{% endif %}>
-          Todas las cards
-        </option>
-        {% for card in cards %}
-          <option value="{{ card.id }}"
-                  {% if selected_card_id == card.id|string %}selected{% endif %}>
-            {{ card.bank.display_name }} &mdash; {{ card.card_number_masked }}
-          </option>
-        {% endfor %}
-      </select>
-      <label for="range-picker">Periodo</label>
-      <select id="range-picker"
-              name="range"
-              data-testid="dashboard-range-picker">
-        <option value="6"{% if selected_range == 6 %} selected{% endif %}>6M</option>
-        <option value="0"{% if selected_range == 0 %} selected{% endif %}>YTD</option>
-        <option value="12"{% if selected_range == 12 %} selected{% endif %}>1Y</option>
-      </select>
-    </div>
-
-    {# --- Section: KPI grid ---------------------------------------- #}
-    <div id="dashboard-summary"
-         hx-get="{{ request.url_for('dashboard_section_summary') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
-         hx-trigger="picker-change from:body"
-         hx-swap="innerHTML"
-         data-testid="dashboard-summary-target">
-      {% include "partials/dashboard_summary.html" %}
-    </div>
-
-    {# --- Section: Bento row (categories 2/3 + anomalies 1/3) ----- #}
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4"
-         data-testid="dashboard-bento-row">
-      <div id="dashboard-categories"
-           class="lg:col-span-2"
-           hx-get="{{ request.url_for('dashboard_section_categories') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
-           hx-trigger="picker-change from:body"
-           hx-swap="innerHTML"
-           data-testid="dashboard-categories-target">
-        {% include "partials/dashboard_categories.html" %}
-      </div>
-      <div id="dashboard-anomalies"
-           hx-get="{{ request.url_for('dashboard_section_anomalies') }}?period={{ selected_period }}&card_id={{ selected_card_id }}"
-           hx-trigger="picker-change from:body"
-           hx-swap="innerHTML"
-           data-testid="dashboard-anomalies-target">
-        {% include "partials/dashboard_anomalies.html" %}
-      </div>
-    </div>
-
-    {# --- Section: Top merchants ---------------------------------- #}
-    <div id="dashboard-merchants"
-         hx-get="{{ request.url_for('dashboard_section_merchants') }}?period={{ selected_period }}&range={{ selected_range }}&card_id={{ selected_card_id }}"
-         hx-trigger="picker-change from:body"
-         hx-swap="innerHTML"
-         data-testid="dashboard-merchants-target">
-      {% include "partials/dashboard_merchants.html" %}
-    </div>
-
-    {# --- Section: Monthly bar chart ------------------------------ #}
-    <div id="dashboard-monthly"
-         hx-get="{{ request.url_for('dashboard_section_monthly') }}?range={{ selected_range }}&card_id={{ selected_card_id }}"
-         hx-trigger="picker-change from:body"
-         hx-swap="innerHTML"
-         data-testid="dashboard-monthly-target">
-      {% include "partials/dashboard_monthly.html" %}
-    </div>
-
-    {# --- Section: Recurring rules -------------------------------- #}
-    <div id="dashboard-recurring"
-         class="mb-12"
-         hx-get="{{ request.url_for('dashboard_section_recurring') }}?period={{ selected_period }}&card_id={{ selected_card_id }}"
-         hx-trigger="picker-change from:body"
-         hx-swap="innerHTML"
-         data-testid="dashboard-recurring-target">
-      {% include "partials/dashboard_recurring.html" %}
-    </div>
-
+<div class="min-h-screen overflow-x-hidden bg-canvas py-6 lg:py-8 lg:pl-60" data-testid="dashboard-main">
+  <div class="mx-auto max-w-[1136px] px-4 sm:px-6 lg:px-8" data-testid="dashboard-content-shell">
+    {% include "partials/dashboard_sections.html" %}
   </div>
 </div>
-
-<script>
-    // Alpine component for the dashboard pickers + dark mode override.
-    // The v5 design uses a segmented control for the period picker
-    // (6M / YTD / 1Y) instead of two dropdowns, so the component
-    // exposes ``setRange(N)`` which maps the segment to the same
-    // ``range`` query param the API expects.
-    document.addEventListener('alpine:init', function () {
-        window.Alpine.data('dashboardPicker', function () {
-            return {
-                rangeMonths: parseInt('{{ selected_range }}', 10),
-                setRange: function (n) {
-                    this.rangeMonths = n;
-                    var cardId = '{{ selected_card_id }}';
-                    var range = n;
-                    var period = '{{ selected_period }}';
-                    var sections = [
-                        { id: 'dashboard-summary',
-                          url: '/dashboard/sections/summary?period=' + period
-                              + '&range=' + range + '&card_id=' + cardId },
-                        { id: 'dashboard-categories',
-                          url: '/dashboard/sections/categories?period=' + period
-                              + '&range=' + range + '&card_id=' + cardId },
-                        { id: 'dashboard-anomalies',
-                          url: '/dashboard/sections/anomalies?period=' + period
-                              + '&card_id=' + cardId },
-                        { id: 'dashboard-monthly',
-                          url: '/dashboard/sections/monthly?range=' + range
-                              + '&card_id=' + cardId },
-                        { id: 'dashboard-recurring',
-                          url: '/dashboard/sections/recurring?period=' + period
-                              + '&card_id=' + cardId },
-                    ];
-                    sections.forEach(function (s) {
-                        var el = document.getElementById(s.id);
-                        if (el) {
-                            el.setAttribute('hx-get', s.url);
-                        }
-                    });
-                    if (window.htmx) {
-                        window.htmx.process(document.body);
-                        window.htmx.trigger(document.body, 'picker-change');
-                    }
-                },
-            };
-        });
-    });
-</script>
 {% endblock %}
