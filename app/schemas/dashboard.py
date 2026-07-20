@@ -137,7 +137,7 @@ class SummaryResponse(BaseModel):
     daily_avg_per_currency: CurrencyTotals = Field(
         default_factory=dict,
         description=(
-            "``total / distinct_days_with_transactions`` per currency. "
+            "``total / calendar days in the selected month`` per currency. "
             "Empty dict when the period has no transactions."
         ),
     )
@@ -145,6 +145,10 @@ class SummaryResponse(BaseModel):
         default=0,
         ge=0,
         description="Number of transactions in the period (across all currencies).",
+    )
+    transaction_count_per_currency: dict[str, int] = Field(
+        default_factory=dict,
+        description="Number of transactions in the period, broken down by currency.",
     )
     top_category_id: UUID | None = Field(
         default=None,

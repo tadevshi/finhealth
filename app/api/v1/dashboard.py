@@ -83,6 +83,7 @@ from app.schemas.dashboard import (
 )
 from app.schemas.domain import RecurringRuleResponse
 from app.services.dashboard import DashboardService
+from app.services.dashboard_selection import RangeMode, from_api_range
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,7 @@ def _parse_card_id(card_id: str) -> uuid.UUID | Literal["all"]:
         ) from exc
 
 
-def _parse_range(range_months: int) -> int:
+def _parse_range(range_months: int) -> RangeMode:
     """Validate the ``range`` query param against the allowed set.
 
     ``range_months`` MUST be one of ``{0, 3, 6, 12}`` per the
@@ -185,7 +186,7 @@ def _parse_range(range_months: int) -> int:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"range must be one of {{0, 3, 6, 12}} (got {range_months!r})",
         )
-    return range_months
+    return from_api_range(range_months)
 
 
 def _parse_limit(limit: int) -> int:
@@ -266,8 +267,11 @@ async def dashboard_summary(
     * ``range_months`` outside ``{0, 3, 6, 12}``.
     * ``card_id`` not a UUID and not the literal ``"all"``.
 
-    The Pydantic ``SummaryResponse`` model wraps the
-    service's payload unchanged — no extra fields, no
+    The endpoint still forwards the typed range mode explicitly;
+    direct service callers also get the same all-time behaviour
+    when calling ``summary(..., range_months=0)`` without
+    ``range_mode``. The Pydantic ``SummaryResponse`` model wraps
+    the service's payload unchanged — no extra fields, no
     transformation.
     """
     parsed_period = _parse_period(period)
@@ -275,7 +279,8 @@ async def dashboard_summary(
     parsed_card_id = _parse_card_id(card_id)
     return await DashboardService(session).summary(
         period=parsed_period,
-        range_months=parsed_range,
+        range_months=range_months,
+        range_mode=parsed_range,
         card_id=parsed_card_id,
     )
 
@@ -437,10 +442,10 @@ async def dashboard_monthly(
     empty ``total_per_currency`` and ``transaction_count=0``)
     so the bar chart has a continuous x-axis.
     """
-    parsed_range = _parse_range(range_months)
+    _parse_range(range_months)
     parsed_card_id = _parse_card_id(card_id)
     return await DashboardService(session).monthly(
-        range_months=parsed_range,
+        range_months=range_months,
         card_id=parsed_card_id,
     )
 

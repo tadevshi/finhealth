@@ -14,9 +14,9 @@
 #   4. Open http://localhost:8000
 #
 # Data persists across container restarts via the two bind mounts
-# below. ``docker compose down`` keeps the host directories intact;
-# ``docker compose down -v`` would also wipe them — pass ``-v`` only
-# when you really want a clean slate.
+# below. ``docker compose down`` keeps host directories intact;
+# ``docker compose down -v`` removes named volumes only, not bind-mounted
+# host directories such as ``./data`` and ``./shared``.
 # ---------------------------------------------------------------------------
 
 services:

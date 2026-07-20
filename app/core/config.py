@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # Database -------------------------------------------------------------------
     DATABASE_URL: str = Field(
-        default="sqlite+aiosqlite:///./finhealth.db",
+        default="sqlite+aiosqlite:///data/finhealth.db",
         description="Async SQLAlchemy database URL.",
     )
 

@@ -92,6 +92,12 @@ from app.schemas.dashboard import (
     MonthlyDataPoint,
     SummaryResponse,
 )
+from app.services.dashboard_selection import (
+    DashboardSelection,
+    RangeMode,
+    YearMonth,
+    resolve_window,
+)
 
 # Generic type variable for ``Select``-typed return values.
 # Used by :meth:`DashboardService._apply_card_filter` to
@@ -202,6 +208,19 @@ def _iso_year_month(d: date_typ) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
+def _add_months(d: date_typ, months: int) -> date_typ:
+    """Return the first day of the month ``months`` away from ``d``."""
+    year = d.year
+    month = d.month + months
+    while month <= 0:
+        month += 12
+        year -= 1
+    while month > 12:
+        month -= 12
+        year += 1
+    return date_typ(year, month, 1)
+
+
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
@@ -253,8 +272,9 @@ class DashboardService:
         period: date_typ,
         range_months: int = _DEFAULT_RANGE_MONTHS,
         card_id: CardFilter = "all",
+        range_mode: RangeMode | None = None,
     ) -> SummaryResponse:
-        """Return the KPI aggregates for a single calendar month.
+        """Return KPI aggregates for the selected calendar or resolved window.
 
         Parameters
         ----------
@@ -262,14 +282,21 @@ class DashboardService:
             Any date inside the calendar month. The service
             normalises to ``[first_day, last_day]``.
         range_months:
-            Lookback window for the previous-period
-            comparison. The Phase 3 PR #9 endpoint accepts
-            ``{3, 6, 12, 0}``; the service is forgiving and
-            accepts any int (it only uses the value to log
-            the window, not to alter the SQL — the
-            comparison is always vs. the prior month
-            regardless of ``range_months``, per the spec
-            scenario "``range=0`` is all-time").
+            Backward-compatible API integer. Kept for callers
+            that have not adopted ``range_mode`` yet. When
+            ``range_mode`` is omitted, ``0`` is inferred as
+            all-time; ``3`` / ``6`` / ``12`` retain the legacy
+            selected-month aggregation. Any other integer is
+            rejected.
+        range_mode:
+            Optional typed range policy. When provided, the
+            service resolves the aggregation window through
+            :func:`app.services.dashboard_selection.resolve_window`.
+            Explicit ``range_mode`` is authoritative and is never
+            overridden by ``range_months``.
+            The previous-month comparison remains anchored to
+            the selected month, while daily average still uses
+            the selected calendar month's day count.
         card_id:
             UUID for one card, or ``"all"`` (default) for
             every card.
@@ -283,60 +310,77 @@ class DashboardService:
             field. ``top_category_id`` and ``top_merchant_id``
             are ``None`` in the empty case.
         """
-        del range_months  # retained for the endpoint contract; comparison is always vs. prior month
         period_start = _first_of_month(period)
         period_end = _last_of_month(period)
         prev_start = _first_of_month(_prior_month_first(period))
         prev_end = _last_of_month(_prior_month_first(period))
 
+        aggregation_start = period_start
+        if range_mode is None:
+            if range_months == 0:
+                range_mode = RangeMode.all_time()
+            elif range_months in {3, 6, 12}:
+                range_mode = None
+            else:
+                raise ValueError("range_months must be one of {0, 3, 6, 12}")
+        if range_mode is not None:
+            earliest = await self._earliest_transaction_date(card_id=card_id)
+            aggregation_start, period_end = resolve_window(
+                DashboardSelection(
+                    period=YearMonth.from_date(period_start),
+                    card_id=card_id,
+                    range_mode=range_mode,
+                ),
+                today=date_typ.today(),
+                earliest=earliest,
+            )
+
         # 1. Current-period totals (per currency) + count.
-        current_totals, current_count = await self._totals_and_count(
-            period_start=period_start,
+        current_totals, current_count, current_counts_by_currency = await self._totals_and_count(
+            period_start=aggregation_start,
             period_end=period_end,
             card_id=card_id,
         )
+        comparison_current_totals = current_totals
+        if aggregation_start != period_start:
+            comparison_current_totals, _comparison_count, _comparison_counts_by_currency = (
+                await self._totals_and_count(
+                    period_start=period_start,
+                    period_end=period_end,
+                    card_id=card_id,
+                )
+            )
 
         # 2. Previous-period totals (per currency) — same shape,
         #    only used for the % change.
-        prev_totals, _prev_count = await self._totals_and_count(
+        prev_totals, _prev_count, _prev_counts_by_currency = await self._totals_and_count(
             period_start=prev_start,
             period_end=prev_end,
             card_id=card_id,
         )
 
-        # 3. Distinct days per currency in the current period —
-        #    drives the ``daily_avg_per_currency`` field.
-        distinct_days = await self._distinct_days_per_currency(
-            period_start=period_start,
-            period_end=period_end,
-            card_id=card_id,
-        )
-
-        # 4. Top category + top merchant in the period (per currency).
+        # 3. Top category + top merchant in the period (per currency).
         top_category_id, top_category_totals = await self._top_category(
-            period_start=period_start,
+            period_start=aggregation_start,
             period_end=period_end,
             card_id=card_id,
         )
         top_merchant_id, top_merchant_totals = await self._top_merchant(
-            period_start=period_start,
+            period_start=aggregation_start,
             period_end=period_end,
             card_id=card_id,
         )
 
-        # 5. Compose the per-currency derived fields.
+        # 4. Compose the per-currency derived fields. Daily average is
+        #    based on calendar days in the selected month, not the number
+        #    of days that happened to have transactions.
+        days_in_month = calendar.monthrange(period_start.year, period_start.month)[1]
         daily_avg: dict[str, Decimal] = {}
         for currency, total in current_totals.items():
-            days = distinct_days.get(currency, 0)
-            if days > 0:
-                # Decimal division with explicit quantize so the
-                # value stays Decimal end-to-end (no implicit
-                # float conversion). Two decimal places match
-                # the ``Numeric(15, 2)`` column.
-                daily_avg[currency] = (total / Decimal(days)).quantize(Decimal("0.01"))
+            daily_avg[currency] = (total / Decimal(days_in_month)).quantize(Decimal("0.01"))
 
         comparison: dict[str, float] = {}
-        for currency, current_total in current_totals.items():
+        for currency, current_total in comparison_current_totals.items():
             prev_total = prev_totals.get(currency)
             if prev_total is None or prev_total == 0:
                 # No prior data, or a divide-by-zero. The
@@ -353,6 +397,7 @@ class DashboardService:
             total_per_currency=current_totals,
             daily_avg_per_currency=daily_avg,
             transaction_count=current_count,
+            transaction_count_per_currency=current_counts_by_currency,
             top_category_id=top_category_id,
             top_category_total_per_currency=top_category_totals,
             top_merchant_id=top_merchant_id,
@@ -363,14 +408,21 @@ class DashboardService:
             card_id=card_id,
         )
 
+    async def _earliest_transaction_date(self, *, card_id: CardFilter) -> date_typ | None:
+        """Return the earliest transaction date for the selected card scope."""
+        stmt = select(func.min(Transaction.date))
+        if card_id != "all":
+            stmt = stmt.join(Statement).where(Statement.credit_card_id == card_id)
+        return await self._session.scalar(stmt)
+
     async def _totals_and_count(
         self,
         *,
         period_start: date_typ,
         period_end: date_typ,
         card_id: CardFilter,
-    ) -> tuple[dict[str, Decimal], int]:
-        """Return ``(per_currency_totals, transaction_count)`` for a period.
+    ) -> tuple[dict[str, Decimal], int, dict[str, int]]:
+        """Return totals, total count, and per-currency counts for a period.
 
         Used by both :meth:`summary` (current + prior month)
         and the per-currency rollups in :meth:`categories` /
@@ -392,44 +444,14 @@ class DashboardService:
 
         rows = (await self._session.execute(stmt)).all()
         totals: dict[str, Decimal] = {}
+        counts: dict[str, int] = {}
         total_count = 0
         for row in rows:
             totals[row.currency] = Decimal(row.total)
-            total_count += int(row.txn_count)
-        return totals, total_count
-
-    async def _distinct_days_per_currency(
-        self,
-        *,
-        period_start: date_typ,
-        period_end: date_typ,
-        card_id: CardFilter,
-    ) -> dict[str, int]:
-        """Return the number of distinct calendar days per currency.
-
-        ``daily_avg`` divides by the *distinct* days, not the
-        period length, so a single big charge on a quiet
-        month does not dilute the average. The query groups
-        by ``(currency, date)`` and counts the rows; one row
-        per day = 1. The currency is then rolled up in
-        Python to the max-day count.
-        """
-        stmt = (
-            select(
-                Transaction.currency,
-                Transaction.date.label("txn_date"),
-            )
-            .where(Transaction.date >= period_start)
-            .where(Transaction.date <= period_end)
-            .group_by(Transaction.currency, Transaction.date)
-        )
-        stmt = self._apply_card_filter(stmt, card_id)
-
-        rows = (await self._session.execute(stmt)).all()
-        per_currency: dict[str, set[date_typ]] = {}
-        for row in rows:
-            per_currency.setdefault(row.currency, set()).add(row.txn_date)
-        return {currency: len(days) for currency, days in per_currency.items()}
+            count = int(row.txn_count)
+            counts[row.currency] = count
+            total_count += count
+        return totals, total_count, counts
 
     async def _top_category(
         self,
@@ -879,7 +901,7 @@ class DashboardService:
         for month_first in months:
             period_start = _first_of_month(month_first)
             period_end = _last_of_month(month_first)
-            totals, count = await self._totals_and_count(
+            totals, count, _counts = await self._totals_and_count(
                 period_start=period_start,
                 period_end=period_end,
                 card_id=card_id,
@@ -918,6 +940,61 @@ class DashboardService:
             )
             prev_totals = totals
 
+        return result
+
+    async def monthly_window(
+        self,
+        *,
+        window_start: date_typ,
+        window_end: date_typ,
+        card_id: CardFilter = "all",
+    ) -> list[MonthlyDataPoint]:
+        """Return a contiguous monthly series for an explicit window."""
+        months: list[date_typ] = []
+        cursor = _first_of_month(window_start)
+        end_month = _first_of_month(window_end)
+        while cursor <= end_month:
+            months.append(cursor)
+            cursor = _add_months(cursor, 1)
+
+        per_month_totals: dict[str, dict[str, Decimal]] = {}
+        per_month_count: dict[str, int] = {}
+        for month_first in months:
+            totals, count, _counts = await self._totals_and_count(
+                period_start=_first_of_month(month_first),
+                period_end=_last_of_month(month_first),
+                card_id=card_id,
+            )
+            label = _iso_year_month(month_first)
+            per_month_totals[label] = totals
+            per_month_count[label] = count
+
+        result: list[MonthlyDataPoint] = []
+        prev_totals: dict[str, Decimal] = {}
+        for idx, month_first in enumerate(months):
+            label = _iso_year_month(month_first)
+            totals = per_month_totals.get(label, {})
+            if idx == 0:
+                prev_pct: dict[str, float | None] = {}
+            else:
+                prev_pct = {}
+                for currency, current_total in totals.items():
+                    prev_total = prev_totals.get(currency)
+                    if prev_total is None or prev_total == 0:
+                        prev_pct[currency] = None
+                        continue
+                    prev_pct[currency] = round(
+                        float((current_total - prev_total) / prev_total * Decimal("100")), 1
+                    )
+            result.append(
+                MonthlyDataPoint(
+                    month=label,
+                    total_per_currency=totals,
+                    transaction_count=per_month_count.get(label, 0),
+                    prev_month_pct_per_currency=prev_pct,
+                )
+            )
+            prev_totals = totals
         return result
 
     async def _distinct_months(

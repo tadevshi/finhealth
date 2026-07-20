@@ -50,14 +50,21 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
+from app.cli import seed_demo
 from app.core.config import Settings
 from app.db.engine import create_engine
 from app.models import Bank, Category, CreditCard, Merchant, RecurringRule, Statement, Transaction
 from app.models.base import Base
 from app.models.statement import StatementStatus
 from app.services.dashboard import DashboardService
+from app.services.dashboard_selection import RangeMode
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -312,8 +319,9 @@ class TestSummary:
 
         assert response.transaction_count == 5
         assert response.total_per_currency == {"CLP": Decimal("80000.00")}
-        # 5 transactions on 5 distinct days → daily avg = total / 5.
-        assert response.daily_avg_per_currency == {"CLP": Decimal("16000.00")}
+        assert response.transaction_count_per_currency == {"CLP": 5}
+        # Calendar-day average: July always divides by 31, independent of transaction density.
+        assert response.daily_avg_per_currency == {"CLP": Decimal("2580.65")}
         assert response.period_start == date(2026, 7, 1)
         assert response.period_end == date(2026, 7, 31)
         assert response.card_id == "all"
@@ -346,6 +354,7 @@ class TestSummary:
         assert response.total_per_currency == {}
         assert response.daily_avg_per_currency == {}
         assert response.transaction_count == 0
+        assert response.transaction_count_per_currency == {}
         assert response.top_category_id is None
         assert response.top_category_total_per_currency == {}
         assert response.top_merchant_id is None
@@ -354,6 +363,29 @@ class TestSummary:
         assert response.period_start == date(2026, 7, 1)
         assert response.period_end == date(2026, 7, 31)
         assert response.card_id == "all"
+
+    @pytest.mark.asyncio
+    async def test_summary_empty_period_returns_zero_counts_and_empty_per_currency(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Empty periods preserve response shape with zero counts and empty currency maps."""
+        del seeded_world
+        async with session_factory() as session:
+            response = await DashboardService(session).summary(
+                period=date(2026, 7, 15),
+                range_months=6,
+                card_id="all",
+            )
+
+        assert response.total_per_currency == {}
+        assert response.transaction_count == 0
+        assert response.transaction_count_per_currency == {}
+        assert response.top_category_id is None
+        assert response.top_merchant_id is None
+        assert response.period_start == date(2026, 7, 1)
+        assert response.period_end == date(2026, 7, 31)
 
     @pytest.mark.asyncio
     async def test_summary_with_card_id_all_vs_uuid(
@@ -408,11 +440,13 @@ class TestSummary:
             )
 
         assert all_response.transaction_count == 5
+        assert all_response.transaction_count_per_currency == {"CLP": 3, "USD": 2}
         assert all_response.total_per_currency == {
             "CLP": Decimal("30000.00"),
             "USD": Decimal("100.00"),
         }
         assert card_response.transaction_count == 3
+        assert card_response.transaction_count_per_currency == {"CLP": 3}
         assert card_response.total_per_currency == {"CLP": Decimal("30000.00")}
 
     @pytest.mark.asyncio
@@ -464,6 +498,7 @@ class TestSummary:
             "CLP": Decimal("45000.00"),
             "USD": Decimal("100.00"),
         }
+        assert response.transaction_count_per_currency == {"CLP": 3, "USD": 2}
         # ``daily_avg_per_currency`` carries a per-currency
         # entry for each currency present.
         assert set(response.daily_avg_per_currency.keys()) == {"CLP", "USD"}
@@ -513,6 +548,130 @@ class TestSummary:
             )
 
         assert response.comparison_to_prev_period_pct_per_currency.get("CLP") == 20.0
+
+    @pytest.mark.asyncio
+    async def test_summary_range_zero_returns_all_time_with_history(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """API range=0/all-time includes historical rows but compares only to prior month."""
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            for txn_date, amount in (
+                (date(2025, 3, 5), "100.00"),
+                (date(2026, 1, 5), "200.00"),
+                (date(2026, 6, 5), "50.00"),
+                (date(2026, 7, 5), "300.00"),
+            ):
+                _add_transaction(
+                    session,
+                    statement_id=statement_a,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=txn_date,
+                    currency="CLP",
+                    category_id=groceries.id,
+                )
+            await session.commit()
+
+        async with session_factory() as session:
+            response = await DashboardService(session).summary(
+                period=date(2026, 7, 15),
+                range_months=0,
+                range_mode=RangeMode.all_time(),
+                card_id="all",
+            )
+
+        assert response.transaction_count == 4
+        assert response.total_per_currency == {"CLP": Decimal("650.00")}
+        assert response.daily_avg_per_currency == {"CLP": Decimal("20.97")}
+        assert response.comparison_to_prev_period_pct_per_currency == {"CLP": 500.0}
+
+    @pytest.mark.asyncio
+    async def test_summary_two_arg_infers_all_time_when_range_mode_omitted(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Direct summary(range=0) infers all-time while comparing only to prior month."""
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            for txn_date, amount in (
+                (date(2025, 3, 5), "100.00"),
+                (date(2026, 1, 5), "200.00"),
+                (date(2026, 6, 5), "50.00"),
+                (date(2026, 7, 5), "300.00"),
+            ):
+                _add_transaction(
+                    session,
+                    statement_id=statement_a,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=txn_date,
+                    currency="CLP",
+                    category_id=groceries.id,
+                )
+            await session.commit()
+
+        async with session_factory() as session:
+            response = await DashboardService(session).summary(date(2026, 7, 1), 0, "all")
+
+        assert response.transaction_count == 4
+        assert response.total_per_currency == {"CLP": Decimal("650.00")}
+        assert response.daily_avg_per_currency == {"CLP": Decimal("20.97")}
+        assert response.comparison_to_prev_period_pct_per_currency == {"CLP": 500.0}
+
+    @pytest.mark.asyncio
+    async def test_summary_explicit_range_mode_overrides_inference(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Explicit typed range_mode wins over integer range_months inference."""
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            for txn_date, amount in (
+                (date(2025, 3, 5), "100.00"),
+                (date(2026, 1, 5), "200.00"),
+                (date(2026, 6, 5), "50.00"),
+                (date(2026, 7, 5), "300.00"),
+            ):
+                _add_transaction(
+                    session,
+                    statement_id=statement_a,
+                    merchant_id=merchant_id,
+                    amount=amount,
+                    txn_date=txn_date,
+                    currency="CLP",
+                    category_id=groceries.id,
+                )
+            await session.commit()
+
+        async with session_factory() as session:
+            response = await DashboardService(session).summary(
+                date(2026, 7, 1),
+                0,
+                "all",
+                range_mode=RangeMode.rolling(3),
+            )
+
+        assert response.transaction_count == 2
+        assert response.total_per_currency == {"CLP": Decimal("350.00")}
+        assert response.daily_avg_per_currency == {"CLP": Decimal("11.29")}
+        assert response.comparison_to_prev_period_pct_per_currency == {"CLP": 500.0}
 
     @pytest.mark.asyncio
     async def test_summary_top_merchant_picks_largest(
@@ -583,6 +742,33 @@ class TestSummary:
 # ---------------------------------------------------------------------------
 # categories
 # ---------------------------------------------------------------------------
+
+
+def test_distinct_days_helper_docstring_or_removal() -> None:
+    """Stale distinct-day average semantics are removed or explicitly deprecated."""
+    helper = getattr(DashboardService, "_distinct_days_per_currency", None)
+    if helper is None:
+        return
+    doc = helper.__doc__ or ""
+    assert "calendar-month denominator" in doc
+    assert "no longer used by summary" in doc
+    assert "divides by the *distinct* days" not in doc
+
+
+@pytest.mark.asyncio
+async def test_dashboard_summary_partial_no_hard_coded_recurring_claim(
+    client,
+) -> None:
+    """The summary partial no longer documents stale hard-coded recurring values."""
+    response = await client.get(
+        "/dashboard/sections",
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+
+    assert response.status_code == 200
+    assert "hard-coded to 8" not in response.text
+    assert "v5 design" not in response.text
+    assert "real value will come from the recurring service in a later phase" not in response.text
 
 
 class TestCategories:
@@ -802,6 +988,110 @@ class TestCategories:
             assert r.total_per_currency == {}
             assert r.transaction_count == 0
             assert r.pct_of_total == 0.0
+
+    @pytest.mark.asyncio
+    async def test_uncategorized_with_seed_spend(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Seed spend that resolves to Uncategorized is counted under that category."""
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        uncategorized = categories["Uncategorized"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_id,
+                amount="100.00",
+                txn_date=date(2026, 7, 5),
+                currency="CLP",
+                category_id=uncategorized.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_id,
+                amount="25.00",
+                txn_date=date(2026, 7, 6),
+                currency="CLP",
+                category_id=uncategorized.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).categories(
+                period=date(2026, 7, 15), card_id="all"
+            )
+
+        uncategorized_row = next(r for r in rows if r.category_id == uncategorized.id)
+        assert uncategorized_row.total_per_currency == {"CLP": Decimal("125.00")}
+        assert uncategorized_row.transaction_count == 2
+
+    @pytest.mark.asyncio
+    async def test_uncategorized_end_to_end_through_seed(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Seed-created Uncategorized is dashboard-visible and user rows remain untouched."""
+        db_path = tmp_path / "uncategorized-seed-dashboard.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+        seed_demo.get_settings.cache_clear()
+        await seed_demo.seed_demo()
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        session_maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_maker() as session:
+            rows = await DashboardService(session).categories(period=date(2026, 7, 1))
+            uncategorized = await session.scalar(
+                select(Category).where(Category.name == "Uncategorized")
+            )
+            assert uncategorized is not None
+            zero_row = next(row for row in rows if row.category_id == uncategorized.id)
+            assert zero_row.total_per_currency == {}
+            assert zero_row.transaction_count == 0
+
+            statement = await session.scalar(select(Statement).order_by(Statement.period_end.desc()))
+            merchant = await session.scalar(select(Merchant).order_by(Merchant.name))
+            assert statement is not None
+            assert merchant is not None
+            session.add_all(
+                [
+                    Transaction(
+                        statement_id=statement.id,
+                        merchant_id=merchant.id,
+                        category_id=uncategorized.id,
+                        category="Uncategorized",
+                        amount=Decimal("40.00"),
+                        currency="CLP",
+                        date=date(2026, 7, 20),
+                        description="USER UNCATEGORIZED 1",
+                        raw_json={"note": "user-owned"},
+                    ),
+                    Transaction(
+                        statement_id=statement.id,
+                        merchant_id=merchant.id,
+                        category_id=uncategorized.id,
+                        category="Uncategorized",
+                        amount=Decimal("60.00"),
+                        currency="CLP",
+                        date=date(2026, 7, 21),
+                        description="USER UNCATEGORIZED 2",
+                        raw_json={"note": "user-owned"},
+                    ),
+                ]
+            )
+            await session.commit()
+            rows = await DashboardService(session).categories(period=date(2026, 7, 1))
+
+        await engine.dispose()
+        uncategorized_row = next(row for row in rows if row.category_id == uncategorized.id)
+        assert uncategorized_row.total_per_currency == {"CLP": Decimal("100.00")}
+        assert uncategorized_row.transaction_count == 2
 
 
 # ---------------------------------------------------------------------------
