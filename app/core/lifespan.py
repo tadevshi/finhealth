@@ -51,14 +51,16 @@ def create_lifespan(settings: Settings) -> Lifespan:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # ---- Startup -----------------------------------------------------
-        logger.info("Starting %s (database=%s)", settings.APP_NAME, settings.DATABASE_URL)
-        engine = create_engine(settings)
+        database_url = settings.database_url
+        redacted_database_url = database_url.render_as_string(hide_password=True)
+        logger.info("Starting %s (database=%s)", settings.APP_NAME, redacted_database_url)
+        engine = create_engine(database_url, debug=settings.DEBUG)
         app.state.engine = engine
         try:
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
         except SQLAlchemyError:
-            logger.exception("Database connectivity check failed for %s", settings.DATABASE_URL)
+            logger.exception("Database connectivity check failed for %s", redacted_database_url)
             await engine.dispose()
             raise
         logger.info("Database connectivity verified")

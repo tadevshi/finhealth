@@ -6,6 +6,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings, get_settings
+from app.db.engine import create_engine
+
+POSTGRES_ENV = {
+    "POSTGRES_USER": "finhealth",
+    "POSTGRES_PASSWORD": "secret",
+    "POSTGRES_DB": "finhealth",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -110,3 +117,65 @@ def test_settings_rejects_invalid_debug_value(
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+@pytest.mark.parametrize("field", ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"])
+@pytest.mark.parametrize("value", [None, ""])
+def test_postgres_only_required_fields_fail_fast(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: str | None
+) -> None:
+    for name, setting in POSTGRES_ENV.items():
+        monkeypatch.setenv(name, setting)
+    if value is None:
+        monkeypatch.delenv(field, raising=False)
+    else:
+        monkeypatch.setenv(field, value)
+    with pytest.raises(ValidationError, match=field):
+        Settings(_env_file=None)
+
+
+def test_postgres_only_host_and_port_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in POSTGRES_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("POSTGRES_HOST", raising=False)
+    monkeypatch.delenv("POSTGRES_PORT", raising=False)
+
+    settings = Settings(_env_file=None)
+    assert settings.POSTGRES_HOST == "postgres"
+    assert settings.POSTGRES_PORT == 5432
+
+    monkeypatch.setenv("POSTGRES_HOST", "")
+    with pytest.raises(ValidationError, match="POSTGRES_HOST"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("POSTGRES_HOST", "db")
+    for invalid_port in ("", "not-a-number", "0", "65536"):
+        monkeypatch.setenv("POSTGRES_PORT", invalid_port)
+        with pytest.raises(ValidationError, match="POSTGRES_PORT"):
+            Settings(_env_file=None)
+
+
+def test_postgres_only_url_uses_raw_values_and_masks_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "p@ss:w0rd/foo#bar"
+    values = POSTGRES_ENV | {
+        "POSTGRES_PASSWORD": password,
+        "POSTGRES_HOST": "db",
+        "POSTGRES_PORT": "5433",
+        "POSTGRES_DB": "ledger",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    database_url = Settings(_env_file=None).database_url
+    assert database_url.drivername == "postgresql+asyncpg"
+    assert database_url.password == password
+    assert password not in database_url.render_as_string(hide_password=True)
+    assert "DATABASE_URL" not in Settings.model_fields
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "app.db.engine.create_async_engine",
+        lambda url, **kwargs: captured.update(url=url, kwargs=kwargs),
+    )
+    create_engine(database_url, debug=True)
+    assert captured == {"url": database_url, "kwargs": {"echo": True}}
