@@ -1,1289 +1,208 @@
-"""Tests for Alembic migration plumbing.
+"""PostgreSQL 16 integration coverage for the destructive Alembic baseline."""
 
-These tests exercise the full upgrade/downgrade round-trip against a
-temporary SQLite file and verify that:
-
-* ``alembic upgrade head`` creates the ``alembic_version`` table and
-  stamps it with the current head revision.
-* ``alembic downgrade base`` clears the stamp (the ``alembic_version``
-  table itself is preserved by Alembic's bookkeeping).
-* ``alembic current`` (i.e. the live revision in the database)
-  matches the head revision reported by the script directory.
-* Running ``upgrade head`` a second time is a no-op.
-* The full upgrade → downgrade cycle leaves the database empty of
-  domain tables (only ``alembic_version`` remains).
-* The ``created_at`` / ``updated_at`` columns on the four domain
-  tables carry ``DEFAULT CURRENT_TIMESTAMP`` after the latest
-  migration runs, so an INSERT that omits the timestamps succeeds
-  (this is the regression guard for the
-  ``NOT NULL constraint failed: credit_cards.created_at`` bug).
-
-The tests are intentionally synchronous: ``alembic.command.upgrade``
-and friends are blocking functions that internally drive the
-``asyncio`` event loop inside ``env.py`` to reach the async engine.
-
-Phase 1 note
-------------
-These tests no longer hardcode ``0001_initial`` as the head: the
-project now has multiple migrations and the head changes as new
-ones are added. The head revision and the full revision list are
-read from the :class:`ScriptDirectory` so the tests stay correct
-no matter how many migrations exist.
-"""
-
+import asyncio
+import os
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from datetime import date
-from decimal import Decimal
+from collections.abc import Iterator
 from pathlib import Path
 
+import asyncpg
 import pytest
-import pytest_asyncio
-from alembic.command import downgrade as alembic_downgrade
 from alembic.command import upgrade as alembic_upgrade
 from alembic.config import Config as AlembicConfig
-from alembic.runtime.migration import MigrationContext
-from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.engine import Engine
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from alembic.operations import Operations
 
-from app.core.config import Settings
-from app.models import Bank, CreditCard, Statement, Transaction
+from app.core.config import get_settings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 ALEMBIC_DIR = PROJECT_ROOT / "alembic"
 
 
-def _sync_url(async_url: str) -> str:
-    """Translate an ``aiosqlite`` URL into its sync counterpart.
+def _postgres_test_settings() -> tuple[str, str, int, str, str]:
+    """Read opt-in PostgreSQL 16 test connection settings."""
+    host = os.getenv("POSTGRES_TEST_HOST")
+    if host is None:
+        pytest.skip("POSTGRES_TEST_HOST is required for PostgreSQL Alembic integration tests")
 
-    Alembic's ``env.py`` runs the migrations through the async engine
-    using ``asyncio.run`` and ``connection.run_sync``, so the
-    connection itself is sync under the hood. For verifying the
-    resulting schema state we want a plain synchronous engine pointing
-    at the same file — which is just the URL with ``+aiosqlite``
-    dropped.
-    """
-    return async_url.replace("sqlite+aiosqlite", "sqlite", 1)
-
-
-@pytest.fixture
-def alembic_config(test_settings: Settings) -> AlembicConfig:
-    """Build an :class:`AlembicConfig` wired to a fresh test database.
-
-    The URL is overridden directly on the config object so we do not
-    need to clear the ``get_settings`` cache. The config is rebuilt
-    per test (function-scoped) so each test starts from a clean slate.
-    """
-    cfg = AlembicConfig(str(ALEMBIC_INI))
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    cfg.set_main_option("sqlalchemy.url", test_settings.DATABASE_URL)
-    return cfg
+    return (
+        host,
+        os.getenv("POSTGRES_TEST_USER", "finhealth"),
+        int(os.getenv("POSTGRES_TEST_PORT", "5432")),
+        os.getenv("POSTGRES_TEST_PASSWORD", "secret"),
+        os.getenv("POSTGRES_TEST_ADMIN_DB", "postgres"),
+    )
 
 
-@pytest.fixture
-def sync_engine(test_settings: Settings) -> Iterator[Engine]:
-    """Yield a sync :class:`Engine` against the same file as the async one.
-
-    Using a sync engine keeps the post-migration assertions
-    (``inspect``) trivial — there is no async context to manage when
-    we only need to read the table list.
-    """
-    engine = create_engine(_sync_url(test_settings.DATABASE_URL))
+async def _create_database(
+    host: str, user: str, port: int, password: str, admin_database: str, database: str
+) -> None:
+    connection = await asyncpg.connect(
+        host=host, user=user, port=port, password=password, database=admin_database
+    )
     try:
-        yield engine
+        await connection.execute(f'CREATE DATABASE "{database}"')
     finally:
-        engine.dispose()
+        await connection.close()
 
 
-def _table_names(engine: Engine) -> set[str]:
-    """Return the set of table names present in ``engine``'s database."""
-    return set(inspect(engine).get_table_names())
-
-
-def _current_revision(engine: Engine) -> str | None:
-    """Return the Alembic revision currently stamped in the database."""
-    with engine.connect() as conn:
-        ctx = MigrationContext.configure(conn)
-        return ctx.get_current_revision()
-
-
-def test_alembic_upgrade_creates_version_table(
-    alembic_config: AlembicConfig, sync_engine: Engine
+async def _drop_database(
+    host: str, user: str, port: int, password: str, admin_database: str, database: str
 ) -> None:
-    """``alembic upgrade head`` creates the ``alembic_version`` table."""
-    assert _table_names(sync_engine) == set()
-
-    alembic_upgrade(alembic_config, "head")
-
-    assert "alembic_version" in _table_names(sync_engine)
-
-
-def test_alembic_current_reports_head_after_upgrade(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """``alembic current`` shows the head revision after upgrade.
-
-    The expected head is read from the :class:`ScriptDirectory` so
-    the test does not need to be updated every time a new migration
-    is added.
-    """
-    script = ScriptDirectory.from_config(alembic_config)
-    expected_head = script.get_current_head()
-    assert expected_head is not None
-
-    alembic_upgrade(alembic_config, "head")
-
-    assert _current_revision(sync_engine) == expected_head
-
-
-def test_alembic_downgrade_clears_version_stamp(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """``alembic downgrade base`` succeeds and clears the current revision.
-
-    The ``alembic_version`` table itself is preserved (Alembic manages
-    its own bookkeeping), but the stamped revision row is removed so
-    ``alembic current`` reports no version afterwards.
-    """
-    script = ScriptDirectory.from_config(alembic_config)
-    expected_head = script.get_current_head()
-    assert expected_head is not None
-
-    alembic_upgrade(alembic_config, "head")
-    assert "alembic_version" in _table_names(sync_engine)
-    assert _current_revision(sync_engine) == expected_head
-
-    alembic_downgrade(alembic_config, "base")
-
-    assert _current_revision(sync_engine) is None
-    # The table stays — Alembic keeps an empty placeholder so a
-    # subsequent ``upgrade head`` can re-stamp it without recreating
-    # the schema. This is the documented Alembic behaviour.
-    assert "alembic_version" in _table_names(sync_engine)
-
-
-def test_alembic_upgrade_is_idempotent(alembic_config: AlembicConfig, sync_engine: Engine) -> None:
-    """Running ``upgrade head`` twice is a no-op (no schema change)."""
-    alembic_upgrade(alembic_config, "head")
-    first_tables = _table_names(sync_engine)
-
-    alembic_upgrade(alembic_config, "head")
-    second_tables = _table_names(sync_engine)
-
-    assert first_tables == second_tables
-    # ``alembic_version`` is always present; the rest are the
-    # domain tables introduced by the migrations.
-    assert "alembic_version" in first_tables
-    assert len(first_tables) > 1  # at least one domain table
-
-
-def test_alembic_round_trip_is_reversible(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """Upgrade → downgrade reverts to an unstamped, single-table state."""
-    script = ScriptDirectory.from_config(alembic_config)
-    expected_head = script.get_current_head()
-    assert expected_head is not None
-
-    alembic_upgrade(alembic_config, "head")
-    assert _current_revision(sync_engine) == expected_head
-
-    alembic_downgrade(alembic_config, "base")
-    assert _current_revision(sync_engine) is None
-    # Every domain table is gone — only the bookkeeping table
-    # remains.
-    assert _table_names(sync_engine) == {"alembic_version"}
-
-    # Re-upgrade from the unstamped state works — proves the
-    # downgrade didn't leave Alembic in a broken state.
-    alembic_upgrade(alembic_config, "head")
-    assert _current_revision(sync_engine) == expected_head
-
-
-def test_alembic_script_directory_has_a_linear_history(
-    alembic_config: AlembicConfig,
-) -> None:
-    """The script directory's revisions form a single linear chain.
-
-    Multiple revisions are expected (Phase 1 added a second one);
-    the test now verifies the chain's *shape* rather than its
-    size so future migrations don't break it.
-    """
-    script = ScriptDirectory.from_config(alembic_config)
-    revisions = list(script.walk_revisions())
-
-    assert len(revisions) >= 1
-    head = script.get_current_head()
-    assert head is not None
-    # The newest revision (first in ``walk_revisions``) is the
-    # current head and has no down-revision pointing past it.
-    newest = revisions[0]
-    assert newest.revision == head
-    assert newest.down_revision is not None
-    # The oldest revision (last in the list) is the root of the
-    # chain and has no down-revision at all.
-    root = revisions[-1]
-    assert root.down_revision is None
-
-
-def test_alembic_seeds_known_banks(alembic_config: AlembicConfig, sync_engine: Engine) -> None:
-    """``alembic upgrade head`` seeds the three known Chilean banks.
-
-    The seed is part of the Phase 1 ingestion migration so a fresh
-    checkout running ``alembic upgrade head`` ends up with a usable
-    database. The test guards against accidental removal of the
-    seed when the migration is refactored.
-    """
-    alembic_upgrade(alembic_config, "head")
-
-    with sync_engine.connect() as conn:
-        rows = conn.exec_driver_sql(
-            "SELECT name, password_formula, is_active FROM banks ORDER BY name"
-        ).fetchall()
-
-    assert len(rows) == 3
-    by_name = {name: (formula, active) for name, formula, active in rows}
-    assert by_name == {
-        "banco_de_chile": ("rut_ultimos_4", 1),
-        "itau": ("rut_sin_dv", 1),
-        "santander": ("rut_sin_dv", 1),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 — Categories seed and new transactions columns
-# ---------------------------------------------------------------------------
-#
-# Migration ``0005_phase2_categories`` introduces the ``categories``
-# table and seeds the 12 closed-set Y-NAB rows. Migration
-# ``0006_phase2_merchants_transactions_alter`` (PR #2 portion) adds
-# the ``category_id`` FK and the ``low_confidence`` Boolean to
-# ``transactions``, plus the supporting index and FK constraint. The
-# tests below prove both halves of the foundation.
-
-
-def test_alembic_seeds_known_categories(alembic_config: AlembicConfig, sync_engine: Engine) -> None:
-    """``alembic upgrade head`` seeds the 12 Y-NAB categories.
-
-    The seed runs in the same transaction as the table create so a
-    fresh checkout running ``alembic upgrade head`` ends up with a
-    fully populated ``categories`` table. The test guards against
-    accidental removal of the seed rows and asserts the canonical
-    12 names are present.
-    """
-    alembic_upgrade(alembic_config, "head")
-
-    with sync_engine.connect() as conn:
-        rows = conn.exec_driver_sql(
-            "SELECT name, display_name, sort_order FROM categories ORDER BY sort_order"
-        ).fetchall()
-
-    by_name = {name: (display, sort) for name, display, sort in rows}
-    # The canonical 12 names. The test asserts the closed set is
-    # present in full so a future PR that drops or renames a row
-    # is caught here.
-    expected = {
-        "Dining Out": ("Dining Out", 1),
-        "Groceries": ("Groceries", 2),
-        "Transportation": ("Transportation", 3),
-        "Shopping": ("Shopping", 4),
-        "Entertainment": ("Entertainment", 5),
-        "Bills": ("Bills & Utilities", 6),
-        "Health": ("Health & Medical", 7),
-        "Travel": ("Travel", 8),
-        "Subscriptions": ("Subscriptions", 9),
-        "Personal Care": ("Personal Care", 10),
-        "Uncategorized": ("Uncategorized", 11),
-        "Other": ("Other", 12),
-    }
-    assert by_name == expected
-
-
-def test_alembic_transactions_round_trip_category_columns(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """The new ``category_id`` / ``low_confidence`` columns round-trip cleanly.
-
-    Inserts a row with explicit values, then re-reads it, so a
-    regression in the migration's column types or default clauses
-    is caught at the boundary. ``category_id`` is verified to
-    accept ``NULL`` (the miss-path of the ingestion validator)
-    and a valid UUID (the hit-path), and ``low_confidence`` is
-    verified at both ``True`` and ``False`` so the
-    ``server_default=0`` clause is honoured.
-    """
-    alembic_upgrade(alembic_config, "head")
-
-    # Seed the parent rows so the FK resolves. The bank seed is
-    # already inserted by migration 0002, so the test only
-    # needs the card + statement + transaction chain.
-    with sync_engine.begin() as conn:
-        conn.exec_driver_sql(
-            "INSERT INTO banks (id, created_at, updated_at, name, display_name, password_formula, is_active) "
-            "VALUES ('11111111-1111-1111-1111-111111111111', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'alembic_test_bank', 'Alembic Test Bank', 'rut_sin_dv', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO credit_cards (id, created_at, updated_at, bank_id, card_number_masked, cardholder, currency, is_active) "
-            "VALUES ('22222222-2222-2222-2222-222222222222', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'11111111-1111-1111-1111-111111111111', 'XXXX XXXX XXXX 0001', 'TEST USER', 'CLP', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO statements (id, created_at, updated_at, credit_card_id, period_start, period_end, statement_date, file_path, file_hash, status) "
-            "VALUES ('33333333-3333-3333-3333-333333333333', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'22222222-2222-2222-2222-222222222222', '2026-05-01', '2026-05-31', '2026-06-01', "
-            "'/tmp/alembic-test.pdf', 'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1', 'COMPLETED')"
-        )
-
-        # Pick the seeded ``Dining Out`` category by name so the
-        # test is independent of the random UUIDs the migration
-        # generates.
-        food_id = conn.exec_driver_sql(
-            "SELECT id FROM categories WHERE name = 'Dining Out'"
-        ).scalar_one()
-        # Insert with a valid FK + ``low_confidence=0`` (the hit-path).
-        conn.exec_driver_sql(
-            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category) "
-            "VALUES ('44444444-4444-4444-4444-444444444441', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'33333333-3333-3333-3333-333333333333', '2026-05-05', 'HIT-PATH', 100.00, 'CLP', "
-            f"'{food_id}', 0, 'Dining Out')"
-        )
-        # Insert with ``category_id=NULL`` + ``low_confidence=1`` (the miss-path).
-        conn.exec_driver_sql(
-            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category) "
-            "VALUES ('44444444-4444-4444-4444-444444444442', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'33333333-3333-3333-3333-333333333333', '2026-05-06', 'MISS-PATH', 50.00, 'CLP', "
-            "NULL, 1, 'Coffee')"
-        )
-
-        # Re-read both rows and assert the columns round-trip
-        # through the schema exactly as written.
-        hit = conn.exec_driver_sql(
-            "SELECT category_id, low_confidence, category FROM transactions WHERE id = '44444444-4444-4444-4444-444444444441'"
-        ).fetchone()
-        miss = conn.exec_driver_sql(
-            "SELECT category_id, low_confidence, category FROM transactions WHERE id = '44444444-4444-4444-4444-444444444442'"
-        ).fetchone()
-
-    # Hit path: FK matches, ``low_confidence=0``, denormalized
-    # name matches the canonical spelling.
-    assert hit is not None
-    assert str(hit[0]) == food_id
-    assert hit[1] == 0
-    assert hit[2] == "Dining Out"
-
-    # Miss path: FK is NULL, ``low_confidence=1``, the LLM string
-    # is preserved verbatim (the ingestion layer keeps it so the
-    # user can re-tag the row by name).
-    assert miss is not None
-    assert miss[0] is None
-    assert miss[1] == 1
-    assert miss[2] == "Coffee"
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 PR #4 — merchants + merchant_aliases + transactions.merchant_id
-# ---------------------------------------------------------------------------
-#
-# Migration ``0006_phase2_merchants_transactions_alter`` (PR #4 portion)
-# adds three artifacts to the schema:
-#
-# * the ``merchants`` table with a nullable FK to
-#   ``categories.id`` (``ON DELETE SET NULL``);
-# * the ``merchant_aliases`` table with a CASCADE FK to
-#   ``merchants.id`` and a UNIQUE constraint on
-#   ``alias_text``;
-# * the ``transactions.merchant_id`` column with a
-#   nullable FK to ``merchants.id`` (``ON DELETE SET
-#   NULL``) and a B-tree index.
-#
-# The two tests below prove the new artifacts survive a
-# full upgrade / downgrade round-trip. The PR #2 portion
-# of migration 0006 (the ``category_id`` column,
-# ``low_confidence``, the FK and index) is exercised by
-# ``test_alembic_transactions_round_trip_category_columns``
-# above — the two halves share the same file, so the
-# round-trip test below implicitly proves the two PRs
-# co-exist cleanly.
-
-
-def test_alembic_seeds_create_merchants_and_aliases_tables(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """Migration 0006 creates the ``merchants`` and ``merchant_aliases`` tables.
-
-    The PR #4 portion of migration 0006 is the table
-    create + the FK + the unique constraint + the
-    index. The test asserts every artifact is present
-    on the live schema after ``upgrade head``.
-    """
-    alembic_upgrade(alembic_config, "head")
-    inspector = inspect(sync_engine)
-
-    # ``merchants`` table exists with the expected
-    # columns and a UNIQUE on ``name``.
-    assert "merchants" in inspector.get_table_names()
-    merchant_columns = {col["name"] for col in inspector.get_columns("merchants")}
-    assert {
-        "id",
-        "name",
-        "default_category_id",
-        "is_active",
-        "created_at",
-        "updated_at",
-    } <= merchant_columns
-    merchant_uniques = inspector.get_unique_constraints("merchants")
-    assert any("name" in u["column_names"] for u in merchant_uniques), (
-        f"merchants.name should be UNIQUE, got {merchant_uniques}"
+    connection = await asyncpg.connect(
+        host=host, user=user, port=port, password=password, database=admin_database
     )
-
-    # ``merchant_aliases`` table exists with the
-    # expected columns and a UNIQUE on ``alias_text``.
-    assert "merchant_aliases" in inspector.get_table_names()
-    alias_columns = {col["name"] for col in inspector.get_columns("merchant_aliases")}
-    assert {
-        "id",
-        "merchant_id",
-        "alias_text",
-        "normalized",
-        "source",
-        "confidence",
-        "created_at",
-        "updated_at",
-    } <= alias_columns
-    alias_uniques = inspector.get_unique_constraints("merchant_aliases")
-    assert any("alias_text" in u["column_names"] for u in alias_uniques), (
-        f"merchant_aliases.alias_text should be UNIQUE, got {alias_uniques}"
-    )
-
-    # ``transactions.merchant_id`` column exists with
-    # an index. The FK is verified by the
-    # round-trip test below.
-    transactions_columns = {col["name"] for col in inspector.get_columns("transactions")}
-    assert "merchant_id" in transactions_columns
-    transactions_indexes = inspector.get_indexes("transactions")
-    assert any(idx["name"] == "ix_transactions_merchant_id" for idx in transactions_indexes), (
-        f"ix_transactions_merchant_id should exist, got {transactions_indexes}"
-    )
-
-
-def test_alembic_transactions_round_trip_merchant_id(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """The new ``transactions.merchant_id`` column round-trips cleanly.
-
-    Inserts a row with an explicit ``merchant_id``
-    bound to a pre-seeded ``Merchant``, then re-reads
-    it, so a regression in the column type or the FK
-    constraint is caught at the boundary. Also inserts
-    a row with ``merchant_id=NULL`` (the auto-create
-    miss path and the pre-PR #4 historical rows) to
-    verify the column is nullable. The round-trip
-    also covers the ``MerchantAlias`` row and the
-    ``UNIQUE(alias_text)`` collision.
-    """
-    alembic_upgrade(alembic_config, "head")
-
-    with sync_engine.begin() as conn:
-        # Seed the parent chain (bank, card, statement,
-        # category, merchant) so the FKs resolve.
-        conn.exec_driver_sql(
-            "INSERT INTO banks (id, created_at, updated_at, name, display_name, password_formula, is_active) "
-            "VALUES ('11111111-1111-1111-1111-111111111111', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'alembic_test_bank', 'Alembic Test Bank', 'rut_sin_dv', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO credit_cards (id, created_at, updated_at, bank_id, card_number_masked, cardholder, currency, is_active) "
-            "VALUES ('22222222-2222-2222-2222-222222222222', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'11111111-1111-1111-1111-111111111111', 'XXXX XXXX XXXX 0001', 'TEST USER', 'CLP', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO statements (id, created_at, updated_at, credit_card_id, period_start, period_end, statement_date, file_path, file_hash, status) "
-            "VALUES ('33333333-3333-3333-3333-333333333333', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'22222222-2222-2222-2222-222222222222', '2026-05-01', '2026-05-31', '2026-06-01', "
-            "'/tmp/alembic-test.pdf', 'c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2', 'COMPLETED')"
-        )
-        # Pick the seeded ``Dining Out`` category by name
-        # so the test is independent of the random UUIDs.
-        food_id = conn.exec_driver_sql(
-            "SELECT id FROM categories WHERE name = 'Dining Out'"
-        ).scalar_one()
-        # Seed a merchant (MCDONALDS) and an alias row.
-        conn.exec_driver_sql(
-            "INSERT INTO merchants (id, created_at, updated_at, name, default_category_id, is_active) "
-            "VALUES ('55555555-5555-5555-5555-555555555555', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            f"'mcdonalds', '{food_id}', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO merchant_aliases (id, created_at, updated_at, merchant_id, alias_text, normalized, source) "
-            "VALUES ('66666666-6666-6666-6666-666666666666', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'55555555-5555-5555-5555-555555555555', 'MCDONALDS SUC 12', 'mcdonalds', 'auto')"
-        )
-
-        # Insert a transaction with a valid merchant FK.
-        conn.exec_driver_sql(
-            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category, merchant_id) "
-            "VALUES ('44444444-4444-4444-4444-444444444443', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'33333333-3333-3333-3333-333333333333', '2026-05-05', 'MCDONALDS SUC 12', 4500.00, 'CLP', "
-            f"'{food_id}', 0, 'Dining Out', '55555555-5555-5555-5555-555555555555')"
-        )
-        # Insert a transaction with merchant_id=NULL
-        # (the pre-PR #4 historical rows + the
-        # auto-create-miss path).
-        conn.exec_driver_sql(
-            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, category_id, low_confidence, category) "
-            "VALUES ('44444444-4444-4444-4444-444444444444', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'33333333-3333-3333-3333-333333333333', '2026-05-06', 'NO-MERCHANT-PATH', 100.00, 'CLP', "
-            f"'{food_id}', 0, 'Dining Out')"
-        )
-
-        # Re-read both rows and assert the merchant_id
-        # column round-trips through the schema exactly
-        # as written.
-        with_merchant = conn.exec_driver_sql(
-            "SELECT merchant_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444443'"
-        ).fetchone()
-        without_merchant = conn.exec_driver_sql(
-            "SELECT merchant_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444444'"
-        ).fetchone()
-
-    assert with_merchant is not None
-    assert str(with_merchant[0]) == "55555555-5555-5555-5555-555555555555"
-    assert without_merchant is not None
-    assert without_merchant[0] is None
-
-
-# ---------------------------------------------------------------------------
-# Migration 0007 — ``recurring_rules`` + ``transactions.recurring_rule_id``
-# ---------------------------------------------------------------------------
-#
-# Phase 2 PR #5 introduces the deterministic recurring-transaction
-# detector. The migration adds one new table and one new nullable
-# column on ``transactions``. The round-trip tests below exercise
-# the schema shape (the table + indexes + the nullable FK on
-# transactions) and prove a value inserted via the new column
-# reads back exactly as written.
-
-
-def test_alembic_seeds_create_recurring_rules_table(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """Migration 0007 creates the ``recurring_rules`` table + indexes + FK.
-
-    The PR #5 portion of migration 0007 is the new table +
-    the composite upsert index + the ``is_active`` index +
-    the ``transactions.recurring_rule_id`` column + its
-    index + its FK. The test asserts every artifact is
-    present on the live schema after ``upgrade head``.
-    """
-    alembic_upgrade(alembic_config, "head")
-    inspector = inspect(sync_engine)
-
-    # ``recurring_rules`` table exists with the expected
-    # columns and the merchant FK with ``ON DELETE CASCADE``.
-    assert "recurring_rules" in inspector.get_table_names()
-    rule_columns = {col["name"] for col in inspector.get_columns("recurring_rules")}
-    assert {
-        "id",
-        "merchant_id",
-        "period_days",
-        "period_label",
-        "amount_min",
-        "amount_max",
-        "currency",
-        "is_active",
-        "confidence",
-        "last_seen_date",
-        "occurrences",
-        "created_at",
-        "updated_at",
-    } <= rule_columns
-    rule_foreign_keys = inspector.get_foreign_keys("recurring_rules")
-    assert any(
-        fk["referred_table"] == "merchants"
-        and fk["constrained_columns"] == ["merchant_id"]
-        and (fk.get("options") or {}).get("ondelete") == "CASCADE"
-        for fk in rule_foreign_keys
-    ), f"recurring_rules.merchant_id FK should be CASCADE, got {rule_foreign_keys}"
-
-    # The composite upsert index + the read-side ``is_active``
-    # index. The composite is non-unique because the upsert
-    # key also includes ``amount_min`` / ``amount_max``, which
-    # are not in the index (checked in application code).
-    rule_indexes = inspector.get_indexes("recurring_rules")
-    assert any(
-        idx["name"] == "ix_recurring_rules_merchant_currency_period"
-        and tuple(idx["column_names"]) == ("merchant_id", "currency", "period_days")
-        for idx in rule_indexes
-    ), (
-        f"ix_recurring_rules_merchant_currency_period should exist on the right columns, "
-        f"got {rule_indexes}"
-    )
-    assert any(
-        idx["name"] == "ix_recurring_rules_is_active"
-        and tuple(idx["column_names"]) == ("is_active",)
-        for idx in rule_indexes
-    ), f"ix_recurring_rules_is_active should exist, got {rule_indexes}"
-
-    # ``transactions.recurring_rule_id`` column exists with
-    # an index. The FK with ``ON DELETE SET NULL`` is verified
-    # by the round-trip test below.
-    transactions_columns = {col["name"] for col in inspector.get_columns("transactions")}
-    assert "recurring_rule_id" in transactions_columns
-    transactions_indexes = inspector.get_indexes("transactions")
-    assert any(
-        idx["name"] == "ix_transactions_recurring_rule_id" for idx in transactions_indexes
-    ), f"ix_transactions_recurring_rule_id should exist, got {transactions_indexes}"
-
-
-def test_alembic_transactions_round_trip_recurring_rule_id(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """The new ``transactions.recurring_rule_id`` column round-trips cleanly.
-
-    Inserts a row with an explicit ``recurring_rule_id``
-    bound to a pre-seeded ``RecurringRule``, then re-reads
-    it, so a regression in the column type or the FK
-    constraint is caught at the boundary. Also inserts a
-    row with ``recurring_rule_id=NULL`` (the pre-PR #5
-    historical rows + the auto-create-miss path) to verify
-    the column is nullable. The round-trip also covers the
-    ``recurring_rules`` row.
-    """
-    alembic_upgrade(alembic_config, "head")
-
-    with sync_engine.begin() as conn:
-        # Seed the parent chain (bank, card, statement,
-        # category, merchant) so the FKs resolve.
-        conn.exec_driver_sql(
-            "INSERT INTO banks (id, created_at, updated_at, name, display_name, password_formula, is_active) "
-            "VALUES ('11111111-1111-1111-1111-111111111111', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'alembic_test_bank_pr5', 'Alembic Test Bank PR5', 'rut_sin_dv', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO credit_cards (id, created_at, updated_at, bank_id, card_number_masked, cardholder, currency, is_active) "
-            "VALUES ('22222222-2222-2222-2222-222222222222', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'11111111-1111-1111-1111-111111111111', 'XXXX XXXX XXXX 0001', 'TEST USER', 'CLP', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO statements (id, created_at, updated_at, credit_card_id, period_start, period_end, statement_date, file_path, file_hash, status) "
-            "VALUES ('33333333-3333-3333-3333-333333333333', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'22222222-2222-2222-2222-222222222222', '2026-05-01', '2026-05-31', '2026-06-01', "
-            "'/tmp/alembic-test-pr5.pdf', 'd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3', 'COMPLETED')"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO merchants (id, created_at, updated_at, name, default_category_id, is_active) "
-            "VALUES ('55555555-5555-5555-5555-555555555555', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'spotify', NULL, 1)"
-        )
-        # Seed a recurring rule so the FK has a valid target.
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, occurrences"
-            ") VALUES ("
-            "'77777777-7777-7777-7777-777777777777', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'55555555-5555-5555-5555-555555555555', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.95, '2026-05-15', 3"
-            ")"
-        )
-
-        # Insert a transaction with a valid recurring_rule FK.
-        conn.exec_driver_sql(
-            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, low_confidence, recurring_rule_id) "
-            "VALUES ('44444444-4444-4444-4444-444444444445', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'33333333-3333-3333-3333-333333333333', '2026-05-15', 'SPOTIFY USA', 9.99, 'USD', "
-            "0, '77777777-7777-7777-7777-777777777777')"
-        )
-        # Insert a transaction with recurring_rule_id=NULL
-        # (the pre-PR #5 historical rows + the one-off
-        # charges the detector skips).
-        conn.exec_driver_sql(
-            "INSERT INTO transactions (id, created_at, updated_at, statement_id, date, description, amount, currency, low_confidence) "
-            "VALUES ('44444444-4444-4444-4444-444444444446', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'33333333-3333-3333-3333-333333333333', '2026-05-16', 'ONE-OFF PURCHASE', 50.00, 'USD', 0)"
-        )
-
-        # Re-read both rows and assert the recurring_rule_id
-        # column round-trips through the schema exactly as
-        # written.
-        with_rule = conn.exec_driver_sql(
-            "SELECT recurring_rule_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444445'"
-        ).fetchone()
-        without_rule = conn.exec_driver_sql(
-            "SELECT recurring_rule_id FROM transactions WHERE id = '44444444-4444-4444-4444-444444444446'"
-        ).fetchone()
-
-    assert with_rule is not None
-    assert str(with_rule[0]) == "77777777-7777-7777-7777-777777777777"
-    assert without_rule is not None
-    assert without_rule[0] is None
-
-
-# ---------------------------------------------------------------------------
-# Migration 0008 — ``recurring_rules`` UNIQUE upsert key + dedup
-# ---------------------------------------------------------------------------
-#
-# Phase 2 PR #7 closes the concurrent-insert race on the
-# detector's SELECT-then-INSERT upsert path by adding a
-# UNIQUE constraint on the 5-column upsert key. The
-# migration's ``upgrade()`` also runs a defensive dedup
-# step that keeps the row with the highest ``confidence``
-# (tie-break: max ``last_seen_date``) for each duplicate
-# group, bumping the keeper's ``last_seen_date`` to the
-# group's max. The two tests below prove both halves.
-
-
-def test_alembic_seeds_create_unique_upsert_key(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """Migration 0008 creates the ``uq_recurring_rules_upsert_key`` UNIQUE constraint.
-
-    The PR #7 portion of migration 0008 is the new
-    UNIQUE constraint on the 5-column upsert key. The
-    test asserts the constraint is present on the live
-    schema after ``upgrade head``, named exactly
-    ``uq_recurring_rules_upsert_key`` and covering
-    ``(merchant_id, amount_min, amount_max, currency,
-    period_days)``. The pre-existing 3-column
-    ``ix_recurring_rules_merchant_currency_period``
-    index is also asserted to be preserved (read-side
-    queries still need it).
-    """
-    alembic_upgrade(alembic_config, "head")
-    inspector = inspect(sync_engine)
-
-    # The 5-column UNIQUE constraint exists on the
-    # upsert key. ``inspect.get_unique_constraints``
-    # returns the constraint metadata including the
-    # column list, so we can assert both name and
-    # column order match the migration.
-    rule_uniques = inspector.get_unique_constraints("recurring_rules")
-    matching = [
-        u
-        for u in rule_uniques
-        if u["name"] == "uq_recurring_rules_upsert_key"
-        and tuple(u["column_names"])
-        == ("merchant_id", "amount_min", "amount_max", "currency", "period_days")
-    ]
-    assert matching, (
-        f"uq_recurring_rules_upsert_key on the 5-tuple should exist, got {rule_uniques}"
-    )
-
-    # The 3-column read-side index from migration 0007
-    # is preserved (the migration's docstring promises
-    # not to drop it).
-    rule_indexes = inspector.get_indexes("recurring_rules")
-    assert any(
-        idx["name"] == "ix_recurring_rules_merchant_currency_period"
-        and tuple(idx["column_names"]) == ("merchant_id", "currency", "period_days")
-        for idx in rule_indexes
-    ), f"ix_recurring_rules_merchant_currency_period should still exist, got {rule_indexes}"
-
-    # The unique constraint is actually enforced —
-    # a second INSERT with the same 5-tuple raises
-    # ``IntegrityError`` at flush. This is the
-    # concurrent-insert race guard the constraint
-    # exists to provide.
-    with sync_engine.begin() as conn:
-        # Seed a merchant (FK target) so the INSERT
-        # can succeed the FK check before hitting
-        # the UNIQUE check.
-        conn.exec_driver_sql(
-            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
-            "VALUES ('88888888-8888-8888-8888-888888888888', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, 'dedup_test_merchant', 1)"
-        )
-        # First INSERT — succeeds.
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
-            "occurrences"
-            ") VALUES ("
-            "'88888888-1111-1111-1111-888888888881', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, '88888888-8888-8888-8888-888888888888', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.8, '2026-05-01', 3)"
-        )
-
-    # Second INSERT with the same 5-tuple but a
-    # different id — must raise IntegrityError.
-    from sqlalchemy.exc import IntegrityError
-
-    with pytest.raises(IntegrityError), sync_engine.begin() as conn:
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
-            "occurrences"
-            ") VALUES ("
-            "'88888888-1111-1111-1111-888888888882', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, '88888888-8888-8888-8888-888888888888', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.7, '2026-05-02', 3)"
-        )
-
-
-def test_alembic_recurring_rules_dedup_on_unique_upgrade(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """Migration 0008 dedups existing rows before adding the UNIQUE constraint.
-
-    Three rows are seeded with the same upsert-key
-    5-tuple but different ``confidence`` and
-    ``last_seen_date`` values. Running ``upgrade head``
-    must dedup to a single row:
-
-    * The survivor is the row with the highest
-      ``confidence`` (0.9 in the example).
-    * The survivor's ``last_seen_date`` is set to
-      ``max(last_seen_date)`` across the group
-      (2026-05-20 in the example — the value from
-      the 0.5-confidence row, which had the most
-      recent seen-date).
-
-    This matches the spec scenario for
-    "Duplicate rows are deduplicated on upgrade".
-    """
-    # Upgrade to 0007 first so we can seed dupes
-    # without tripping the UNIQUE constraint that
-    # 0008 introduces.
-    alembic_upgrade(alembic_config, "0007_phase2_recurring_rules")
-
-    with sync_engine.begin() as conn:
-        # Seed the merchant FK target.
-        conn.exec_driver_sql(
-            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
-            "VALUES ('99999999-9999-9999-9999-999999999999', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, 'dedup_race_merchant', 1)"
-        )
-        # Three duplicate rows: same upsert key
-        # (merchant_id, amount_min, amount_max,
-        # currency, period_days) but different
-        # confidence + last_seen_date.
-        # - 0.7 confidence, seen 2026-05-01
-        # - 0.9 confidence, seen 2026-05-15  <- max confidence → keeper
-        # - 0.5 confidence, seen 2026-05-20  <- max last_seen → tie-break
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
-            "occurrences"
-            ") VALUES ("
-            "'99999999-0001-0001-0001-999999999991', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, '99999999-9999-9999-9999-999999999999', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.7, '2026-05-01', 3)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
-            "occurrences"
-            ") VALUES ("
-            "'99999999-0002-0002-0002-999999999992', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, '99999999-9999-9999-9999-999999999999', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.9, '2026-05-15', 3)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
-            "occurrences"
-            ") VALUES ("
-            "'99999999-0003-0003-0003-999999999993', CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP, '99999999-9999-9999-9999-999999999999', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.5, '2026-05-20', 3)"
-        )
-
-    # Run the dedup-bearing migration. 0008's
-    # upgrade() dedups BEFORE adding the UNIQUE
-    # constraint, so the test is meaningful.
-    alembic_upgrade(alembic_config, "head")
-
-    # Exactly one row remains.
-    with sync_engine.connect() as conn:
-        rows = conn.exec_driver_sql(
-            "SELECT id, confidence, last_seen_date FROM recurring_rules "
-            "WHERE merchant_id = '99999999-9999-9999-9999-999999999999'"
-        ).fetchall()
-
-    assert len(rows) == 1, f"Expected 1 row after dedup, got {len(rows)}: {rows}"
-
-    # The survivor is the 0.9-confidence row.
-    survivor_id, survivor_confidence, survivor_last_seen = rows[0]
-    assert str(survivor_id) == "99999999-0002-0002-0002-999999999992", (
-        f"Expected the 0.9-confidence row to survive, got {survivor_id}"
-    )
-    assert survivor_confidence == 0.9, (
-        f"Expected survivor confidence 0.9, got {survivor_confidence}"
-    )
-
-    # The survivor's last_seen_date is bumped to
-    # max(last_seen_date) across the original
-    # group: 2026-05-20 (the value from the
-    # 0.5-confidence row). The 0.9 row originally
-    # had 2026-05-15; the dedup bumps it to
-    # 2026-05-20 so the survivor reflects the
-    # freshest seen-date the detector ever
-    # observed.
-    assert str(survivor_last_seen) == "2026-05-20", (
-        f"Expected survivor last_seen_date 2026-05-20 (group max), got {survivor_last_seen}"
-    )
-
-
-def test_alembic_0008_downgrade_drops_unique_constraint_preserves_data(
-    alembic_config: AlembicConfig, sync_engine: Engine
-) -> None:
-    """Migration 0008's downgrade drops the UNIQUE constraint and preserves data.
-
-    The spec scenario "Downgrade drops the unique constraint"
-    requires that ``alembic downgrade -1`` (0008 -> 0007) drops
-    the ``uq_recurring_rules_upsert_key`` UNIQUE constraint AND
-    leaves the ``recurring_rules`` table intact (no data loss —
-    the rows that survived the upgrade's dedup step are still
-    readable).
-
-    The round-trip tests in this file downgrade all the way to
-    ``base``, which drops the entire ``recurring_rules`` table
-    (it was created in migration 0007), so they cannot verify
-    the data-preservation half of the scenario. This test
-    downgrades only to ``-1`` (0008 -> 0007), inserts a row,
-    runs the downgrade, and asserts all three halves:
-
-    * The ``recurring_rules`` table is still present (0007
-      still owns the table — the downgrade must not drop it).
-    * The ``uq_recurring_rules_upsert_key`` constraint is gone
-      (so a duplicate INSERT now succeeds instead of raising
-      ``IntegrityError``).
-    * The inserted row's data round-trips through ``SELECT``
-      exactly as written — no rows were deleted by the
-      downgrade.
-    """
-    # 1. Upgrade to head so the UNIQUE constraint is in
-    #    place (this is the "GIVEN" the spec scenario requires).
-    alembic_upgrade(alembic_config, "head")
-    pre_inspector = inspect(sync_engine)
-    pre_uniques = pre_inspector.get_unique_constraints("recurring_rules")
-    assert any(u["name"] == "uq_recurring_rules_upsert_key" for u in pre_uniques), (
-        f"Pre-condition failed: uq_recurring_rules_upsert_key should exist after head, "
-        f"got {pre_uniques}"
-    )
-
-    # 2. Seed a merchant + a recurring_rule row so there is
-    #    real data to preserve through the downgrade. The
-    #    upsert-key 5-tuple matches the on-disk column types
-    #    (amount_min/max as REAL, currency as TEXT, period_days
-    #    as INTEGER) so the constraint accepts the INSERT.
-    inserted_rule_id = "dddddddd-0001-0001-0001-dddddddddd01"
-    inserted_merchant_id = "dddddddd-0002-0002-0002-dddddddddd02"
-    with sync_engine.begin() as conn:
-        conn.exec_driver_sql(
-            "INSERT INTO merchants (id, created_at, updated_at, name, is_active) "
-            "VALUES ("
-            f"'{inserted_merchant_id}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            "'downgrade_test_merchant', 1)"
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO recurring_rules ("
-            "id, created_at, updated_at, merchant_id, period_days, period_label, "
-            "amount_min, amount_max, currency, is_active, confidence, last_seen_date, "
-            "occurrences"
-            ") VALUES ("
-            f"'{inserted_rule_id}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
-            f"'{inserted_merchant_id}', 30, 'monthly', "
-            "9.99, 9.99, 'USD', 1, 0.95, '2026-05-15', 3)"
-        )
-
-    # 3. Downgrade 0008 -> 0007. This is JUST 0008's
-    #    downgrade (``op.batch_alter_table`` + ``drop_constraint``
-    #    with ``type_="unique"``), not all the way to base.
-    #    The 0007 step would have been a no-op here (we are
-    #    already at 0008) so calling ``-1`` exercises only
-    #    0008's own downgrade.
-    alembic_downgrade(alembic_config, "-1")
-
-    # Discard the pre-downgrade inspector and dispose the
-    # engine pool so the post-downgrade reads come from a
-    # fresh connection. ``Inspect`` caches per-instance
-    # results, and on SQLite the ``batch_alter_table``
-    # copy-and-move creates a brand-new on-disk table
-    # that the old cached state would not see.
-    sync_engine.dispose()
-    post_inspector = inspect(sync_engine)
-
-    # 4. The ``recurring_rules`` table is still present
-    #    (0007 still creates it — only 0008's upgrade is
-    #    being reversed).
-    assert "recurring_rules" in post_inspector.get_table_names(), (
-        "recurring_rules table should still exist after 0008 downgrade (0007 still owns the table)"
-    )
-
-    # 5. The UNIQUE constraint is gone. The 3-column
-    #    read-side index from 0007 must still be present
-    #    (the downgrade must not touch it).
-    post_uniques = post_inspector.get_unique_constraints("recurring_rules")
-    assert "uq_recurring_rules_upsert_key" not in {u["name"] for u in post_uniques}, (
-        f"uq_recurring_rules_upsert_key should be dropped after 0008 downgrade, got {post_uniques}"
-    )
-    post_indexes = post_inspector.get_indexes("recurring_rules")
-    assert any(
-        idx["name"] == "ix_recurring_rules_merchant_currency_period" for idx in post_indexes
-    ), (
-        f"ix_recurring_rules_merchant_currency_period should be preserved after 0008 "
-        f"downgrade, got {post_indexes}"
-    )
-
-    # 6. The inserted row is still readable with its data
-    #    intact. The downgrade must not have touched any
-    #    rows — the spec scenario explicitly requires "no
-    #    data is lost".
-    with sync_engine.connect() as conn:
-        row = conn.exec_driver_sql(
-            "SELECT id, merchant_id, period_days, amount_min, amount_max, "
-            "currency, is_active, confidence, last_seen_date, occurrences "
-            f"FROM recurring_rules WHERE id = '{inserted_rule_id}'"
-        ).fetchone()
-
-    assert row is not None, (
-        f"Recurring rule {inserted_rule_id} should still be present after 0008 downgrade"
-    )
-    assert str(row[0]) == inserted_rule_id
-    assert str(row[1]) == inserted_merchant_id
-    assert int(row[2]) == 30
-    # amount_min / amount_max come back as ``float`` from
-    # the SQLite driver — compare as floats so the test is
-    # not tied to the exact repr.
-    assert float(row[3]) == 9.99
-    assert float(row[4]) == 9.99
-    assert row[5] == "USD"
-    assert int(row[6]) == 1
-    assert float(row[7]) == 0.95
-    assert str(row[8]) == "2026-05-15"
-    assert int(row[9]) == 3
-
-
-# ---------------------------------------------------------------------------
-# Timestamp server_default regression guard
-# ---------------------------------------------------------------------------
-#
-# The migration ``0002_phase1_ingestion`` created ``created_at`` and
-# ``updated_at`` as ``NOT NULL`` columns *without* a ``server_default``
-# clause. The ORM model had ``server_default=func.now()``, but the
-# database schema Alembic produced did not carry the same default —
-# so SQLAlchemy's flush path (which can omit the column on dialects
-# with ``RETURNING``) tripped ``NOT NULL constraint failed:
-# credit_cards.created_at``.
-#
-# The regression is fixed by migration ``0004_timestamp_server_defaults``
-# (which adds ``DEFAULT CURRENT_TIMESTAMP`` to both columns on every
-# domain table) and by the companion change to ``TimestampMixin``
-# (which adds the matching ``default=func.now()`` and ``nullable=False``
-# on the Python side). The tests below prove both halves of the fix:
-# the schema carries the default, and the ORM honours it on flush.
-
-
-@pytest_asyncio.fixture
-async def async_session_factory(
-    migrated_test_settings: Settings,
-) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Yield a session factory bound to a freshly-migrated async engine.
-
-    Unlike the ``test_models`` fixture, which uses
-    ``Base.metadata.create_all``, this one runs the *real* Alembic
-    migration chain (via the sync ``migrated_test_settings``
-    fixture, so ``alembic_upgrade`` does not call ``asyncio.run``
-    inside our event loop). The point of the regression guard is to
-    verify the migration produces a schema that lets the
-    application insert rows without explicit timestamps —
-    recreating the schema with ``create_all`` would mask the bug
-    entirely (the ORM model itself already had the right
-    ``server_default``).
-    """
-    eng: AsyncEngine = create_async_engine(migrated_test_settings.DATABASE_URL)
     try:
-        factory = async_sessionmaker(eng, expire_on_commit=False)
-        yield factory
+        await connection.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            database,
+        )
+        await connection.execute(f'DROP DATABASE IF EXISTS "{database}"')
     finally:
-        await eng.dispose()
+        await connection.close()
 
 
 @pytest.fixture
-def migrated_test_settings(test_settings: Settings) -> Settings:
-    """Run ``alembic upgrade head`` on the test database, return the settings.
+def postgres_database(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, str, int, str, str]]:
+    """Provide an isolated disposable database without changing global test fixtures."""
+    host, user, port, password, admin_database = _postgres_test_settings()
+    database = f"finhealth_wu2_{uuid.uuid4().hex}"
+    asyncio.run(_create_database(host, user, port, password, admin_database, database))
+    monkeypatch.setenv("POSTGRES_HOST", host)
+    monkeypatch.setenv("POSTGRES_USER", user)
+    monkeypatch.setenv("POSTGRES_PORT", str(port))
+    monkeypatch.setenv("POSTGRES_PASSWORD", password)
+    monkeypatch.setenv("POSTGRES_DB", database)
+    get_settings.cache_clear()
+    try:
+        yield host, user, port, password, database
+    finally:
+        get_settings.cache_clear()
+        asyncio.run(_drop_database(host, user, port, password, admin_database, database))
 
-    This is intentionally a *sync* fixture: ``alembic.command.upgrade``
-    calls ``asyncio.run`` internally (see ``alembic/env.py``) and
-    that call would fail with ``RuntimeError: asyncio.run() cannot
-    be called from a running event loop`` if invoked from inside
-    a ``pytest-asyncio`` test. Keeping the migration in a sync
-    fixture lets Alembic drive its own event loop on a clean slate.
-    """
-    cfg = AlembicConfig(str(ALEMBIC_INI))
-    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
-    cfg.set_main_option("sqlalchemy.url", test_settings.DATABASE_URL)
-    alembic_upgrade(cfg, "head")
-    return test_settings
+
+def _alembic_config() -> AlembicConfig:
+    config = AlembicConfig(str(ALEMBIC_INI))
+    config.set_main_option("script_location", str(ALEMBIC_DIR))
+    return config
 
 
-def test_alembic_timestamp_columns_have_server_default(
-    alembic_config: AlembicConfig, sync_engine: Engine
+def _run(coroutine: object) -> object:
+    return asyncio.run(coroutine)  # type: ignore[arg-type]
+
+
+def test_preseeded_database_fails_before_baseline_ddl(
+    postgres_database: tuple[str, str, int, str, str],
 ) -> None:
-    """The four domain tables carry ``DEFAULT CURRENT_TIMESTAMP`` on timestamps.
+    """A legacy user table must reject the destructive baseline without partial DDL."""
+    host, user, port, password, database = postgres_database
 
-    Inspects the live database schema (after ``upgrade head``) and
-    asserts that the ``server_default`` of every ``created_at`` and
-    ``updated_at`` column is non-``None``. This is the *schema-level*
-    half of the fix: without this, SQLAlchemy's flush path on SQLite
-    (which relies on ``RETURNING`` and omits server-defaulted
-    columns) hits the ``NOT NULL`` constraint.
-    """
-    alembic_upgrade(alembic_config, "head")
-    inspector = inspect(sync_engine)
+    async def seed_and_verify() -> None:
+        connection = await asyncpg.connect(
+            host=host, user=user, port=port, password=password, database=database
+        )
+        try:
+            await connection.execute("CREATE TABLE legacy_data (id integer PRIMARY KEY)")
+        finally:
+            await connection.close()
 
-    for table in ("banks", "credit_cards", "statements", "transactions"):
-        columns = {col["name"]: col for col in inspector.get_columns(table)}
-        for ts_col in ("created_at", "updated_at"):
-            assert ts_col in columns, f"{table}.{ts_col} missing from schema"
-            default = columns[ts_col].get("default")
-            assert default is not None, (
-                f"{table}.{ts_col} has no server default — "
-                f"the upload endpoint will hit NOT NULL constraint failure"
+    _run(seed_and_verify())
+    with pytest.raises(RuntimeError, match="non-empty database"):
+        alembic_upgrade(_alembic_config(), "head")
+
+    async def assert_no_partial_schema() -> None:
+        connection = await asyncpg.connect(
+            host=host, user=user, port=port, password=password, database=database
+        )
+        try:
+            assert (
+                await connection.fetchval("SELECT to_regclass('public.legacy_data')")
+                == "legacy_data"
             )
-            # The default is rendered as a SQL fragment; ``CURRENT_TIMESTAMP``
-            # is what ``sa.func.now()`` compiles to on every dialect this
-            # project supports (SQLite and PostgreSQL). Matching on the
-            # substring keeps the test portable across both.
-            assert "CURRENT_TIMESTAMP" in str(default).upper(), (
-                f"{table}.{ts_col} default is {default!r}, expected CURRENT_TIMESTAMP"
+            assert await connection.fetchval("SELECT to_regclass('public.banks')") is None
+        finally:
+            await connection.close()
+
+    _run(assert_no_partial_schema())
+
+
+def test_empty_database_creates_schema_constraints_and_deterministic_seeds(
+    postgres_database: tuple[str, str, int, str, str],
+) -> None:
+    """The sole baseline creates the current schema and stable reference rows."""
+    host, user, port, password, database = postgres_database
+    alembic_upgrade(_alembic_config(), "head")
+
+    async def assert_schema() -> None:
+        connection = await asyncpg.connect(
+            host=host, user=user, port=port, password=password, database=database
+        )
+        try:
+            tables = {
+                record["relname"]
+                for record in await connection.fetch(
+                    "SELECT relname FROM pg_class WHERE relkind = 'r' "
+                    "AND relnamespace = 'public'::regnamespace"
+                )
+            }
+            assert {
+                "banks",
+                "categories",
+                "credit_cards",
+                "statements",
+                "transactions",
+                "merchants",
+                "merchant_aliases",
+                "recurring_rules",
+            } <= tables
+            assert await connection.fetchval("SELECT count(*) FROM banks") == 3
+            assert await connection.fetchval("SELECT count(*) FROM categories") == 12
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM pg_constraint WHERE conname = 'uq_recurring_rules_upsert_key'"
+                )
+                == 1
             )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM pg_indexes WHERE indexname = 'ix_transactions_recurring_rule_id'"
+                )
+                == 1
+            )
+        finally:
+            await connection.close()
+
+    _run(assert_schema())
 
 
-@pytest.mark.asyncio
-async def test_credit_card_creation_without_explicit_timestamps(
-    async_session_factory: async_sessionmaker[AsyncSession],
+def test_mid_baseline_failure_rolls_back_schema(
+    postgres_database: tuple[str, str, int, str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``CreditCard`` inserted on a migrated DB gets timestamps from the DB.
+    """A seed failure cannot leave baseline DDL or an Alembic stamp behind."""
+    host, user, port, password, database = postgres_database
 
-    Regression guard for ``NOT NULL constraint failed:
-    credit_cards.created_at``. Before migration ``0004``, the
-    application raised 500 on every upload because the database
-    schema lacked the ``DEFAULT CURRENT_TIMESTAMP`` clause. With
-    the migration in place, the same INSERT succeeds and the row
-    carries non-``None`` ``created_at`` / ``updated_at`` populated
-    by the engine.
-    """
-    async with async_session_factory() as session:
-        # Seed a bank first (banks is the parent of credit_cards).
-        # The bank row also goes through the timestamp path — the
-        # seed in ``0002`` writes explicit timestamps, so this row
-        # is just a control to make sure the fixture is alive.
-        bank = Bank(
-            id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
-            name="repro_bank",
-            display_name="Repro Bank",
-            password_formula="rut_sin_dv",
+    def fail_seed(self: Operations, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected baseline seed failure")
+
+    monkeypatch.setattr(Operations, "bulk_insert", fail_seed)
+    with pytest.raises(RuntimeError, match="injected baseline seed failure"):
+        alembic_upgrade(_alembic_config(), "head")
+
+    async def assert_rollback() -> None:
+        connection = await asyncpg.connect(
+            host=host, user=user, port=port, password=password, database=database
         )
-        session.add(bank)
-        await session.commit()
+        try:
+            assert await connection.fetchval("SELECT to_regclass('public.banks')") is None
+            assert await connection.fetchval("SELECT to_regclass('public.alembic_version')") is None
+        finally:
+            await connection.close()
 
-        # The card is the *real* subject of the regression: pre-fix
-        # this ``commit()`` raised IntegrityError because the DB
-        # schema had ``NOT NULL created_at`` with no default.
-        card = CreditCard(
-            bank_id=bank.id,
-            card_number_masked="XXXX XXXX XXXX 1234",
-            cardholder="REPRO USER",
-            currency="CLP",
-        )
-        session.add(card)
-        await session.commit()  # was raising before the fix
-        await session.refresh(card)
-
-        assert card.id is not None
-        assert card.created_at is not None, "created_at not populated by DB default"
-        assert card.updated_at is not None, "updated_at not populated by DB default"
-        assert isinstance(card.created_at, type(card.updated_at))
-        assert card.created_at <= card.updated_at
+    _run(assert_rollback())
 
 
-@pytest.mark.asyncio
-async def test_all_timestamp_mixin_tables_accept_timeless_inserts(
-    async_session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """Every model that opts into ``TimestampMixin`` accepts a timestamp-less insert.
-
-    The ``TimestampMixin`` is shared across the four domain tables,
-    so the fix must hold for *all* of them — not just
-    ``credit_cards``. This test inserts one row per table (in
-    dependency order) and asserts each commit succeeds and the
-    timestamps are populated. The parent rows are seeded with
-    explicit UUIDs to keep the test self-contained.
-    """
-    bank_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
-    card_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
-    statement_id = uuid.UUID("44444444-4444-4444-4444-444444444444")
-
-    async with async_session_factory() as session:
-        # Bank
-        bank = Bank(
-            id=bank_id,
-            name="repro_bank_all",
-            display_name="Repro All",
-            password_formula="rut_sin_dv",
-        )
-        session.add(bank)
-        await session.commit()
-        await session.refresh(bank)
-        assert bank.created_at is not None
-        assert bank.updated_at is not None
-
-        # CreditCard
-        card = CreditCard(
-            id=card_id,
-            bank_id=bank.id,
-            card_number_masked="XXXX XXXX XXXX 9999",
-            cardholder="REPRO ALL",
-            currency="CLP",
-        )
-        session.add(card)
-        await session.commit()
-        await session.refresh(card)
-        assert card.created_at is not None
-        assert card.updated_at is not None
-
-        # Statement
-        statement = Statement(
-            id=statement_id,
-            credit_card_id=card.id,
-            period_start=date(2026, 5, 1),
-            period_end=date(2026, 5, 31),
-            statement_date=date(2026, 6, 1),
-            file_path="repro/2026-05.pdf",
-            file_hash="a" * 64,
-        )
-        session.add(statement)
-        await session.commit()
-        await session.refresh(statement)
-        assert statement.created_at is not None
-        assert statement.updated_at is not None
-
-        # Transaction (the deepest child)
-        tx = Transaction(
-            statement_id=statement.id,
-            date=date(2026, 5, 5),
-            description="REPRO TX",
-            amount=Decimal("100.00"),
-            currency="CLP",
-        )
-        session.add(tx)
-        await session.commit()
-        await session.refresh(tx)
-        assert tx.created_at is not None
-        assert tx.updated_at is not None
+def test_only_postgresql_baseline_revision_exists() -> None:
+    """The undeployed SQLite-oriented migration lineage is not retained."""
+    versions = ALEMBIC_DIR / "versions"
+    assert [path.name for path in versions.glob("*.py")] == ["0001_postgresql_baseline.py"]

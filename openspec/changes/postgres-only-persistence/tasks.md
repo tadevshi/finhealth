@@ -37,14 +37,14 @@ Estimated changed lines: 1200–1800; 4 stacked PRs.
 
 ## Phase 2: Alembic Baseline & Cleanup (WU-2)
 
-- [ ] **0.0 BLOCKING PREREQUISITE** still active.
-- [ ] 2.1 RED `tests/test_alembic.py`: `alembic upgrade head` on pre-seeded schema raises non-empty-database error before any DDL.
-- [ ] 2.2 RED: on empty database, baseline creates all tables, constraints, indexes, `banks` seeds inside one transaction.
-- [ ] 2.3 RED: injected mid-baseline failure rolls the entire transaction back.
-- [ ] 2.4 RED: revision files `0001_initial.py`–`0008_phase2_recurring_rules_unique.py` no longer exist.
-- [ ] 2.5 GREEN rewrite `alembic/env.py` to use the URL object; add pre-DDL `pg_catalog` preflight (exclude `alembic_version` + system schemas); short-circuit at head.
-- [ ] 2.6 GREEN create `alembic/versions/0001_postgresql_baseline.py` — all tables, constraints, indexes, seeds in one transactional `upgrade()`; empty `downgrade()`.
-- [ ] 2.7 GREEN delete `0001_initial.py`–`0008_phase2_recurring_rules_unique.py`; clear `__pycache__`.
+- [x] **0.0 BLOCKING PREREQUISITE** resolved through the maintainer's explicit continuation/reset authorization.
+- [x] 2.1 RED `tests/test_alembic.py`: `alembic upgrade head` on pre-seeded schema raises non-empty-database error before any DDL.
+- [x] 2.2 RED: on empty database, baseline creates all tables, constraints, indexes, `banks` seeds inside one transaction.
+- [x] 2.3 RED: injected mid-baseline failure rolls the entire transaction back.
+- [x] 2.4 RED: revision files `0001_initial.py`–`0008_phase2_recurring_rules_unique.py` no longer exist.
+- [x] 2.5 GREEN rewrite `alembic/env.py` to use the URL object; add pre-DDL `pg_catalog` preflight (exclude `alembic_version` + system schemas); short-circuit at head.
+- [x] 2.6 GREEN create `alembic/versions/0001_postgresql_baseline.py` — all tables, constraints, indexes, seeds in one transactional `upgrade()`; empty `downgrade()`.
+- [x] 2.7 GREEN delete `0001_initial.py`–`0008_phase2_recurring_rules_unique.py`; clear `__pycache__`.
 
 ## Phase 3: Test Isolation & Dependency Cleanup (WU-3)
 
