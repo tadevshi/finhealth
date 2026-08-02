@@ -51,7 +51,7 @@ async def get_session(
     transactions are discarded, so handlers that intend to persist
     must call ``await session.commit()`` themselves.
     """
-    engine = create_engine(settings)
+    engine = create_engine(settings.database_url, debug=settings.DEBUG)
     factory = create_session_factory(engine)
     try:
         async with factory() as session:

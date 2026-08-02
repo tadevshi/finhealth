@@ -20,9 +20,8 @@ FastAPI application uses. Two design decisions worth flagging:
 import asyncio
 from logging.config import fileConfig
 
-from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
 
@@ -58,7 +57,6 @@ if config.config_file_name is not None:
 # overrides whatever ``sqlalchemy.url`` is set to in ``alembic.ini``,
 # so the value declared in the INI file is effectively a placeholder.
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 # Metadata ``autogenerate`` reads when building new migrations.
 # Empty for now — no domain models exist yet.
@@ -74,13 +72,11 @@ def run_migrations_offline() -> None:
     ``ALTER TABLE`` rewrites it needs (e.g. column renames), even
     though this project does not use autogenerate yet.
     """
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=settings.database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        render_as_batch=True,
     )
 
     with context.begin_transaction():
@@ -92,7 +88,6 @@ def do_run_migrations(connection: Connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
-        render_as_batch=True,
     )
 
     with context.begin_transaction():
@@ -106,11 +101,7 @@ async def run_async_migrations() -> None:
     its ``sqlalchemy.url`` rewritten above) and used as a context
     manager so the connection pool is released cleanly.
     """
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    connectable = create_async_engine(settings.database_url)
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

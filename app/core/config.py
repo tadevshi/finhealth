@@ -2,8 +2,9 @@
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -46,10 +47,11 @@ class Settings(BaseSettings):
     )
 
     # Database -------------------------------------------------------------------
-    DATABASE_URL: str = Field(
-        default="sqlite+aiosqlite:///data/finhealth.db",
-        description="Async SQLAlchemy database URL.",
-    )
+    POSTGRES_USER: str = Field(min_length=1, description="PostgreSQL login role.")
+    POSTGRES_PASSWORD: str = Field(min_length=1, description="PostgreSQL login password.")
+    POSTGRES_HOST: str = Field(default="postgres", description="PostgreSQL host name.")
+    POSTGRES_PORT: int = Field(default=5432, ge=1, le=65535, description="PostgreSQL port.")
+    POSTGRES_DB: str = Field(min_length=1, description="PostgreSQL database name.")
 
     # CORS -----------------------------------------------------------------------
     CORS_ORIGINS: list[str] = Field(
@@ -152,6 +154,25 @@ class Settings(BaseSettings):
         ge=1,
         description="Maximum upload size in megabytes.",
     )
+
+    @field_validator("POSTGRES_HOST", mode="before")
+    @classmethod
+    def _reject_empty_postgres_host(cls, value: object) -> object:
+        if value == "":
+            raise ValueError("POSTGRES_HOST must not be empty")
+        return value
+
+    @property
+    def database_url(self) -> URL:
+        """Build the async PostgreSQL URL from validated raw environment values."""
+        return URL.create(
+            "postgresql+asyncpg",
+            username=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            database=self.POSTGRES_DB,
+        )
 
 
 @lru_cache(maxsize=1)
