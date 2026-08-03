@@ -1,116 +1,84 @@
-"""Alembic environment — async SQLAlchemy migration runner.
-
-This module is loaded by the Alembic CLI (``alembic upgrade``, etc.)
-and configures the migration context to talk to the same database the
-FastAPI application uses. Two design decisions worth flagging:
-
-1. **Source of truth is the application settings**, not
-   ``alembic.ini``. ``alembic.ini`` leaves ``sqlalchemy.url`` blank and
-   the URL is read from :func:`app.core.config.get_settings`, which
-   honours the ``DATABASE_URL`` environment variable. This keeps dev,
-   test, and production in lock-step with the FastAPI app.
-2. **Migrations run on an async engine** (``aiosqlite`` for now) via
-   :func:`sqlalchemy.ext.asyncio.async_engine_from_config`. The
-   ``run_migrations_online`` function drives an ``asyncio.run`` loop,
-   so the CLI invocation is still synchronous from Alembic's
-   perspective — every async SQLAlchemy call goes through
-   ``connection.run_sync`` to run sync-style inside the event loop.
-"""
+"""PostgreSQL-only Alembic runner using the application URL object."""
 
 import asyncio
 from logging.config import fileConfig
 
+import sqlalchemy as sa
+from alembic.script import ScriptDirectory
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
-
-# ---------------------------------------------------------------------------
-# Project imports
-# ---------------------------------------------------------------------------
-# Importing ``app.core.config`` and ``app.models.base`` ensures Alembic
-# sees the same declarative ``Base.metadata`` as the running app. The
-# import is intentionally *after* the standard-library / third-party
-# imports so isort groups them correctly. ``app`` is on ``sys.path``
-# thanks to ``prepend_sys_path = .`` in ``alembic.ini``.
 from app.core.config import get_settings
 from app.models.base import Base
 
-# This is the Alembic Config object, which provides access to the
-# values within the .ini file in use.
 config = context.config
-
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-#
-# ``disable_existing_loggers=False`` is required so the migration
-# runner does not clobber handlers installed by other systems (most
-# importantly, pytest's ``caplog`` fixture, which is wired at the
-# root logger). The Python logging spec defaults this to ``True``
-# for safety; we override it because the alembic logger tree is
-# a small, well-known subset and we never want to surprise other
-# tools.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# Inject the runtime database URL from application settings. This
-# overrides whatever ``sqlalchemy.url`` is set to in ``alembic.ini``,
-# so the value declared in the INI file is effectively a placeholder.
 settings = get_settings()
-
-# Metadata ``autogenerate`` reads when building new migrations.
-# Empty for now — no domain models exist yet.
 target_metadata = Base.metadata
+
+_USER_TABLES = sa.text(
+    """
+    SELECT n.nspname || '.' || c.relname
+    FROM pg_catalog.pg_class AS c
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p')
+      AND n.nspname <> 'information_schema'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND c.relname <> 'alembic_version'
+    ORDER BY n.nspname, c.relname
+    """
+)
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode.
-
-    In this mode Alembic emits SQL scripts to stdout without talking
-    to a live database. The URL is read from the (already-injected)
-    main option. ``render_as_batch`` is enabled so SQLite gets the
-    ``ALTER TABLE`` rewrites it needs (e.g. column renames), even
-    though this project does not use autogenerate yet.
-    """
+    """Emit PostgreSQL SQL using the same structured settings URL."""
     context.configure(
-        url=settings.database_url,
+        url=settings.database_url.render_as_string(hide_password=False),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
 
 def do_run_migrations(connection: Connection) -> None:
-    """Run migrations inside a sync ``Connection`` (async-safe)."""
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
-    )
+    """Refuse non-empty user databases before a destructive baseline runs."""
+    if connection.dialect.name != "postgresql":
+        raise RuntimeError("PostgreSQL is required for Alembic migrations")
+
+    context.configure(connection=connection, target_metadata=target_metadata)
+    migration_context = context.get_context()
+    script_head = ScriptDirectory.from_config(config).get_current_head()
+    if migration_context.get_current_revision() == script_head:
+        return
+
+    user_tables = list(connection.execute(_USER_TABLES).scalars())
+    if user_tables:
+        raise RuntimeError(
+            "Refusing to initialize non-empty database; found user tables: "
+            + ", ".join(user_tables)
+        )
 
     with context.begin_transaction():
         context.run_migrations()
 
 
 async def run_async_migrations() -> None:
-    """Drive migrations on an :class:`AsyncEngine`.
-
-    The engine is built from the Alembic config (which has just had
-    its ``sqlalchemy.url`` rewritten above) and used as a context
-    manager so the connection pool is released cleanly.
-    """
+    """Run migrations on an async engine constructed from the URL object."""
     connectable = create_async_engine(settings.database_url)
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
+    try:
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+    finally:
+        await connectable.dispose()
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode using the async engine."""
+    """Run the PostgreSQL migration flow from Alembic's synchronous CLI."""
     asyncio.run(run_async_migrations())
 
 
