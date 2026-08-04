@@ -93,7 +93,7 @@ async def seeded_banks(test_settings: Settings) -> AsyncIterator[list[Bank]]:
     ``test_settings`` fixture already creates a fresh file
     per test, so there is no risk of cross-test pollution.
     """
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         from app.models.base import Base
 
@@ -147,7 +147,7 @@ async def seeded_transactions(
     Yields the created transactions so tests can assert against
     them by id, description, etc.
     """
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         from app.models.base import Base
 
@@ -243,7 +243,7 @@ async def seeded_categories(
     ascending so tests can assert against the canonical
     ordering.
     """
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         from app.models.base import Base
 
@@ -781,7 +781,7 @@ async def test_filter_form_submission_with_multiple_category_ids_narrows_table(
     # Seed the three new transactions against the same
     # database the ``client`` fixture is wired to (they share
     # ``test_settings``).
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         from app.models.base import Base
 

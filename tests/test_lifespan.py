@@ -33,7 +33,7 @@ async def test_lifespan_initialises_engine_on_app_state(
             assert engine is not None
 
             # The engine is bound to the configured database URL.
-            assert str(engine.url) == test_settings.DATABASE_URL
+            assert engine.url == test_settings.database_url
 
         # After the lifespan exits, ``app.state.engine`` is still
         # the same object (the lifespan only disposes it, it does
@@ -76,7 +76,7 @@ async def test_lifespan_disposes_engine_on_shutdown(
     # After shutdown, the engine pool is closed. A fresh engine on
     # the same URL still works (this is a behavioural sanity check
     # that the underlying file is not corrupted by dispose()).
-    fresh = create_async_engine(test_settings.DATABASE_URL)
+    fresh = create_async_engine(test_settings.database_url)
     try:
         async with fresh.connect() as conn:
             from sqlalchemy import text
@@ -103,24 +103,21 @@ async def test_lifespan_raises_when_db_unreachable(
     restart a fresh process instead of running a half-broken
     service.
     """
-    from sqlalchemy.exc import SQLAlchemyError
-
     from app.core.config import get_settings
 
-    # An obviously invalid URL — argument validation fails before
-    # any network call. The exact exception class depends on which
-    # step of engine construction trips first; we accept any
-    # ``SQLAlchemyError`` subclass.
-    monkeypatch.setenv(
-        "DATABASE_URL", "sqlite+aiosqlite:////this/path/does/not/exist/at/all/x9k.db"
-    )
+    # An unreachable PostgreSQL port causes startup to abort.
+    monkeypatch.setenv("POSTGRES_USER", "finhealth")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
+    monkeypatch.setenv("POSTGRES_DB", "finhealth")
+    monkeypatch.setenv("POSTGRES_HOST", "127.0.0.1")
+    monkeypatch.setenv("POSTGRES_PORT", "1")
     get_settings.cache_clear()
     bad_settings = get_settings()
 
     app = FastAPI()
     lifespan = create_lifespan(bad_settings)
 
-    with pytest.raises(SQLAlchemyError):
+    with pytest.raises(OSError):
         async with lifespan(app):
             pytest.fail("Lifespan must not enter the context when the DB is unreachable")
 

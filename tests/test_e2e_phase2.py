@@ -200,7 +200,7 @@ async def seeded_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine]:
     ``category_id`` FK during the upload (the ingestion layer
     does a one-query + in-memory dict lookup against the seed).
     """
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

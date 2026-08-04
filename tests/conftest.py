@@ -1,117 +1,107 @@
-"""Shared pytest fixtures for the integration test suite.
+"""Shared PostgreSQL fixtures for the test suite."""
 
-The fixtures below provide a clean, isolated application instance for
-every test:
-
-* :func:`test_settings` points ``DATABASE_URL`` at a temporary file
-  inside a fresh :class:`tempfile.TemporaryDirectory`. This avoids
-  any cross-test pollution of the SQLite database.
-* :func:`engine` creates the engine used by the health probe and
-  disposes it after the test.
-* :func:`client` builds the FastAPI app against the test settings and
-  wires an :class:`httpx.AsyncClient` with :class:`ASGITransport`
-  so requests are handled in-process — no real network I/O. The
-  full ORM schema is created before any request so endpoints that
-  touch the database (e.g. the upload page reading ``banks``) work
-  out of the box.
-
-The lifespan event is *not* triggered by ``ASGITransport`` (httpx's
-default), so the test does not exercise the production startup/shutdown
-hooks. This is intentional: the health endpoint uses the
-``get_session`` dependency directly, not ``app.state.engine``, so the
-lifespan would only add noise. Lifespan behaviour is covered by the
-``test_lifespan.py`` unit test (added when lifespan-specific edge
-cases warrant it).
-"""
-
-import tempfile
+import asyncio
+import os
+import uuid
 from collections.abc import AsyncIterator, Iterator
-from pathlib import Path
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings, get_settings
+from app.db.engine import create_engine
 from app.main import create_app
 from app.models.base import Base
 
 
+def _test_connection_settings() -> tuple[str, int, str, str, str]:
+    """Read the explicit PostgreSQL administrator connection for isolated tests."""
+    host = os.getenv("POSTGRES_TEST_HOST")
+    if not host:
+        pytest.skip("POSTGRES_TEST_HOST is required for PostgreSQL-backed tests")
+    return (
+        host,
+        int(os.getenv("POSTGRES_TEST_PORT", "5432")),
+        os.getenv("POSTGRES_TEST_USER", "finhealth"),
+        os.getenv("POSTGRES_TEST_PASSWORD", "secret"),
+        os.getenv("POSTGRES_TEST_ADMIN_DB", "postgres"),
+    )
+
+
+async def _create_database(
+    host: str, port: int, user: str, password: str, admin_database: str, database: str
+) -> None:
+    connection = await asyncpg.connect(
+        host=host, port=port, user=user, password=password, database=admin_database
+    )
+    try:
+        await connection.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await connection.close()
+
+
+async def _drop_database(
+    host: str, port: int, user: str, password: str, admin_database: str, database: str
+) -> None:
+    connection = await asyncpg.connect(
+        host=host, port=port, user=user, password=password, database=admin_database
+    )
+    try:
+        await connection.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            database,
+        )
+        await connection.execute(f'DROP DATABASE IF EXISTS "{database}"')
+    finally:
+        await connection.close()
+
+
 @pytest.fixture
 def test_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
-    """Yield a :class:`Settings` pointing at a throwaway SQLite file.
-
-    The previous cached settings are restored between tests via
-    ``monkeypatch`` and explicit ``get_settings.cache_clear()`` calls
-    so cached singletons from other fixtures cannot leak across
-    tests.
-    """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        db_path = Path(tmp_dir) / "finhealth-test.db"
-        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
-        monkeypatch.setenv("CORS_ORIGINS", '["http://localhost", "http://testserver"]')
+    """Yield settings for a disposable PostgreSQL database, then drop it."""
+    host, port, user, password, admin_database = _test_connection_settings()
+    database = f"finhealth_test_{uuid.uuid4().hex}"
+    asyncio.run(_create_database(host, port, user, password, admin_database, database))
+    monkeypatch.setenv("POSTGRES_HOST", host)
+    monkeypatch.setenv("POSTGRES_PORT", str(port))
+    monkeypatch.setenv("POSTGRES_USER", user)
+    monkeypatch.setenv("POSTGRES_PASSWORD", password)
+    monkeypatch.setenv("POSTGRES_DB", database)
+    monkeypatch.setenv("CORS_ORIGINS", '["http://localhost", "http://testserver"]')
+    get_settings.cache_clear()
+    try:
+        yield get_settings()
+    finally:
         get_settings.cache_clear()
-        try:
-            yield get_settings()
-        finally:
-            get_settings.cache_clear()
+        asyncio.run(_drop_database(host, port, user, password, admin_database, database))
 
 
 @pytest.fixture
 async def engine(test_settings: Settings) -> AsyncIterator[AsyncEngine]:
-    """Yield an :class:`AsyncEngine` bound to the test database file.
-
-    The full ORM schema is created on a fresh engine so any test
-    that needs the tables (e.g. the web page tests that read
-    ``banks``) works without a separate setup step. ``Base.metadata``
-    is the source of truth for the test schema — no Alembic
-    migration is run; ``test_alembic.py`` exercises the migration
-    path explicitly.
-    """
-    eng = create_async_engine(
-        test_settings.DATABASE_URL,
-        echo=False,
-        connect_args={"check_same_thread": False},
-    )
+    """Yield an engine with the full ORM schema in the isolated database."""
+    test_engine = create_engine(test_settings.database_url)
     try:
-        async with eng.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        yield eng
+        async with test_engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        yield test_engine
     finally:
-        await eng.dispose()
+        await test_engine.dispose()
 
 
 @pytest.fixture
 async def client(test_settings: Settings) -> AsyncIterator[AsyncClient]:
-    """Yield an :class:`AsyncClient` wired to a fresh FastAPI app.
-
-    The app is created with the test settings so its lifespan,
-    CORS, and ``get_session`` dependency all point at the temporary
-    database. The full schema is created up front so endpoints
-    that read from the database (e.g. ``GET /upload`` listing
-    banks) do not need a separate setup fixture.
-
-    ``ASGITransport`` handles requests in-process.
-    """
+    """Yield an in-process client backed by an isolated PostgreSQL database."""
     app = create_app(test_settings)
-
-    # Create the schema against the per-test database. The engine
-    # used here is disposed before the test ends so the connection
-    # pool does not leak across tests. We do not call
-    # ``Base.metadata.drop_all`` on teardown — the temporary
-    # directory is wiped by ``test_settings`` so the file is gone
-    # anyway.
-    bootstrap_engine = create_async_engine(
-        test_settings.DATABASE_URL,
-        echo=False,
-        connect_args={"check_same_thread": False},
-    )
+    bootstrap_engine = create_engine(test_settings.database_url)
     try:
-        async with bootstrap_engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        async with bootstrap_engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
     finally:
         await bootstrap_engine.dispose()
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
-        yield ac
+    async with AsyncClient(transport=transport, base_url="http://testserver") as test_client:
+        yield test_client

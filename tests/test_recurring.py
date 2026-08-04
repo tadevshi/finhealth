@@ -17,13 +17,13 @@ The test surface is split into three layers:
 
 * **Algorithm unit tests** (8) — the
   :class:`RecurringDetector` against a real in-memory
-  SQLite database with hand-rolled transaction fixtures
+  PostgreSQL database with hand-rolled transaction fixtures
   (no LLM, no PDF).
 * **API tests** (4) — drive the FastAPI app through an
   :class:`httpx.AsyncClient` with ``ASGITransport``.
 * **Edge cases** (2) — empty result, single transaction.
 
-Every test uses a fresh in-memory SQLite database (via the
+Every test uses a fresh disposable PostgreSQL database (via the
 ``engine`` fixture from :mod:`tests.conftest`) and the
 ORM schema is created via ``Base.metadata.create_all`` so
 the test surface matches what the production app sees at
@@ -74,7 +74,7 @@ async def recurring_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine
     relationships are explicit and the per-test cost is
     bounded.
     """
-    engine: AsyncEngine = create_engine(test_settings)
+    engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

@@ -10,7 +10,7 @@ card is still allowed.
 The ``status`` enum is stored as a string in the database (``Enum``
 with ``native_enum=False``) so it survives database engine swaps
 without requiring an ``ALTER TYPE`` migration. A native enum would
-also be inappropriate for SQLite.
+also be inappropriate for the application database.
 """
 
 from __future__ import annotations

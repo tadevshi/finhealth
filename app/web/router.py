@@ -124,7 +124,7 @@ async def _query_transactions(
     if max_amount is not None:
         query = query.where(func.abs(Transaction.amount) <= max_amount)
     if description is not None:
-        # ``ilike`` is PostgreSQL-specific; SQLite's ``LIKE``
+        # ``ilike`` provides case-insensitive PostgreSQL matching.
         # is already case-insensitive for ASCII. We use
         # ``func.lower`` on both sides so the SQL is portable.
         needle = f"%{description.lower()}%"

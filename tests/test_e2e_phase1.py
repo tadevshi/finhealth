@@ -162,7 +162,7 @@ CANNED_NACIONAL_EXTRACTION: dict[str, object] = {
 @pytest.fixture
 async def seeded_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine]:
     """Yield an engine with the full schema and the three banks seeded."""
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

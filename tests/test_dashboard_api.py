@@ -19,7 +19,7 @@ HTTP-shaped contract:
 
 The test surface mirrors the Phase 2
 :mod:`tests.test_recurring` style: per-test fresh in-memory
-SQLite database, an engine fixture, a seeded-world fixture
+PostgreSQL database, an engine fixture, a seeded-world fixture
 with a bank, two cards, two statements, two merchants, the
 12 closed-set categories, and an :class:`httpx.AsyncClient`
 whose session dependency is overridden to point at the
@@ -64,7 +64,7 @@ async def dashboard_api_engine(test_settings: Settings) -> AsyncIterator[AsyncEn
     Mirrors :mod:`tests.test_dashboard` — same engine + the
     same 12-row categories seed the service depends on.
     """
-    engine: AsyncEngine = create_engine(test_settings)
+    engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -112,7 +112,7 @@ async def api_client(
 
     The app's ``get_session`` dependency is overridden so
     requests read and write to the test engine's database —
-    the in-memory SQLite file is the single source of truth
+    the disposable PostgreSQL database is the single source of truth
     for the test. The schema and the 12 categories were
     seeded by :func:`dashboard_api_engine`.
     """

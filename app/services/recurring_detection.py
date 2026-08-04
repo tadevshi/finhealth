@@ -13,7 +13,7 @@ keyed on the
 ``(merchant_id, amount_min, amount_max, currency, period_days)``
 composite. The detector is fully deterministic + statistical
 — no LLM call, no async I/O outside the database — so the
-test surface is a real in-memory SQLite database and a
+test surface is a disposable PostgreSQL database and a
 hand-rolled transaction fixture.
 
 Algorithm
