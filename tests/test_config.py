@@ -25,7 +25,10 @@ def _clear_settings_cache() -> Iterator[None]:
 
 def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """Defaults match the documented values when no env is set."""
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for name, value in POSTGRES_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("POSTGRES_HOST", raising=False)
+    monkeypatch.delenv("POSTGRES_PORT", raising=False)
     # _env_file=None forces Settings to read only from the process env,
     # not from a local .env file (which may override defaults in dev).
     settings = Settings(_env_file=None)
@@ -33,7 +36,8 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.APP_NAME == "finhealth"
     assert settings.DEBUG is False
     assert settings.SECRET_KEY == "change-me-in-production"
-    assert settings.DATABASE_URL == "sqlite+aiosqlite:///data/finhealth.db"
+    assert settings.POSTGRES_HOST == "postgres"
+    assert settings.POSTGRES_PORT == 5432
     assert settings.CORS_ORIGINS == ["http://localhost:8000"]
     # LLM defaults: OpenCode Zen with a free model — no API key required to start.
     assert settings.LLM_PROVIDER == "opencode_zen"
@@ -41,11 +45,16 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.LLM_MODEL == "deepseek-v4-flash-free"
 
 
-def test_default_database_url_is_canonical_data_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local default uses the canonical data/finhealth.db SQLite path."""
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+def test_default_postgres_topology(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset host and port use the documented PostgreSQL defaults."""
+    for name, value in POSTGRES_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("POSTGRES_HOST", raising=False)
+    monkeypatch.delenv("POSTGRES_PORT", raising=False)
 
-    assert Settings(_env_file=None).DATABASE_URL == "sqlite+aiosqlite:///data/finhealth.db"
+    settings = Settings(_env_file=None)
+    assert settings.POSTGRES_HOST == "postgres"
+    assert settings.POSTGRES_PORT == 5432
 
 
 def test_settings_env_override(
@@ -55,7 +64,11 @@ def test_settings_env_override(
     monkeypatch.setenv("APP_NAME", "finhealth-test")
     monkeypatch.setenv("DEBUG", "true")
     monkeypatch.setenv("SECRET_KEY", "super-secret")
-    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./custom-test.db")
+    monkeypatch.setenv("POSTGRES_USER", "custom-user")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "custom-password")
+    monkeypatch.setenv("POSTGRES_HOST", "custom-postgres")
+    monkeypatch.setenv("POSTGRES_PORT", "55432")
+    monkeypatch.setenv("POSTGRES_DB", "custom-db")
     monkeypatch.setenv("CORS_ORIGINS", '["https://example.com","https://api.example.com"]')
     monkeypatch.setenv("LLM_PROVIDER", "ollama")
     monkeypatch.setenv("LLM_API_ENDPOINT", "http://test-llm:11434")
@@ -65,7 +78,11 @@ def test_settings_env_override(
     assert settings.APP_NAME == "finhealth-test"
     assert settings.DEBUG is True
     assert settings.SECRET_KEY == "super-secret"
-    assert settings.DATABASE_URL == "sqlite+aiosqlite:///./custom-test.db"
+    assert settings.POSTGRES_USER == "custom-user"
+    assert settings.POSTGRES_PASSWORD == "custom-password"
+    assert settings.POSTGRES_HOST == "custom-postgres"
+    assert settings.POSTGRES_PORT == 55432
+    assert settings.POSTGRES_DB == "custom-db"
     assert settings.CORS_ORIGINS == [
         "https://example.com",
         "https://api.example.com",

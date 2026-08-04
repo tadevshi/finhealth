@@ -7,7 +7,7 @@ LLM extraction, plus the four HTTP endpoints the orchestrator backs.
 The tests are organised in three layers:
 
 * **IngestionService unit tests** — exercise the service directly with
-  a real SQLite database and a fake LLM client. The PDF pipeline runs
+  a real PostgreSQL database and a fake LLM client. The PDF pipeline runs
   against the real sample PDFs in ``shared/account-state-examples/``,
   so the test surface is realistic without being slow.
 * **HTTP integration tests** — drive the FastAPI app through an
@@ -17,7 +17,7 @@ The tests are organised in three layers:
 * **Edge cases and error paths** — oversize upload, invalid PDF, LLM
   failure, idempotency, missing rows, and category validation.
 
-Every test uses a fresh throwaway SQLite database (via the
+Every test uses a fresh disposable PostgreSQL database (via the
 ``test_settings`` fixture from :mod:`tests.conftest`) and the
 ORM schema is created via :func:`Base.metadata.create_all` so the
 DDL matches the model definitions exactly (including
@@ -249,7 +249,7 @@ async def seeded_engine(
     On teardown the engine is disposed; the temp file is cleaned
     up by ``test_settings``.
     """
-    engine = create_engine(test_settings)
+    engine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -1126,7 +1126,7 @@ class TestIngestStatementChunked:
             # card whose ``cardholder`` matches chunk 3's
             # value, not chunk 1's.
             #
-            # SQLite returns date columns as ``str`` (no native
+            # Normalize date-like values before comparing persistence results.
             # date type), so we parse the ISO strings back to
             # :class:`date` for a clean assertion.
             result = await session.execute(
@@ -2636,7 +2636,7 @@ class TestBuildTransactions:
     ``categories`` table once at the start of the call to build
     a name → :class:`Category` dict cache, then resolves the
     LLM-emitted ``category`` string per row. The tests below
-    run against a real in-memory SQLite database (via the
+    run against a real disposable PostgreSQL database (via the
     ``engine`` fixture from :mod:`tests.conftest`) so the
     cache lookup is exercised end-to-end.
     """
@@ -3724,9 +3724,7 @@ class TestRecurringDetectorIntegration:
 
         caplog.set_level(logging.INFO, logger="app.services.recurring_detection")
 
-        llm = FakeLLMClient(
-            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
-        )
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
         async with make_ingestion_service(llm) as service:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
@@ -3740,13 +3738,10 @@ class TestRecurringDetectorIntegration:
         info_records = [
             r
             for r in caplog.records
-            if r.name == "app.services.recurring_detection"
-            and r.levelno == logging.INFO
+            if r.name == "app.services.recurring_detection" and r.levelno == logging.INFO
         ]
         assert len(info_records) >= 1
-        assert any(
-            "Recurring detection complete" in r.getMessage() for r in info_records
-        )
+        assert any("Recurring detection complete" in r.getMessage() for r in info_records)
 
     @pytest.mark.asyncio
     async def test_detector_logs_warning_on_partial_success(
@@ -3789,13 +3784,10 @@ class TestRecurringDetectorIntegration:
         warning_records = [
             r
             for r in caplog.records
-            if r.name == "app.services.recurring_detection"
-            and r.levelno == logging.WARNING
+            if r.name == "app.services.recurring_detection" and r.levelno == logging.WARNING
         ]
         assert len(warning_records) >= 1
-        assert any(
-            "Recurring detection complete" in r.getMessage() for r in warning_records
-        )
+        assert any("Recurring detection complete" in r.getMessage() for r in warning_records)
         assert any("partial-success" in r.getMessage() for r in warning_records)
 
     @pytest.mark.asyncio
@@ -3835,9 +3827,7 @@ class TestRecurringDetectorIntegration:
             _raise,
         )
 
-        llm = FakeLLMClient(
-            response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD)
-        )
+        llm = FakeLLMClient(response=ExtractionResponse.model_validate(NACIONAL_EXTRACTION_PAYLOAD))
         async with make_ingestion_service(llm) as service:
             statement = await service.ingest_statement(
                 file_path=SANTANDER_PDF,
@@ -3852,12 +3842,9 @@ class TestRecurringDetectorIntegration:
         error_records = [
             r
             for r in caplog.records
-            if r.name == "app.services.ingestion"
-            and r.levelno >= logging.ERROR
+            if r.name == "app.services.ingestion" and r.levelno >= logging.ERROR
         ]
-        assert any(
-            "Recurring detection failed" in r.getMessage() for r in error_records
-        )
+        assert any("Recurring detection failed" in r.getMessage() for r in error_records)
 
     @pytest.mark.asyncio
     async def test_detector_not_called_on_dedup_early_return(

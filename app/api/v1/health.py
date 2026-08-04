@@ -3,7 +3,7 @@
 Exposes a single ``GET /api/v1/health`` route that reports service
 liveness and the most recent database round-trip status. The endpoint
 is intentionally cheap: a single ``SELECT 1`` is enough to prove the
-async SQLAlchemy stack and SQLite file are both reachable.
+async SQLAlchemy stack and PostgreSQL database are both reachable.
 """
 
 import logging

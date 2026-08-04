@@ -3,7 +3,7 @@
 Covers the ``GET /dashboard`` page and the five HTMX
 partials that load each section. Mirrors the pattern from
 :mod:`tests.test_web_phase1` (per-test fresh in-memory
-SQLite database, ``httpx.AsyncClient`` driven through
+PostgreSQL database, ``httpx.AsyncClient`` driven through
 ``ASGITransport``).
 
 Test surface
@@ -121,7 +121,7 @@ async def dashboard_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine
     :mod:`tests.test_dashboard_api`; reuses the same 12-row
     category seed so the categories partial is meaningful.
     """
-    engine: AsyncEngine = create_engine(test_settings)
+    engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -344,7 +344,7 @@ async def test_dashboard_shell_navigation_uses_valid_active_links(client: AsyncC
     assert 'aria-current="page"' in body
     assert body.count('data-testid="dashboard-nav-link"') == 4
     assert body.count('data-testid="dashboard-mobile-nav-link"') == 4
-    assert body.count('min-h-11') >= 8
+    assert body.count("min-h-11") >= 8
 
     for path in ("/dashboard", "/transactions", "/upload"):
         response = await client.get(path)

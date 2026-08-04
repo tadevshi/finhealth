@@ -10,7 +10,7 @@ Covers:
   (text/html returns the partial ``<tr>``; default returns
   JSON TransactionResponse).
 
-The tests run against a fresh in-memory SQLite database per
+The tests run against a fresh disposable PostgreSQL database per
 test (via the ``seeded_engine`` / ``seeded_client`` fixtures
 defined locally) and the schema is created by
 :func:`Base.metadata.create_all`. The 12 seeded categories
@@ -50,7 +50,7 @@ async def seeded_engine(test_settings) -> AsyncIterator[AsyncEngine]:
     category ordering matches what ``GET /api/v1/categories``
     returns.
     """
-    engine: AsyncEngine = create_engine(test_settings)
+    engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

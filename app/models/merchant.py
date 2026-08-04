@@ -57,7 +57,7 @@ class MerchantAliasSource(enum.StrEnum):
 
     The values are stored as their string form in the database
     (``Enum`` with ``native_enum=False``) so they survive a database
-    engine swap without an ``ALTER TYPE`` migration. SQLite has no
+    engine swap without an ``ALTER TYPE`` migration.
     native enum type, so the portable form is also the only form
     that works today.
 

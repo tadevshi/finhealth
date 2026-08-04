@@ -203,6 +203,6 @@ def test_mid_baseline_failure_rolls_back_schema(
 
 
 def test_only_postgresql_baseline_revision_exists() -> None:
-    """The undeployed SQLite-oriented migration lineage is not retained."""
+    """The undeployed historical migration lineage is not retained."""
     versions = ALEMBIC_DIR / "versions"
     assert [path.name for path in versions.glob("*.py")] == ["0001_postgresql_baseline.py"]

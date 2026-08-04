@@ -15,13 +15,13 @@ The test surface is split into three layers:
   accent/punctuation strip) are covered.
 * **Alias-lookup unit tests** (5) — the
   :class:`app.services.merchants.MerchantNormalizer`
-  against a real in-memory SQLite database (the alias
+  against a real disposable PostgreSQL database (the alias
   lookup, auto-create, race guard, and 404/422 paths).
 * **LLM helper unit tests** (2) — the opt-in path:
   flag off = 0 LLM calls, flag on = first-occurrence-only
   with a cache hit on subsequent calls.
 
-Every test uses a fresh in-memory SQLite database (via the
+Every test uses a fresh disposable PostgreSQL database (via the
 ``engine`` fixture from :mod:`tests.conftest`) and the
 ORM schema is created via ``Base.metadata.create_all`` so
 the test surface matches what the production app sees at

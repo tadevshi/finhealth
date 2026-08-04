@@ -3,7 +3,7 @@
 Two mixins are provided:
 
 * :class:`UUIDMixin` — adds a UUID primary key column. The UUID is
-  stored as ``CHAR(36)`` (TEXT in SQLite) so values are debuggable in
+  stored as ``CHAR(36)`` so values are debuggable in
   raw database inspection, and is auto-generated on insert via
   ``uuid.uuid4``.
 * :class:`TimestampMixin` — adds timezone-aware ``created_at`` and
@@ -12,7 +12,7 @@ Two mixins are provided:
 
 :class:`UUIDType` is a :class:`sqlalchemy.types.TypeDecorator` that
 maps between :class:`uuid.UUID` in Python and ``CHAR(36)`` at the
-SQL boundary. SQLite has no native UUID type, so storing the canonical
+SQL boundary. Storing the canonical
 string form keeps things portable and human-readable.
 """
 
@@ -30,9 +30,8 @@ class UUIDType(TypeDecorator[uuid.UUID]):
 
     The decorator converts to a canonical string on bind and back to
     a :class:`uuid.UUID` on result. ``None`` round-trips as ``None``.
-    The implementation is dialect-agnostic — it works on SQLite
-    (the project's Phase 0 backend) and any future RDBMS without
-    changes.
+    The implementation normalizes UUID values consistently at the SQL
+    boundary and works across supported database backends without changes.
     """
 
     impl = String(36)

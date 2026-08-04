@@ -2,7 +2,7 @@
 
 The tests run against an in-process FastAPI app built with the
 ``client`` fixture from :mod:`tests.conftest`. The app talks to a
-throwaway SQLite file, so the suite stays hermetic and parallel-safe.
+throwaway PostgreSQL database, so the suite stays hermetic and parallel-safe.
 """
 
 from collections.abc import AsyncGenerator

@@ -12,7 +12,7 @@ Covers:
 * the ``PATCH /api/v1/transactions/{id}`` legacy ``category``
   path emits exactly one deprecation log line.
 
-The tests run against a fresh in-memory SQLite database per
+The tests run against a fresh disposable PostgreSQL database per
 test (via the ``client`` fixture from :mod:`tests.conftest`)
 and the schema is created by the same :func:`Base.metadata.create_all`
 call the production app uses at startup. The migration
@@ -56,7 +56,7 @@ async def seeded_engine(test_settings) -> AsyncIterator[AsyncEngine]:
     :func:`Base.metadata.create_all` so the test surface
     matches what the production app sees at startup.
     """
-    engine: AsyncEngine = create_engine(test_settings)
+    engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

@@ -10,10 +10,8 @@ fix later:
 * the ``Numeric(15, 2)`` precision for :class:`app.models.transaction.Transaction`
   amounts (no float drift).
 
-In-memory SQLite is used for the round-trip tests because it is fast
-and fully isolated per engine. The ``file_hash`` uniqueness test
-relies on the unique constraint being enforced by SQLite, which it
-is — unique constraints are honoured in in-memory mode as well.
+Each test uses a disposable PostgreSQL database supplied by the shared
+fixture, so database constraints are exercised on the production dialect.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.db.engine import create_engine
 from app.db.session import create_session_factory
 from app.models import (
@@ -43,17 +41,9 @@ from app.models.base import Base
 
 
 @pytest.fixture
-def in_memory_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Settings instance pointing at a fresh in-memory SQLite database.
-
-    Duplicated locally from :mod:`tests.test_db` so this test file
-    has no order-of-import dependency. The fixture also clears the
-    settings cache so the change is observed by the next
-    :func:`get_settings` call.
-    """
-    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-    get_settings.cache_clear()
-    return get_settings()
+def in_memory_settings(test_settings: Settings) -> Settings:
+    """Compatibility alias for the shared disposable PostgreSQL settings."""
+    return test_settings
 
 
 @pytest_asyncio.fixture
@@ -69,7 +59,7 @@ async def session_factory(
     async engine (the greenlet context is released by the time
     ``commit()`` raises).
     """
-    engine: AsyncEngine = create_engine(in_memory_settings)
+    engine: AsyncEngine = create_engine(in_memory_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -91,7 +81,7 @@ async def session(in_memory_settings: Settings) -> AsyncIterator[AsyncSession]:
     are about ORM behaviour, not migration correctness — Alembic
     round-trips are covered by :mod:`tests.test_alembic`.
     """
-    engine: AsyncEngine = create_engine(in_memory_settings)
+    engine: AsyncEngine = create_engine(in_memory_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
