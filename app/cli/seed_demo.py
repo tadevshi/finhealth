@@ -33,9 +33,8 @@ dashboard looks alive):
 The categories table is left alone (it is the 12-row closed
 set seeded by Alembic migration 0001).
 
-The script reads ``DATABASE_URL`` from the environment (with
-the same fallback the app uses, ``sqlite+aiosqlite:///data/finhealth.db``)
-so it works against the dev database without any extra config.
+The script uses the validated structured ``POSTGRES_*`` settings shared
+with the application, so it always targets the configured PostgreSQL database.
 """
 
 from __future__ import annotations
@@ -216,8 +215,6 @@ def _assert_unmarked_or_seed(row: object | None, stable_key: str) -> None:
         marker_value = row.display_name
     elif isinstance(row, Statement):
         marker_value = row.error_message
-    elif isinstance(row, RecurringRule):
-        marker_value = row.period_label
     elif isinstance(row, Transaction):
         marker_value = row.raw_json
     else:
@@ -252,8 +249,22 @@ def _mark_seed_owned(row: object, stable_key: str) -> None:
         row.display_name = _marked_text(row.display_name, stable_key)
     elif isinstance(row, Statement):
         row.error_message = _seed_marker(stable_key)
-    elif isinstance(row, RecurringRule):
-        row.period_label = _marked_text(row.period_label, stable_key)
+
+
+def _assert_recurring_seed_identity(
+    row: RecurringRule,
+    *,
+    stable_key: str,
+    merchant_id: uuid.UUID,
+    currency: str,
+    period_days: int,
+    period_label: str,
+) -> None:
+    """Reject a user row that collides with a deterministic seed-rule identity."""
+    expected = (_seed_uuid(stable_key), merchant_id, currency, period_days, period_label)
+    actual = (row.id, row.merchant_id, row.currency, row.period_days, row.period_label)
+    if actual != expected:
+        raise RuntimeError(f"seed recurring rule collision for {stable_key}")
 
 
 def _statement_hash(card_key: str, year: int, month: int) -> str:
@@ -269,7 +280,7 @@ def _tx_key(year: int, month: int, currency: str, slot: int, merchant: str, amou
 
 async def seed_demo() -> None:
     settings = get_settings()
-    engine = create_async_engine(settings.DATABASE_URL)
+    engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     # Ensure the schema exists (the dev DB may not be migrated).
@@ -512,11 +523,18 @@ async def seed_demo() -> None:
         ) in RECURRING_RULES:
             stable_key = f"recurring/{merchants[merch_slug].id}/{currency}/{period_days}"
             rule_id = _seed_uuid(stable_key)
-            existing = (
+            existing_rule = (
                 await session.execute(select(RecurringRule).where(RecurringRule.id == rule_id))
             ).scalar_one_or_none()
-            if existing is not None:
-                _assert_unmarked_or_seed(existing, stable_key)
+            if existing_rule is not None:
+                _assert_recurring_seed_identity(
+                    existing_rule,
+                    stable_key=stable_key,
+                    merchant_id=merchants[merch_slug].id,
+                    currency=currency,
+                    period_days=period_days,
+                    period_label=period_label,
+                )
                 continue
             rule = RecurringRule(
                 id=rule_id,
@@ -531,7 +549,6 @@ async def seed_demo() -> None:
                 is_active=True,
                 last_seen_date=date(2026, 7, 1),
             )
-            _mark_seed_owned(rule, stable_key)
             session.add(rule)
             rules_added += 1
         await session.commit()

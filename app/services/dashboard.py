@@ -343,12 +343,14 @@ class DashboardService:
         )
         comparison_current_totals = current_totals
         if aggregation_start != period_start:
-            comparison_current_totals, _comparison_count, _comparison_counts_by_currency = (
-                await self._totals_and_count(
-                    period_start=period_start,
-                    period_end=period_end,
-                    card_id=card_id,
-                )
+            (
+                comparison_current_totals,
+                _comparison_count,
+                _comparison_counts_by_currency,
+            ) = await self._totals_and_count(
+                period_start=period_start,
+                period_end=period_end,
+                card_id=card_id,
             )
 
         # 2. Previous-period totals (per currency) — same shape,
@@ -1016,12 +1018,7 @@ class DashboardService:
         """
         from sqlalchemy import select as sa_select
 
-        # ``func.strftime`` is SQLite-portable; for
-        # PostgreSQL the equivalent is
-        # ``func.to_char(Transaction.date, 'YYYY-MM')``.
-        # The project targets SQLite today, so we use
-        # ``strftime`` directly.
-        month_expr = func.strftime("%Y-%m", Transaction.date).label("month")
+        month_expr = func.to_char(Transaction.date, "YYYY-MM").label("month")
         stmt: Select[tuple[str]] = sa_select(month_expr).group_by(month_expr).order_by(month_expr)
         stmt = self._apply_card_filter(stmt, card_id)
         rows = (await self._session.execute(stmt)).all()
@@ -1082,9 +1079,7 @@ class DashboardService:
         #    the SQL returns the active rules — keeping
         #    the rule selection in one query and the
         #    in-band check in a second one is the only
-        #    way to keep the SQL portable (PostgreSQL and
-        #    SQLite have different syntax for
-        #    range-on-Numeric).
+        #    way to keep range-on-Numeric logic explicit.
         rules_stmt = sa_select(RecurringRule).where(RecurringRule.is_active.is_(True))
         rules = list((await self._session.execute(rules_stmt)).scalars().all())
 
@@ -1097,8 +1092,7 @@ class DashboardService:
         #    the in-band check by collecting the candidate
         #    (merchant_id, currency, amount_min, amount_max)
         #    tuples and running a single query that ORs
-        #    across them. SQLite supports ``OR`` chains
-        #    via ``or_``.
+        #    across them.
         or_clauses = []
         for rule in rules:
             lower = rule.amount_min * (Decimal("1") - _RECURRING_AMOUNT_TOLERANCE)

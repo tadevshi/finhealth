@@ -9,9 +9,11 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import func, inspect, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.cli import seed_demo
+from app.core.config import Settings, get_settings
+from app.db.engine import create_engine
 from app.models import Bank, Category, CreditCard, Merchant, RecurringRule, Statement, Transaction
 from app.models.base import Base
 from app.models.statement import StatementStatus
@@ -38,18 +40,35 @@ def _contains_seed_marker(value: object) -> bool:
     return isinstance(value, str) and seed_demo.SEED_PROVENANCE in value
 
 
+@pytest.fixture(autouse=True)
+def _use_postgres_test_settings(test_settings: Settings) -> Settings:
+    """Make every seed test use its own shared PostgreSQL database."""
+    return test_settings
+
+
+def _test_engine() -> AsyncEngine:
+    return create_engine(get_settings().database_url)
+
+
+def _is_seed_recurring_rule(row: RecurringRule) -> bool:
+    return row.id in {
+        seed_demo._seed_uuid(
+            f"recurring/{seed_demo._seed_uuid(f'merchant/{merchant}')}/{currency}/{period_days}"
+        )
+        for merchant, period_days, _label, _min, _max, currency, _confidence in seed_demo.RECURRING_RULES
+    }
+
+
 @pytest.mark.asyncio
 async def test_every_seed_row_carries_provenance_marker(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Threat matrix: every seed-created row type carries stable provenance."""
-    db_path = tmp_path / "seed-provenance.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         banks = (await session.execute(select(Bank))).scalars().all()
@@ -68,7 +87,7 @@ async def test_every_seed_row_carries_provenance_marker(
     assert categories and all(_contains_seed_marker(row.display_name) for row in categories)
     assert statements and all(_contains_seed_marker(row.error_message) for row in statements)
     assert transactions and all(_contains_seed_marker(row.raw_json) for row in transactions)
-    assert recurring and all(_contains_seed_marker(row.period_label) for row in recurring)
+    assert recurring and all(_is_seed_recurring_rule(row) for row in recurring)
 
     assert {row.id for row in banks} == {seed_demo._seed_uuid(f"bank/{seed_demo.BANK_NAME}")}
     assert {row.id for row in cards} == {
@@ -93,15 +112,13 @@ async def test_user_row_marker_unchanged_after_seed(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Threat matrix: seed provenance is never written onto a user-owned transaction."""
-    db_path = tmp_path / "seed-user-preservation.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
-    user_tx_id, before = await _insert_user_transaction(db_path, raw_json=None)
+    user_tx_id, before = await _insert_user_transaction(raw_json=None)
 
     await seed_demo.seed_demo()
 
-    after = await _transaction_values(db_path, user_tx_id)
+    after = await _transaction_values(user_tx_id)
     assert after == before
 
 
@@ -110,11 +127,9 @@ async def test_seed_is_repeat_safe_and_preserves_user_rows(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Threat matrix: two runs are identical, user rows survive, seed never attaches to user statements."""
-    db_path = tmp_path / "seed.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -181,13 +196,13 @@ async def test_seed_is_repeat_safe_and_preserves_user_rows(
     await engine.dispose()
 
     await seed_demo.seed_demo()
-    first = await _snapshot(db_path)
+    first = await _snapshot()
     await seed_demo.seed_demo()
-    second = await _snapshot(db_path)
+    second = await _snapshot()
 
     assert first == second
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         user_row = await session.get(Transaction, user_tx_id)
@@ -208,14 +223,12 @@ async def test_two_runs_seed_owned_row_snapshot_stable(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """All seed-owned row types are byte-stable across reruns; user rows stay untouched."""
-    db_path = tmp_path / "seed-owned-snapshot.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
     await seed_demo.seed_demo()
-    first = await _seed_owned_snapshot(db_path)
+    first = await _seed_owned_snapshot()
     await seed_demo.seed_demo()
-    second = await _seed_owned_snapshot(db_path)
+    second = await _seed_owned_snapshot()
 
     assert first == second
     assert set(first) == {
@@ -235,14 +248,12 @@ async def test_two_runs_full_mapped_column_snapshot(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every seed-owned non-timestamp mapped field is stable across reruns."""
-    db_path = tmp_path / "seed-owned-full-snapshot.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
     await seed_demo.seed_demo()
-    first = await _seed_owned_snapshot(db_path)
+    first = await _seed_owned_snapshot()
     await seed_demo.seed_demo()
-    second = await _seed_owned_snapshot(db_path)
+    second = await _seed_owned_snapshot()
 
     assert first == second
     assert "installment_number" in first.transactions[0]
@@ -263,18 +274,18 @@ async def test_unknown_alias_routes_to_uncategorized_via_seed(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A test-local unknown seed alias creates Uncategorized spend without touching users."""
-    db_path = tmp_path / "seed-unknown-alias.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
     sentinel = (2026, 7, "jumbo", "completely_new_alias_xyz", 1, "CLP")
     monkeypatch.setattr(seed_demo, "TX_PLAN", [*seed_demo.TX_PLAN, sentinel])
 
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
-        uncategorized = await session.scalar(select(Category).where(Category.name == "Uncategorized"))
+        uncategorized = await session.scalar(
+            select(Category).where(Category.name == "Uncategorized")
+        )
         assert uncategorized is not None
         assert _contains_seed_marker(uncategorized.display_name)
         row = await session.scalar(
@@ -294,8 +305,6 @@ async def test_unknown_alias_seeds_two_uncategorized_dashboard_rows(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Unknown aliases flow through seed_demo and aggregate under Uncategorized."""
-    db_path = tmp_path / "seed-unknown-alias-dashboard.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
     sentinels = [
         (2026, 7, "jumbo", "completely_new_alias_a", 100, "CLP"),
@@ -305,21 +314,27 @@ async def test_unknown_alias_seeds_two_uncategorized_dashboard_rows(
 
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
-        uncategorized = await session.scalar(select(Category).where(Category.name == "Uncategorized"))
+        uncategorized = await session.scalar(
+            select(Category).where(Category.name == "Uncategorized")
+        )
         assert uncategorized is not None
         assert _contains_seed_marker(uncategorized.display_name)
         rows = (
-            await session.execute(
-                select(Transaction).where(
-                    Transaction.raw_json["category_key"].as_string().in_(
-                        ["completely_new_alias_a", "completely_new_alias_b"]
+            (
+                await session.execute(
+                    select(Transaction).where(
+                        Transaction.raw_json["category_key"]
+                        .as_string()
+                        .in_(["completely_new_alias_a", "completely_new_alias_b"])
                     )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(rows) == 2
         assert {row.category for row in rows} == {"Uncategorized"}
         assert {row.category_id for row in rows} == {uncategorized.id}
@@ -338,23 +353,70 @@ async def test_exact_id_collision_rejected_for_every_seed_entity(
 ) -> None:
     """Unmarked exact deterministic IDs are rejected before seed-owned mutation."""
     entity_cases = [
-        (Bank, f"bank/{seed_demo.BANK_NAME}", {"name": seed_demo.BANK_NAME, "display_name": "User Bank", "password_formula": "rut", "is_active": True}, "display_name"),
-        (CreditCard, f"card/{seed_demo.CARD_CLP_MASK}", {"card_number_masked": seed_demo.CARD_CLP_MASK, "cardholder": "USER CARD", "currency": "CLP", "is_active": True}, "cardholder"),
+        (
+            Bank,
+            f"bank/{seed_demo.BANK_NAME}",
+            {
+                "name": seed_demo.BANK_NAME,
+                "display_name": "User Bank",
+                "password_formula": "rut",
+                "is_active": True,
+            },
+            "display_name",
+        ),
+        (
+            CreditCard,
+            f"card/{seed_demo.CARD_CLP_MASK}",
+            {
+                "card_number_masked": seed_demo.CARD_CLP_MASK,
+                "cardholder": "USER CARD",
+                "currency": "CLP",
+                "is_active": True,
+            },
+            "cardholder",
+        ),
         (Merchant, "merchant/jumbo", {"name": "user_jumbo", "is_active": True}, "name"),
-        (Category, "category/Dining Out", {"name": "Dining Out", "display_name": "User Dining", "sort_order": 1}, "display_name"),
-        (RecurringRule, None, {"period_days": 30, "period_label": "user-monthly", "amount_min": Decimal("11900.00"), "amount_max": Decimal("11900.00"), "currency": "CLP", "confidence": 0.5, "occurrences": 1, "last_seen_date": date(2026, 7, 1), "is_active": True}, "period_label"),
+        (
+            Category,
+            "category/Dining Out",
+            {"name": "Dining Out", "display_name": "User Dining", "sort_order": 1},
+            "display_name",
+        ),
+        (
+            RecurringRule,
+            None,
+            {
+                "period_days": 30,
+                "period_label": "user-monthly",
+                "amount_min": Decimal("11900.00"),
+                "amount_max": Decimal("11900.00"),
+                "currency": "CLP",
+                "confidence": 0.5,
+                "occurrences": 1,
+                "last_seen_date": date(2026, 7, 1),
+                "is_active": True,
+            },
+            "period_label",
+        ),
     ]
     for model, stable_key, values, marker_field in entity_cases:
-        db_path = tmp_path / f"collision-{model.__name__.lower()}.db"
-        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
         seed_demo.get_settings.cache_clear()
+        reset_engine = _test_engine()
+        try:
+            async with reset_engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+                await connection.run_sync(Base.metadata.create_all)
+        finally:
+            await reset_engine.dispose()
         await seed_demo.seed_demo()
 
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engine = _test_engine()
         session_maker = async_sessionmaker(engine, expire_on_commit=False)
         async with session_maker() as session:
             if model is RecurringRule:
-                merchant = await session.scalar(select(Merchant).where(Merchant.name.like("%netflix%")))
+                merchant = await session.scalar(
+                    select(Merchant).where(Merchant.name.like("%netflix%"))
+                )
                 assert merchant is not None
                 stable_key = f"recurring/{merchant.id}/CLP/30"
                 values = {**values, "merchant_id": merchant.id}
@@ -371,11 +433,13 @@ async def test_exact_id_collision_rejected_for_every_seed_entity(
         with pytest.raises(RuntimeError, match=r"seed .* collision"):
             await seed_demo.seed_demo()
 
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engine = _test_engine()
         session_maker = async_sessionmaker(engine, expire_on_commit=False)
         async with session_maker() as session:
             after = await _row_snapshot(session, model, collision_id)
-            count = await session.scalar(select(func.count(model.id)).where(model.id == collision_id))
+            count = await session.scalar(
+                select(func.count(model.id)).where(model.id == collision_id)
+            )
             row = await session.get(model, collision_id)
             assert row is not None
             assert not _contains_seed_marker(getattr(row, marker_field))
@@ -389,15 +453,15 @@ async def test_exact_file_hash_collision_rejected_for_statement(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unmarked exact statement file_hash collision is rejected without mutation."""
-    db_path = tmp_path / "statement-hash-collision.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
-        card = await session.get(CreditCard, seed_demo._seed_uuid(f"card/{seed_demo.CARD_CLP_MASK}"))
+        card = await session.get(
+            CreditCard, seed_demo._seed_uuid(f"card/{seed_demo.CARD_CLP_MASK}")
+        )
         assert card is not None
         seed_hash = seed_demo._statement_hash(str(card.id), 2026, 7)
         statement = await session.scalar(select(Statement).where(Statement.file_hash == seed_hash))
@@ -405,8 +469,14 @@ async def test_exact_file_hash_collision_rejected_for_statement(
         statement.error_message = "user-owned statement"
         statement.file_path = "/tmp/user-owned-statement.pdf"
         for tx in (
-            await session.execute(select(Transaction).where(Transaction.statement_id == statement.id))
-        ).scalars().all():
+            (
+                await session.execute(
+                    select(Transaction).where(Transaction.statement_id == statement.id)
+                )
+            )
+            .scalars()
+            .all()
+        ):
             await session.delete(tx)
         await session.commit()
         before = await _row_snapshot(session, Statement, statement.id)
@@ -416,7 +486,7 @@ async def test_exact_file_hash_collision_rejected_for_statement(
     with pytest.raises(RuntimeError, match="seed statement collision"):
         await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         after = await _row_snapshot(session, Statement, statement_id)
@@ -436,11 +506,9 @@ async def test_seed_collision_user_statement_same_card_period(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Threat matrix: seed statements reconcile by seed hash, not card+period."""
-    db_path = tmp_path / "seed-statement-collision.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -499,7 +567,7 @@ async def test_seed_collision_user_statement_same_card_period(
 
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         user_statement_after = await session.get(Statement, user_statement_id)
@@ -510,7 +578,9 @@ async def test_seed_collision_user_statement_same_card_period(
             user_statement_after.file_path,
         ) == user_statement_before
         seed_hash = seed_demo._statement_hash(str(card.id), 2026, 7)
-        seed_statement = await session.scalar(select(Statement).where(Statement.file_hash == seed_hash))
+        seed_statement = await session.scalar(
+            select(Statement).where(Statement.file_hash == seed_hash)
+        )
         assert seed_statement is not None
         assert seed_statement.id != user_statement_id
         seed_on_user_statement = await session.scalar(
@@ -526,30 +596,24 @@ async def test_seed_collision_user_statement_same_card_period(
 @pytest.mark.asyncio
 async def test_two_runs_user_value_equality(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Threat matrix: user transaction values stay byte-identical across seed reruns."""
-    db_path = tmp_path / "seed-user-value-equality.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
 
-    user_tx_id, before = await _insert_user_transaction(db_path, raw_json={"note": "keep"})
+    user_tx_id, before = await _insert_user_transaction(raw_json={"note": "keep"})
 
     await seed_demo.seed_demo()
     await seed_demo.seed_demo()
 
-    after = await _transaction_values(db_path, user_tx_id)
+    after = await _transaction_values(user_tx_id)
     assert after == before
 
 
 @pytest.mark.asyncio
-async def test_two_runs_user_full_value_equality(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_two_runs_user_full_value_equality(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every non-timestamp mapped user Transaction value survives seed reruns."""
-    db_path = tmp_path / "seed-user-full-value-equality.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     seed_demo.get_settings.cache_clear()
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         statement = await session.scalar(select(Statement).order_by(Statement.period_end.desc()))
@@ -585,7 +649,7 @@ async def test_two_runs_user_full_value_equality(
     await seed_demo.seed_demo()
     await seed_demo.seed_demo()
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         after = await _row_snapshot(session, Transaction, user_tx_id)
@@ -594,11 +658,9 @@ async def test_two_runs_user_full_value_equality(
 
 
 async def _insert_user_transaction(
-    db_path,
-    *,
-    raw_json: dict[str, str] | None,
+    *, raw_json: dict[str, str] | None
 ) -> tuple[UUID, tuple[object, ...]]:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -642,24 +704,26 @@ async def _insert_user_transaction(
         session.add(user_tx)
         await session.commit()
         user_tx_id = user_tx.id
-    before = await _transaction_values(db_path, user_tx_id)
+    before = await _transaction_values(user_tx_id)
     await engine.dispose()
     return user_tx_id, before
 
 
-async def _transaction_values(db_path, tx_id: UUID) -> tuple[object, ...]:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+async def _transaction_values(tx_id: UUID) -> tuple[object, ...]:
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         row = await session.get(Transaction, tx_id)
         assert row is not None
-        values = tuple(_serialize_value(getattr(row, column)) for column in _mapped_columns(Transaction))
+        values = tuple(
+            _serialize_value(getattr(row, column)) for column in _mapped_columns(Transaction)
+        )
     await engine.dispose()
     return values
 
 
-async def _snapshot(db_path) -> list[tuple[str, str, str, str, str]]:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+async def _snapshot() -> list[tuple[str, str, str, str, str]]:
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         rows = (
@@ -729,18 +793,26 @@ async def _row_snapshot(session, model: type[Any], row_id: UUID) -> dict[str, ob
     return {column: _serialize_value(getattr(row, column)) for column in _mapped_columns(model)}
 
 
-async def _seed_owned_snapshot(db_path) -> SeedOwnedSnapshot:
+async def _seed_owned_snapshot() -> SeedOwnedSnapshot:
     """Return deterministic non-timestamp snapshots for every seed-owned row type."""
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = _test_engine()
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
         banks = (await session.execute(select(Bank).order_by(Bank.id))).scalars().all()
         cards = (await session.execute(select(CreditCard).order_by(CreditCard.id))).scalars().all()
         merchants = (await session.execute(select(Merchant).order_by(Merchant.id))).scalars().all()
         categories = (await session.execute(select(Category).order_by(Category.id))).scalars().all()
-        statements = (await session.execute(select(Statement).order_by(Statement.id))).scalars().all()
-        transactions = (await session.execute(select(Transaction).order_by(Transaction.id))).scalars().all()
-        recurring = (await session.execute(select(RecurringRule).order_by(RecurringRule.id))).scalars().all()
+        statements = (
+            (await session.execute(select(Statement).order_by(Statement.id))).scalars().all()
+        )
+        transactions = (
+            (await session.execute(select(Transaction).order_by(Transaction.id))).scalars().all()
+        )
+        recurring = (
+            (await session.execute(select(RecurringRule).order_by(RecurringRule.id)))
+            .scalars()
+            .all()
+        )
     await engine.dispose()
 
     return SeedOwnedSnapshot(
@@ -750,7 +822,10 @@ async def _seed_owned_snapshot(db_path) -> SeedOwnedSnapshot:
             if _contains_seed_marker(row.display_name)
         ],
         credit_cards=[
-            {column: _serialize_value(getattr(row, column)) for column in _mapped_columns(CreditCard)}
+            {
+                column: _serialize_value(getattr(row, column))
+                for column in _mapped_columns(CreditCard)
+            }
             for row in cards
             if _contains_seed_marker(row.cardholder)
         ],
@@ -765,18 +840,27 @@ async def _seed_owned_snapshot(db_path) -> SeedOwnedSnapshot:
             if _contains_seed_marker(row.display_name)
         ],
         statements=[
-            {column: _serialize_value(getattr(row, column)) for column in _mapped_columns(Statement)}
+            {
+                column: _serialize_value(getattr(row, column))
+                for column in _mapped_columns(Statement)
+            }
             for row in statements
             if _contains_seed_marker(row.error_message)
         ],
         transactions=[
-            {column: _serialize_value(getattr(row, column)) for column in _mapped_columns(Transaction)}
+            {
+                column: _serialize_value(getattr(row, column))
+                for column in _mapped_columns(Transaction)
+            }
             for row in transactions
             if _contains_seed_marker(row.raw_json)
         ],
         recurring_rules=[
-            {column: _serialize_value(getattr(row, column)) for column in _mapped_columns(RecurringRule)}
+            {
+                column: _serialize_value(getattr(row, column))
+                for column in _mapped_columns(RecurringRule)
+            }
             for row in recurring
-            if _contains_seed_marker(row.period_label)
+            if _is_seed_recurring_rule(row)
         ],
     )

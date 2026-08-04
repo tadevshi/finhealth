@@ -5,7 +5,7 @@ class introduced by Phase 3 PR #8: the data layer for the
 five ``/api/v1/dashboard/*`` endpoints and the
 ``GET /dashboard`` HTMX page. The service is pure SQL with
 ``GROUP BY`` on indexed columns, so the test surface is a
-real in-memory SQLite database plus a hand-rolled fixture
+real disposable PostgreSQL database plus a hand-rolled fixture
 (no LLM, no PDF).
 
 Test surface
@@ -32,7 +32,7 @@ Total: 24 tests.
 
 The test surface mirrors the Phase 2
 :mod:`tests.test_recurring` style: per-test fresh
-in-memory SQLite database, ``recurring_engine`` /
+disposable PostgreSQL database, ``recurring_engine`` /
 ``session_factory`` fixtures, hand-rolled transaction
 fixture with a ``_add_transaction`` helper. The
 ``seeded_world`` fixture provides one bank, one card,
@@ -54,7 +54,6 @@ from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
 from app.cli import seed_demo
@@ -82,7 +81,7 @@ async def dashboard_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine
     exercised by :mod:`tests.test_alembic`; the seed here
     keeps the unit test self-contained).
     """
-    engine: AsyncEngine = create_engine(test_settings)
+    engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -1034,16 +1033,13 @@ class TestCategories:
     @pytest.mark.asyncio
     async def test_uncategorized_end_to_end_through_seed(
         self,
-        tmp_path,
-        monkeypatch: pytest.MonkeyPatch,
+        test_settings: Settings,
     ) -> None:
         """Seed-created Uncategorized is dashboard-visible and user rows remain untouched."""
-        db_path = tmp_path / "uncategorized-seed-dashboard.db"
-        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
         seed_demo.get_settings.cache_clear()
         await seed_demo.seed_demo()
 
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engine = create_engine(test_settings.database_url)
         session_maker = async_sessionmaker(engine, expire_on_commit=False)
         async with session_maker() as session:
             rows = await DashboardService(session).categories(period=date(2026, 7, 1))
@@ -1055,7 +1051,9 @@ class TestCategories:
             assert zero_row.total_per_currency == {}
             assert zero_row.transaction_count == 0
 
-            statement = await session.scalar(select(Statement).order_by(Statement.period_end.desc()))
+            statement = await session.scalar(
+                select(Statement).order_by(Statement.period_end.desc())
+            )
             merchant = await session.scalar(select(Merchant).order_by(Merchant.name))
             assert statement is not None
             assert merchant is not None
@@ -1393,7 +1391,11 @@ class TestMonthly:
             await session.commit()
 
         async with session_factory() as session:
-            rows = await DashboardService(session).monthly(range_months=2, card_id="all")
+            rows = await DashboardService(session).monthly_window(
+                window_start=date(2026, 6, 1),
+                window_end=date(2026, 7, 1),
+                card_id="all",
+            )
 
         # 2 months in the response (range_months=2). The
         # second row carries the prior-month comparison.
