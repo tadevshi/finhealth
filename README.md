@@ -19,7 +19,7 @@ the money actually goes.
 ### Available now (Phase 1)
 
 - **Async FastAPI** application with a clean factory pattern (`create_app`)
-- **SQLite + SQLAlchemy 2.x (async)** with session-scoped dependency injection
+- **PostgreSQL + SQLAlchemy 2.x (async)** with session-scoped dependency injection
 - **Alembic** async migrations with up/down round-trip tests
 - **Server-rendered web shell** (Jinja2 + HTMX + Alpine.js + Tailwind CSS)
   with a dark-mode toggle
@@ -170,8 +170,7 @@ the money actually goes.
 - **git**
 - A POSIX shell (bash, zsh). Windows works under WSL.
 
-> No database server is required: finhealth uses a local SQLite file
-> (`data/finhealth.db`) created on first migration.
+> PostgreSQL 16 is required. The supported local deployment is Docker Compose.
 
 ### LLM endpoint
 
@@ -223,15 +222,14 @@ Open `.env` in your editor. At minimum:
 - Replace `SECRET_KEY` with a real random value for any non-development
   use: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 
-### 5. Run database migrations
+### 5. Start PostgreSQL and the application
 
 ```bash
-alembic upgrade head
+docker compose up -d
 ```
 
-The SQLite database (`data/finhealth.db`) is created on first run. The
-Phase 1 migration seeds the three known banks (Santander, Itaú, Banco
-de Chile) with the right password formulas.
+Compose waits for PostgreSQL health, runs the one-shot `migrate` service, then
+starts the application. The baseline migration seeds the supported banks.
 
 ---
 
@@ -368,10 +366,8 @@ For Phase 3 dashboard hardening verification, run the focused harness:
 ./scripts/verify.sh
 ```
 
-The script runs the dashboard/seed/SQLite/documentation/Docker lifecycle
-focused pytest suite, Ruff, `compileall`, and the disposable Docker checks.
-The Docker lifecycle test uses an isolated Compose project and xfails cleanly
-when Docker is unavailable.
+The script runs focused application, PostgreSQL/Compose lifecycle, and
+documentation checks, then Ruff and `compileall`.
 
 The Phase 1 E2E test (`tests/test_e2e_phase1.py`) requires the sample
 PDFs in `shared/account-state-examples/`. The repo does not commit
@@ -415,39 +411,15 @@ configuration.
 ### Database migrations
 
 ```bash
-# Apply all pending migrations
+# Apply the baseline to an empty PostgreSQL database
 alembic upgrade head
 
-# Roll back one migration
-alembic downgrade -1
-
-# Create a new migration (autogenerate)
-alembic revision --autogenerate -m "describe change"
-
-# Show current revision
+# Show the single baseline revision
 alembic current
-
-# Show migration history
-alembic history
 ```
 
-The migration history is small and intentionally append-only:
-
-| Revision                                            | Phase | Purpose                                                              |
-| --------------------------------------------------- | ----- | -------------------------------------------------------------------- |
-| `0001_initial`                                      | 1     | Initial schema (banks, credit cards, statements, transactions)        |
-| `0002_phase1_ingestion`                             | 1     | Phase 1 ingestion columns + indexes                                  |
-| `0003_statement_error_message`                      | 1     | Surface ingestion failures on the statement row                      |
-| `0004_timestamp_server_defaults`                    | 1     | Server-side `CURRENT_TIMESTAMP` defaults for `created_at`/`updated_at` |
-| `0005_phase2_categories`                            | 2     | `categories` table + seed of 12 Y-NAB rows |
-| `0006_phase2_merchants_transactions_alter`          | 2     | `merchants` + `merchant_aliases` tables; `category_id` + `merchant_id` FKs + `low_confidence` on `transactions` |
-| `0007_phase2_recurring_rules`                       | 2     | `recurring_rules` table; `recurring_rule_id` FK on `transactions`    |
-
-`alembic upgrade head` runs all seven in order and is invoked
-automatically on every container start (see
-[Docker deployment](#docker-deployment) below), so a fresh
-clone + `docker compose up` is enough to land on the latest
-schema with no manual steps.
+The repository has one destructive PostgreSQL baseline. It only initializes an
+empty database; do not use it to upgrade a pre-existing schema.
 
 ### Pre-commit hooks (optional)
 
@@ -511,7 +483,8 @@ project root). See `.env.example` for the full list. Key entries:
 | `APP_NAME`          | `finhealth`                            | Display name + OpenAPI title                  |
 | `DEBUG`             | `false`                                | Verbose errors / autoreload hint              |
 | `SECRET_KEY`        | `change-me-in-production`              | Secret used for signing tokens                |
-| `DATABASE_URL`      | `sqlite+aiosqlite:///data/finhealth.db` | Async SQLAlchemy URL                          |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | *(required)* | PostgreSQL credentials and database name |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | `postgres` / `5432` | PostgreSQL connection location |
 | `CORS_ORIGINS`      | `["http://localhost:8000", ...]`       | Allowed CORS origins                          |
 | `LLM_PROVIDER`      | `opencode_go`                          | LLM provider identifier                       |
 | `LLM_API_ENDPOINT`  | `http://localhost:11434`               | Base URL for the LLM provider's HTTP API      |
@@ -589,15 +562,14 @@ internal network. Optimized for CPU-only inference with limited
 RAM (2-4 GB).
 
 ```bash
-# 1. Start the Ollama sidecar (waits for healthy state before
-#    finhealth starts)
-docker compose -f docker-compose.self-hosted.yml up -d ollama
+# 1. Start the base topology and Ollama overlay
+docker compose -f docker-compose.yml -f docker-compose.self-hosted.yml up -d ollama
 
 # 2. Pull a CPU-friendly model (one-time, ~1-3 GB download)
 ./scripts/pull-ollama-model.sh qwen2.5:1.5b
 
 # 3. Start finhealth
-docker compose -f docker-compose.self-hosted.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.self-hosted.yml up -d
 ```
 
 The compose file pins the LLM provider to `ollama` and points
@@ -621,7 +593,7 @@ different model — the script reads it as the default.
 
 Pulled models are persisted in the `ollama_data` named volume, so
 they survive `docker compose down` and container restarts. Use
-`docker compose -f docker-compose.self-hosted.yml down -v` only
+`docker compose -f docker-compose.yml -f docker-compose.self-hosted.yml down -v` only
 when you want a clean slate (it wipes the model cache too).
 
 ---
@@ -630,8 +602,8 @@ when you want a clean slate (it wipes the model cache too).
 
 A self-hosted single-user app is the natural fit for a single
 container, so finhealth ships a multi-stage `Dockerfile` and a
-`docker-compose.yml` that mount the SQLite database and the
-upload directory as host bind mounts for persistence. The
+`docker-compose.yml` with PostgreSQL in a named volume and the
+upload directory as a host bind mount. The
 `docker-compose.yml` in this directory targets **cloud LLM
 providers**; for self-hosted Ollama see
 [Option 2](#option-2-self-hosted-with-ollama-cpu-friendly-no-api-costs)
@@ -659,9 +631,9 @@ above.
    `/upload`, the transactions list at `/transactions`, the
    interactive API docs at `/docs`.
 
-The first `up -d` runs `alembic upgrade head` on container start,
-so the SQLite schema is created and the three supported banks
-(Santander, Itaú, Banco de Chile) are seeded automatically.
+The first `up -d` waits for PostgreSQL health, then the one-shot `migrate`
+service runs `alembic upgrade head`. `finhealth` starts only after that
+service succeeds, and the baseline seeds the supported banks.
 
 ### Configuration
 
@@ -671,7 +643,8 @@ Docker deployment are:
 
 | Variable            | Default (Docker)                              | Purpose                                       |
 | ------------------- | --------------------------------------------- | --------------------------------------------- |
-| `DATABASE_URL`      | `sqlite+aiosqlite:////app/data/finhealth.db`  | Async SQLAlchemy URL. The path is *inside* the container — the host bind mount on `./data` makes it persistent. |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | *(required)* | PostgreSQL credentials and database name. |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | `postgres` / `5432` | PostgreSQL connection location. |
 | `SECRET_KEY`        | `change-me-in-production`                     | Set a real random value in `.env` for production. |
 | `LLM_PROVIDER`      | `opencode_go`                                 | LLM provider identifier (`opencode_go`, `ollama`, `opencode_zen`). |
 | `LLM_API_ENDPOINT`  | *(unset — required)*                          | Base URL for the LLM provider's HTTP API. No default in the cloud compose file; the app fails fast if it is unset. For self-hosted Ollama, use `docker-compose.self-hosted.yml` which points at `http://ollama:11434`. |
@@ -686,75 +659,65 @@ Docker deployment are:
 
 ### Volumes
 
-The compose file bind-mounts two host directories into the
-container. They survive `docker compose down` and any number of
-container restarts. `docker compose down -v` removes Docker named
-volumes, but it does **not** delete bind-mounted host directories
-such as `./data` or `./shared`.
+The compose file keeps database data in the named `postgres_data` volume and
+bind-mounts `./shared` for PDFs. Normal container restarts preserve both.
+`docker compose down -v` destroys named volumes, including PostgreSQL data.
 
-| Host path   | Container path  | Purpose                                                                 |
-| ----------- | --------------- | ----------------------------------------------------------------------- |
-| `./shared`  | `/app/shared`   | PDF uploads. Drop a statement PDF in `./shared/` and it is immediately visible to the running app. |
-| `./data`    | `/app/data`     | SQLite database + WAL files. The schema, the main DB, and the write-ahead log all live in one directory so atomic commits survive a restart. |
+| Storage | Location | Purpose |
+| --- | --- | --- |
+| Named volume | `postgres_data` | PostgreSQL data, retained across normal restarts. |
+| Bind mount | `./shared:/app/shared` | Uploaded PDFs. |
 
 Both directories are tracked as empty in git via `.gitkeep`
 files, so a fresh `git clone` produces the directories Docker
 needs to bind-mount. Anything you drop in there is ignored by
 git (see `.gitignore`).
 
-### SQLite backup and restore
+### PostgreSQL backup and restore
 
-The canonical database path is `data/finhealth.db` locally and
-`/app/data/finhealth.db` inside Docker. Because SQLite may use WAL
-files, do not copy a live database file blindly. Use the verified
-helper, which uses SQLite's backup API, runs `PRAGMA integrity_check`,
-and writes a row-count manifest for `transactions`, `statements`,
-`credit_cards`, and `banks`:
+Use PostgreSQL-native tools through the database service. Back up before any
+destructive operation:
 
 ```bash
-python -m app.cli.sqlite_ops backup \
-  sqlite:///data/finhealth.db \
-  backups/finhealth-$(date +%F).db
+mkdir -p backups
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
+  > "backups/finhealth-$(date +%F).dump"
 ```
 
-To restore, stop the app first, validate and atomically replace the DB,
-then restart and check health:
+To restore, stop the app, recreate its database, restore the custom dump, and
+start it again:
 
 ```bash
 docker compose stop finhealth
-python -m app.cli.sqlite_ops restore \
-  backups/finhealth-YYYY-MM-DD.db \
-  sqlite:///data/finhealth.db
-docker compose up -d finhealth
+docker compose exec -T postgres sh -c 'dropdb -U "$POSTGRES_USER" "$POSTGRES_DB"'
+docker compose exec -T postgres sh -c 'createdb -U "$POSTGRES_USER" "$POSTGRES_DB"'
+cat backups/finhealth-YYYY-MM-DD.dump | docker compose exec -T postgres \
+  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists'
+# Start the stopped application container without rerunning the one-shot migrate service.
+docker start finhealth
 curl http://localhost:8000/api/v1/health
 ```
 
-For a stopped-container backup variant, stop the container and copy the
-database directory snapshot with the same helper used by the tests:
+To reset all database data permanently, first take a backup and then run:
 
 ```bash
-python -c "from app.cli.sqlite_ops import copy_stopped_container_db; copy_stopped_container_db('data', 'backups/finhealth-stopped.db')"
+docker compose down -v
+docker compose up -d --build
 ```
 
-The exact bind-mount lifecycle `docker compose down && docker compose up -d`
-preserves `./data/finhealth.db` because `./data` is a host directory, not a
-named Docker volume. Likewise, `docker compose down -v does **not** delete bind-mounted host directories`;
-it removes named volumes only.
+If an interrupted teardown leaves the default named volume behind, remove it
+explicitly before starting again:
 
-Restore removes stale `data/finhealth.db-wal` and
-`data/finhealth.db-shm` before replacement. A corrupt backup or a
-non-SQLite URL is rejected before the destination is mutated. After
-restore, compare the generated `.manifest.json` counts with the
-post-restore manifest and smoke-test `/dashboard` plus the JSON health
-endpoint.
+```bash
+docker volume rm finhealth_postgres_data
+```
 
 ### File ownership (HOST_UID / HOST_GID)
 
 The compose file maps the container's effective user to
 `${HOST_UID:-0}:${HOST_GID:-0}`. The default `0:0` (root)
-works for any host that does not care who owns the files in
-`./data` and `./shared`; the SQLite database and any uploaded
-PDFs will be owned by `root` on the host.
+works for any host that does not care who owns the shared upload
+directory; uploaded PDFs will be owned by `root` on the host.
 
 To keep those files owned by your own user (recommended for
 self-hosted deployments), set `HOST_UID` and `HOST_GID` in
@@ -770,6 +733,12 @@ The variables are read on every `docker compose` invocation, so
 no rebuild is needed — `docker compose restart` is enough to
 apply a new UID/GID.
 
+Restart the application without recreating PostgreSQL data:
+
+```bash
+docker compose restart finhealth
+```
+
 ### Updating
 
 Pull the new code, rebuild, and restart:
@@ -780,9 +749,8 @@ docker compose build
 docker compose up -d
 ```
 
-Migrations are applied automatically on every container start,
-so a schema change in a newer image does not need a manual
-`alembic upgrade head`.
+Migrations are owned by the one-shot Compose service. To apply a rebuilt image
+explicitly, run `docker compose run --rm migrate` before starting `finhealth`.
 
 ### Logs
 
@@ -803,7 +771,7 @@ with:
 ```bash
 docker compose ps
 #   NAME        IMAGE           COMMAND                  SERVICE     STATUS
-#   finhealth   finhealth:local "sh -c alembic upgrad…"  finhealth   Up 2 minutes (healthy)
+#   finhealth   finhealth:local "uvicorn app.main:app"  finhealth   Up 2 minutes (healthy)
 ```
 
 The status column switches to `(unhealthy)` if the DB is

@@ -1,85 +1,71 @@
-# ---------------------------------------------------------------------------
-# finhealth — docker-compose for CLOUD LLM providers
-# (OpenCode Zen recommended, OpenAI, Anthropic, etc.).
-#
-# For self-hosted deployment with Ollama as a sidecar (CPU-only servers,
-# no API budget), use ``docker-compose.self-hosted.yml`` instead — this
-# file does NOT start an LLM and requires LLM_API_ENDPOINT to point at a
-# reachable provider.
-#
-# Quick start:
-#   1. ``cp .env.example .env`` and edit it (LLM endpoint, model, etc.)
-#   2. ``docker compose build``
-#   3. ``docker compose up -d``
-#   4. Open http://localhost:8000
-#
-# Data persists across container restarts via the two bind mounts
-# below. ``docker compose down`` keeps host directories intact;
-# ``docker compose down -v`` removes named volumes only, not bind-mounted
-# host directories such as ``./data`` and ``./shared``.
-# ---------------------------------------------------------------------------
+# finhealth deployment with PostgreSQL and a cloud LLM provider.
+# For Ollama, apply the overlay as well:
+# docker compose -f docker-compose.yml -f docker-compose.self-hosted.yml up -d
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finhealth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finhealth}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-finhealth}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    image: finhealth:local
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finhealth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finhealth}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-finhealth}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   finhealth:
-    # Build the image from the project root using the multi-stage
-    # Dockerfile in this directory. Tagging the image ``finhealth:local``
-    # makes ``docker compose down && docker compose up -d`` pick up
-    # the freshly built image without ``docker compose build``.
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     image: finhealth:local
     container_name: finhealth
-
-    # Map the container's effective user to the host UID/GID so
-    # the bind-mounted ``./data`` and ``./shared`` directories
-    # remain owned by the host user. Defaults to 0:0 (root) for
-    # the "I just want it to work" case; set ``HOST_UID`` /
-    # ``HOST_GID`` in your ``.env`` to match the host user
-    # (typically the value ``id -u`` and ``id -g`` print when
-    # you run them) to keep the SQLite database and uploaded
-    # PDFs owned by you instead of by root.
     user: "${HOST_UID:-0}:${HOST_GID:-0}"
-
     ports:
-      # Host port 8000 -> container port 8000. Change the left side
-      # if the host port is already taken (``"9000:8000"``).
       - "8000:8000"
-
     volumes:
-      # PDF uploads. Drop a statement PDF in ``./shared`` and it
-      # is immediately visible to the running app (and vice versa).
       - ./shared:/app/shared
-      # SQLite database + WAL files. One directory keeps the
-      # schema, the main DB, and the write-ahead log together so
-      # atomic commits survive a container restart.
-      - ./data:/app/data
-
     environment:
-      # Database URL points inside the container; the bind mount
-      # above makes ``/app/data`` the same directory as ``./data``
-      # on the host.
-      - DATABASE_URL=sqlite+aiosqlite:////app/data/finhealth.db
-      - DEBUG=false
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      - LLM_PROVIDER=${LLM_PROVIDER:-opencode_go}
-      # IMPORTANT: For self-hosted Ollama, use docker-compose.self-hosted.yml
-      # instead. This file targets a CLOUD provider, so LLM_API_ENDPOINT
-      # has no default — the app fails fast if it is unset.
-      - LLM_API_ENDPOINT=${LLM_API_ENDPOINT:-}
-      # API key for LLM provider authentication. Optional for local
-      # providers like Ollama (leave empty). Required for cloud
-      # providers. Set in ``.env`` to avoid committing secrets.
-      - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_MODEL=${LLM_MODEL:-qwen3.7-max}
-      - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
-      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-3}
-      # PDF upload directory *inside* the container. The bind
-      # mount above keeps it in sync with ``./shared`` on the host.
-      - PDF_UPLOAD_DIR=/app/shared
-      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-10}
-
-    # Self-hosted single-user app: always come back up unless the
-    # operator explicitly stops the container. Use ``docker compose
-    # stop`` to take it down for maintenance.
+      POSTGRES_USER: ${POSTGRES_USER:-finhealth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finhealth}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-finhealth}
+      DEBUG: "false"
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      LLM_PROVIDER: ${LLM_PROVIDER:-opencode_go}
+      LLM_API_ENDPOINT: ${LLM_API_ENDPOINT:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.7-max}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-3}
+      PDF_UPLOAD_DIR: /app/shared
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+volumes:
+  postgres_data:

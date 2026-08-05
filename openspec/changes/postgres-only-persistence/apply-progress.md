@@ -135,4 +135,28 @@ The full suite is not globally green because 16 unchanged LLM schema/OpenCode Ze
 
 ## Remaining Work
 
-- [ ] WU-4 / Phase 4: Compose migration owner and operations documentation.
+- [x] WU-4 / Phase 4: Compose migration owner and operations documentation.
+
+### WU-4 Compose and Operations Evidence
+
+| Evidence | Exact result |
+|---|---|
+| RED tests | New `tests/test_docker_lifecycle.py` and `tests/test_documentation.py` first failed with 7 assertions against the legacy Compose, Dockerfile, environment template, README, and verification script. |
+| Focused test command | `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth python -m pytest tests/test_docker_lifecycle.py tests/test_documentation.py --no-cov` |
+| Focused test result | Exit 0 — 8 passed in 0.02s. |
+| Compose checks | Base and merged-overlay `docker compose config` exited 0 with structured PostgreSQL fields; no `DATABASE_URL` or `/app/data` references remain in Compose or the runbook. |
+| Full work-unit verification | Disposable PostgreSQL 16 on `127.0.0.1:55440` ran `bash scripts/verify.sh` — exit 0, 119 passed; repeated documentation/lifecycle run exited 0, 8 passed. |
+| Runtime harness | `docker compose up -d --build` reached healthy PostgreSQL, successful one-shot baseline migration, healthy Uvicorn-only `finhealth`, and `GET /api/v1/health` returned `{"status":"ok","database":"ok","version":"0.1.0"}`. `docker compose down -v` removed the disposable stack and volume. |
+| Settlement | Native attempt token `sha256:bc722f926f5e0eb9d0155cce0ac6e8dd7432c63bb54feda55fb1474436266244` settled `passed` with a distinct request ID. |
+| Rollback boundary | Revert the ten staged WU-4 files in this change; `scripts/verify.sh` remains outside this PR boundary. This leaves WU-1–WU-3 persistence behavior intact. |
+
+### WU-4 Gatekeeper Correction Evidence
+
+| Evidence | Exact result |
+|---|---|
+| Corrected scope | Every self-hosted command now combines `docker-compose.yml` with `docker-compose.self-hosted.yml`; the pull script, template, and README no longer invoke the overlay alone. |
+| Credentials | The PostgreSQL backup, drop/create, and restore commands run `sh -c` inside `postgres`, so `$POSTGRES_USER` and `$POSTGRES_DB` are expanded in the container rather than requiring host exports. |
+| Restore behavior | The smoke test proved `docker compose up` reruns the one-shot migration after restore and fails the baseline preflight; the runbook correctly uses `docker start finhealth` to restart the stopped application without rerunning migration. |
+| Focused test | `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth python -m pytest tests/test_documentation.py tests/test_docker_lifecycle.py --no-cov` — exit 0, 8 passed. |
+| Runtime harness | With host `POSTGRES_*` unset, a disposable Compose PostgreSQL 16 stack booted, created a custom `pg_dump`, stopped the app, dropped/recreated/restored the database via container-side credentials, restarted `finhealth`, and returned healthy DB status. Cleanup used `docker compose down -v`. |
+| Rollback boundary | Revert the self-hosted command, runbook, and documentation-test corrections in `.env.example`, `README.md`, `scripts/pull-ollama-model.sh`, and `tests/test_documentation.py`; preserve the completed WU-4 topology work. |
