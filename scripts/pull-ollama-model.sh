@@ -11,9 +11,9 @@ echo "Pulling Ollama model: $MODEL"
 echo "This may take a few minutes depending on your connection..."
 
 # Connect to the running Ollama container
-docker compose -f docker-compose.self-hosted.yml exec ollama ollama pull "$MODEL"
+docker compose -f docker-compose.yml -f docker-compose.self-hosted.yml exec ollama ollama pull "$MODEL"
 
 echo "Model $MODEL is ready."
 echo ""
 echo "You can now start finhealth:"
-echo "  docker compose -f docker-compose.self-hosted.yml up -d finhealth"
+echo "  docker compose -f docker-compose.yml -f docker-compose.self-hosted.yml up -d finhealth"

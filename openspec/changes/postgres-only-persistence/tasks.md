@@ -59,18 +59,18 @@ Estimated changed lines: 1200–1800; 4 stacked PRs.
 
 ## Phase 4: Compose, Documentation & Operations (WU-4)
 
-- [ ] **0.0 BLOCKING PREREQUISITE** still active.
-- [ ] 4.1 RED `docker compose config` — exactly one `migrate` with `command: alembic upgrade head`, `restart: "no"`; `finhealth` depends on `migrate: service_completed_successfully` AND `postgres` healthy.
-- [ ] 4.2 RED: merged `docker-compose.yml + docker-compose.self-hosted.yml` defines migration command in exactly one file.
-- [ ] 4.3 RED: `docker compose config` lists the five `POSTGRES_*` and no `DATABASE_URL`.
-- [ ] 4.4 RED: `Dockerfile` `CMD` = Uvicorn only — no `alembic upgrade` in the image.
-- [ ] 4.5 RED: non-zero `migrate` exit blocks `finhealth` from starting.
-- [ ] 4.6 GREEN `docker-compose.yml` — add `migrate`, rewire `finhealth` deps, drop `./data` mount, replace `DATABASE_URL` with `POSTGRES_*`.
-- [ ] 4.7 GREEN `docker-compose.self-hosted.yml` becomes overlay only.
-- [ ] 4.8 GREEN `Dockerfile` runtime `CMD` = Uvicorn only.
-- [ ] 4.9 GREEN rewrite `.env.example` — drop `DATABASE_URL`, list five `POSTGRES_*`, remove SQLite comment.
-- [ ] 4.10 GREEN rewrite `README.md` — PostgreSQL-only deploy + lifecycle runbook (deploy, migration, `pg_dump`, `pg_restore`, `docker volume rm`).
-- [ ] 4.11 GREEN recreate replacement PostgreSQL/Compose lifecycle and documentation coverage, then run `bash scripts/verify.sh` plus lifecycle smoke (start, write, restart, read, `pg_dump`, `pg_restore`) without relying on deleted test paths.
+- [x] **0.0 BLOCKING PREREQUISITE** resolved through the maintainer-provided WU-4 native attempt token.
+- [x] 4.1 RED `docker compose config` — exactly one `migrate` with `command: alembic upgrade head`, `restart: "no"`; `finhealth` depends on `migrate: service_completed_successfully` AND `postgres` healthy.
+- [x] 4.2 RED: merged `docker-compose.yml + docker-compose.self-hosted.yml` defines migration command in exactly one file.
+- [x] 4.3 RED: `docker compose config` lists the five `POSTGRES_*` and no `DATABASE_URL`.
+- [x] 4.4 RED: `Dockerfile` `CMD` = Uvicorn only — no `alembic upgrade` in the image.
+- [x] 4.5 RED: non-zero `migrate` exit blocks `finhealth` from starting.
+- [x] 4.6 GREEN `docker-compose.yml` — add `migrate`, rewire `finhealth` deps, drop `./data` mount, replace `DATABASE_URL` with `POSTGRES_*`.
+- [x] 4.7 GREEN `docker-compose.self-hosted.yml` becomes overlay only.
+- [x] 4.8 GREEN `Dockerfile` runtime `CMD` = Uvicorn only.
+- [x] 4.9 GREEN rewrite `.env.example` — drop `DATABASE_URL`, list five `POSTGRES_*`, remove SQLite comment.
+- [x] 4.10 GREEN rewrite `README.md` — PostgreSQL-only deploy + lifecycle runbook (`docker compose down -v`, optional `docker volume rm finhealth_postgres_data`, migration, `pg_dump`, and `pg_restore`).
+- [x] 4.11 GREEN recreate replacement PostgreSQL/Compose lifecycle and documentation coverage, then run `bash scripts/verify.sh` plus lifecycle smoke (start, write, restart, read, `pg_dump`, `pg_restore`) without relying on deleted test paths.
 
 ## Phase 5: Verification & Archive
 

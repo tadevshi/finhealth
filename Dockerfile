@@ -9,7 +9,7 @@
 #   runtime  — slim image with the wheel + system libraries needed
 #              by pdfplumber (Pillow transitively) and pikepdf
 #              (libqpdf). Runs as an unprivileged user, applies
-#              Alembic migrations on startup, then serves on :8000.
+#              serves the HTTP application on :8000. Compose owns migrations.
 
 # ---------------------------------------------------------------------------
 # Stage 1 — build the production wheel
@@ -99,17 +99,9 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 
-# Persistent directories. Under docker-compose these are bind
-# mount points owned by the host user, so the Dockerfile creates
-# them but does not chown them — the actual ownership is
-# governed by the ``user:`` directive in ``docker-compose.yml``
-# (or the ``docker run -u`` flag), which maps the container user
-# to the host UID/GID that owns the bind-mounted directories.
-# The 0:0 default in compose means "run as root", which works
-# for any host that does not care about file ownership; setting
-# ``UID``/``GID`` in ``.env`` to match the host user keeps the
-# SQLite database and uploaded PDFs owned by the host user.
-RUN mkdir -p /app/shared /app/data
+# The application retains uploaded PDFs on the shared bind mount. PostgreSQL
+# persistence is owned by its named Compose volume, not the application image.
+RUN mkdir -p /app/shared
 
 EXPOSE 8000
 
@@ -122,9 +114,5 @@ r = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3); \
 sys.exit(0 if r.status == 200 else 1)" \
     || exit 1
 
-# ``sh -c`` chains the two commands. ``alembic upgrade head`` is
-# idempotent and a no-op when already at the head revision, so
-# running it on every start is safe and keeps the schema in sync
-# with the code in the image. ``uvicorn`` is then started in the
-# foreground so the container stays alive.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Compose starts the one-shot `migrate` service before this application service.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
