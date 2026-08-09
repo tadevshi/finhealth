@@ -74,7 +74,7 @@ Estimated changed lines: 1200–1800; 4 stacked PRs.
 
 ## Phase 5: Verification & Archive
 
-- [ ] **0.0 BLOCKING PREREQUISITE** — final confirmation `authority_corrupted` resolved before `sdd-archive`.
-- [ ] 5.1 Run `sdd-verify`; all spec scenarios pass.
-- [ ] 5.2 Confirm `rg "sqlite"` = 0 outside removal notes; `pip check` clean.
-- [ ] 5.3 `sdd-archive` → `archive/YYYY-MM-DD-postgres-only-persistence/`; merge delta into `openspec/specs/postgresql-persistence/spec.md`.
+- [x] **0.0 BLOCKING PREREQUISITE** — final confirmation `authority_corrupted` resolved before `sdd-archive`. Resolved by explicit maintainer authorization for native final-verification attempt `postgres-only-persistence-final-verify-20260804-r1`.
+- [x] 5.1 Run `sdd-verify`; all spec scenarios pass. Final verification proved 17/17 scenarios and 8/8 requirements.
+- [x] 5.2 Confirm `rg "sqlite"` = 0 outside removal notes; `pip check` clean. Classified static check and `python -m pip check` both exited 0.
+- [x] 5.3 `sdd-archive` → `archive/YYYY-MM-DD-postgres-only-persistence/`; merge delta into `openspec/specs/postgresql-persistence/spec.md`.

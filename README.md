@@ -28,8 +28,8 @@ the money actually goes.
   Markdown (markitdown), detects the CMF NACIONAL / INTERNACIONAL
   variant, and parses transactions with the configured LLM
 - **Provider-agnostic LLM** — `opencode_go` (default, OpenAI-compatible),
-  `ollama`, or `opencode_zen` (curated cloud models via the
-  Anthropic-compatible endpoint). Selected by `LLM_PROVIDER`
+  `ollama`, or `opencode_zen` (curated cloud models with model-aware
+  Anthropic and OpenAI-compatible endpoints). Selected by `LLM_PROVIDER`
 - **Idempotent uploads** — re-uploading the same PDF for the same card is
   a no-op (SHA-256 dedup at the `(card, file_hash)` level)
 - **Filterable transactions list** — date range, amount range, description
@@ -513,9 +513,11 @@ that matches your environment:
 
 [OpenCode Zen](https://opencode.ai/zen) is a curated list of
 LLM models (Claude, Qwen, Gemini, etc.) with transparent
-per-token pricing and a single API key. Most recommended
-models for finhealth are served through Zen's
-Anthropic-compatible `/v1/messages` endpoint.
+per-token pricing and a single API key. The client selects Zen's
+wire contract from `LLM_MODEL`: Qwen and Claude models use the
+Anthropic-compatible `/v1/messages` endpoint; DeepSeek, GLM, Kimi,
+MiniMax, and other OpenAI-compatible models use
+`/v1/chat/completions`.
 
 1. Sign up at <https://opencode.ai/auth> and copy your API
    key.

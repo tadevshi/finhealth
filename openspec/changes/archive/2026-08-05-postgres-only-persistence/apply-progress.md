@@ -160,3 +160,13 @@ The full suite is not globally green because 16 unchanged LLM schema/OpenCode Ze
 | Focused test | `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth python -m pytest tests/test_documentation.py tests/test_docker_lifecycle.py --no-cov` — exit 0, 8 passed. |
 | Runtime harness | With host `POSTGRES_*` unset, a disposable Compose PostgreSQL 16 stack booted, created a custom `pg_dump`, stopped the app, dropped/recreated/restored the database via container-side credentials, restarted `finhealth`, and returned healthy DB status. Cleanup used `docker compose down -v`. |
 | Rollback boundary | Revert the self-hosted command, runbook, and documentation-test corrections in `.env.example`, `README.md`, `scripts/pull-ollama-model.sh`, and `tests/test_documentation.py`; preserve the completed WU-4 topology work. |
+
+### WU-4 Verification-Script Reconciliation
+
+| Evidence | Exact result |
+|---|---|
+| Merged-tree inspection | `origin/main` does not contain `tests/test_sqlite_ops.py`, but its `scripts/verify.sh` still invokes that deleted path. |
+| Required correction | Task 4.11 requires `bash scripts/verify.sh` to run without relying on deleted test paths. The existing one-line worktree change removes only `tests/test_sqlite_ops.py` from the command and is required to preserve that completed WU-4 contract. |
+| Scope | This follow-up reconciles the deliberately excluded WU-4 PR file with merged `origin/main`; it does not mark any Phase 5 verification or archive task complete. |
+| Static verification | `bash -n scripts/verify.sh`, a Python assertion that the retained documentation/lifecycle test paths exist, and `git diff --check` all exit 0. |
+| Rollback boundary | Revert the single deleted `tests/test_sqlite_ops.py` argument in `scripts/verify.sh`; no Compose, application, or Phase 5 behavior is affected. |
