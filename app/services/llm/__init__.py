@@ -24,9 +24,9 @@ Module map
 * :mod:`app.services.llm.ollama_client` — Client for a local
   Ollama daemon, used for offline / privacy-sensitive runs.
 * :mod:`app.services.llm.opencode_zen_client` — Client for
-  OpenCode Zen (curated cloud models with API key auth,
-  served via the Anthropic-compatible ``/v1/messages``
-  endpoint).
+  OpenCode Zen (curated cloud models with API key auth and
+  model-aware Anthropic ``/messages`` or OpenAI-compatible
+  ``/chat/completions`` endpoints).
 * :mod:`app.services.llm.factory` — Single entry point
   :func:`create_llm_client` that the orchestrator uses to
   construct the provider from :class:`~app.core.config.Settings`.

@@ -1,24 +1,17 @@
-"""OpenCode Zen client — curated models with API-key authentication.
+"""OpenCode Zen client with model-aware wire contracts.
 
 OpenCode Zen is a list of tested and verified models provided by
-the OpenCode team. It is exposed at
-``https://opencode.ai/zen/v1`` and is **OpenAI-compatible** —
-the wire format is the same ``/v1/chat/completions`` endpoint
-that ``OllamaClient`` and ``OpenCodeGoClient`` already speak,
-just behind a different base URL and with a different
-authentication header.
+the OpenCode team. It exposes model-specific endpoints below
+``https://opencode.ai/zen/v1``:
 
-This client mirrors :class:`OllamaClient` and
-:class:`OpenCodeGoClient` in shape: same retry policy, same
-extraction-error model, same response parsing. The only
-Zen-specific details are the URL (``/chat/completions``)
-and the auth (``Authorization: Bearer <key>``).
+* Qwen and Claude models use the Anthropic-compatible
+  ``/messages`` endpoint.
+* DeepSeek, GLM, Kimi, MiniMax, and other OpenAI-compatible
+  models use ``/chat/completions``.
 
-Models that are *not* behind the ``/v1/messages`` Anthropic
-shim are the ones we use here: most of the Zen catalogue
-(DeepSeek, GLM, Kimi, Big Pickle, Grok, etc.) lives behind
-the OpenAI-compat endpoint and is the one this client
-targets.
+This client selects the endpoint, request body, authentication
+headers, and response parser from ``LLM_MODEL`` while keeping the
+same retry and extraction-error behavior for both contracts.
 """
 
 from __future__ import annotations
@@ -50,13 +43,21 @@ _RETRYABLE_STATUSES: Final = frozenset({429, 500, 502, 503, 504})
 #: retrying will help.
 _NON_RETRYABLE_STATUSES: Final = frozenset({400, 401, 403, 404, 405, 415, 422})
 
+# OpenCode Zen documents these model families on the Anthropic-compatible
+# endpoint. All other models use its OpenAI-compatible chat endpoint.
+_MESSAGE_COMPATIBLE_MODEL_PREFIXES: Final = ("qwen", "claude")
+_ANTHROPIC_VERSION: Final = "2023-06-01"
+_ANTHROPIC_MAX_TOKENS: Final = 4096
+
 
 class OpenCodeZenClient(LLMProvider):
     """LLM client for OpenCode Zen (curated models, API-key auth).
 
-    Talks to the OpenAI-compatible ``/v1/chat/completions``
-    endpoint exposed by ``https://opencode.ai/zen/v1`` (or a
-    self-hosted equivalent configured via ``LLM_API_ENDPOINT``).
+    Selects the Anthropic-compatible ``/messages`` contract for
+    Qwen and Claude models, and the OpenAI-compatible
+    ``/chat/completions`` contract for other documented Zen models.
+    The base URL is exposed by ``https://opencode.ai/zen/v1`` (or
+    a self-hosted equivalent configured via ``LLM_API_ENDPOINT``).
 
     Parameters
     ----------
@@ -97,10 +98,10 @@ class OpenCodeZenClient(LLMProvider):
 
         1. Render the prompt via
            :func:`app.services.llm.prompts.build_extraction_prompt`.
-        2. POST it to ``{settings.LLM_API_ENDPOINT}/v1/chat/completions``
-           with ``response_format={"type": "json_object"}`` so the
-           daemon enforces JSON at the provider level, not just in
-           the prompt.
+        2. POST it to the endpoint selected from ``LLM_MODEL``. The
+           OpenAI-compatible route uses
+           ``response_format={"type": "json_object"}``; the
+           Anthropic-compatible route relies on the prompt for JSON.
         3. Parse the response and validate it as
            :class:`ExtractionResponse`.
         4. On retryable failure, sleep for ``2 ** attempt``
@@ -175,37 +176,35 @@ class OpenCodeZenClient(LLMProvider):
         return self._parse_response(body)
 
     def _endpoint_url(self) -> str:
-        """Return the OpenAI-compat ``/v1/chat/completions`` URL.
+        """Return the model-specific Zen endpoint URL.
 
-        The base URL in settings is the Zen root (or a
-        self-hosted equivalent); we append the standard
-        ``/v1/chat/completions`` suffix used by OpenAI-compatible
-        APIs. A trailing slash on the base URL is normalised
-        to a single one.
+        The base URL already contains Zen's ``/v1`` path. Qwen and
+        Claude use ``/messages``; all other models use
+        ``/chat/completions``. A trailing slash is normalised.
         """
         base = self._settings.LLM_API_ENDPOINT.rstrip("/")
-        return f"{base}/v1/chat/completions"
+        suffix = "/messages" if self._uses_messages_endpoint() else "/chat/completions"
+        return f"{base}{suffix}"
 
     def _build_payload(self, prompt: str) -> dict[str, Any]:
-        """Build the OpenAI-compat request body.
+        """Build the request body for the selected Zen wire contract.
 
-        The prompt is sent as a single ``user`` message; the
-        system role would let the daemon inject its own
-        system prompt and we want to keep behaviour
-        deterministic. ``response_format`` enforces JSON at
-        the provider level — a guard against prompt-only
-        enforcement failing.
-
-        Note: ``max_tokens`` is intentionally omitted. The
-        default cap on the OpenAI-compat side is large
-        enough for a few hundred transactions; sending a
-        lower cap on free models occasionally causes a
-        400 ("max_tokens too large for this model"). We let
-        the provider pick the ceiling.
+        The prompt is sent as a single ``user`` message. Anthropic
+        models require ``max_tokens`` and do not accept the
+        OpenAI-only ``temperature`` or ``response_format`` fields.
+        OpenAI-compatible models retain the existing JSON response
+        enforcement payload.
         """
+        messages = [{"role": "user", "content": prompt}]
+        if self._uses_messages_endpoint():
+            return {
+                "model": self._settings.LLM_MODEL,
+                "max_tokens": _ANTHROPIC_MAX_TOKENS,
+                "messages": messages,
+            }
         return {
             "model": self._settings.LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
         }
@@ -213,38 +212,50 @@ class OpenCodeZenClient(LLMProvider):
     def _build_headers(self) -> dict[str, str]:
         """Build HTTP headers for the request.
 
-        The ``Authorization: Bearer <key>`` header is the
-        OpenAI convention. Zen's gateway also accepts
-        ``x-api-key`` (Anthropic convention) but ``Bearer``
-        is the canonical choice for the OpenAI-compat
-        endpoint.
-
-        When ``LLM_API_KEY`` is empty the auth header is
-        omitted — useful for a local Zen-compatible mock that
-        does not require authentication.
+        The Anthropic-compatible route always advertises the
+        pinned ``anthropic-version`` and sends ``x-api-key`` plus
+        ``Authorization: Bearer`` when a key is configured. The
+        OpenAI-compatible route sends only the Bearer header.
+        Empty keys omit authentication, which keeps local and mock
+        compatible providers usable.
         """
         headers: dict[str, str] = {}
+        if self._uses_messages_endpoint():
+            headers["anthropic-version"] = _ANTHROPIC_VERSION
         if self._settings.LLM_API_KEY:
+            if self._uses_messages_endpoint():
+                headers["x-api-key"] = self._settings.LLM_API_KEY
             headers["Authorization"] = f"Bearer {self._settings.LLM_API_KEY}"
         return headers
 
     def _parse_response(self, body: dict[str, Any]) -> ExtractionResponse:
-        """Extract the assistant message and validate it as :class:`ExtractionResponse`.
+        """Extract model output and validate it as :class:`ExtractionResponse`.
 
-        Two shapes are accepted:
+        The Anthropic-compatible route concatenates all text blocks
+        from ``content`` before parsing JSON. The OpenAI-compatible
+        route accepts these shapes:
 
         * OpenAI-style: ``{"choices": [{"message": {"content": "<json>"}}]}``
         * Flat: ``{"content": "<json>"}`` or ``{"transactions": [...], ...}``
 
-        The flat shape is convenient for local daemons (Ollama
-        proxies, mocks) and keeps the test surface simple.
+        A message response without text blocks is a retryable typed
+        error rather than a Pydantic validation failure.
         """
-        content = _extract_content(body)
-        if content is None:
-            raise LLMExtractionError(
-                f"OpenCode Zen response did not include a content payload: {body!r}",
-                retryable=True,
-            )
+        if self._uses_messages_endpoint():
+            text_blocks = _collect_text_blocks(body)
+            if not text_blocks:
+                raise LLMExtractionError(
+                    f"OpenCode Zen response did not include text content blocks: {body!r}",
+                    retryable=True,
+                )
+            content: Any = "".join(text_blocks)
+        else:
+            content = _extract_content(body)
+            if content is None:
+                raise LLMExtractionError(
+                    f"OpenCode Zen response did not include a content payload: {body!r}",
+                    retryable=True,
+                )
 
         if isinstance(content, str):
             content = _strip_markdown_fences(content)
@@ -286,6 +297,34 @@ class OpenCodeZenClient(LLMProvider):
         if self._owns_http_client and self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
+
+    def _uses_messages_endpoint(self) -> bool:
+        """Return whether ``LLM_MODEL`` uses Zen's Anthropic contract."""
+        model = self._settings.LLM_MODEL.strip().lower().rsplit("/", 1)[-1]
+        return model.startswith(_MESSAGE_COMPATIBLE_MODEL_PREFIXES)
+
+
+def _collect_text_blocks(body: dict[str, Any]) -> list[str]:
+    """Collect textual content from Anthropic-style response shapes.
+
+    Non-text content blocks are ignored. Flat string content and
+    already-unwrapped extraction payloads remain supported for local
+    or mock-compatible providers.
+    """
+    content = body.get("content")
+    if isinstance(content, list):
+        return [
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+    if isinstance(content, str):
+        return [content]
+    if "transactions" in body or "notes" in body:
+        return [json.dumps(body)]
+    return []
 
 
 def _extract_content(body: dict[str, Any]) -> Any:
@@ -385,7 +424,13 @@ def _drop_empty_transactions(data: dict[str, Any]) -> dict[str, Any]:
     # Sanitise metadata fields.
     meta = data.get("metadata")
     if isinstance(meta, dict):
-        for key in ("period_start", "period_end", "statement_date", "cardholder", "card_number_masked"):
+        for key in (
+            "period_start",
+            "period_end",
+            "statement_date",
+            "cardholder",
+            "card_number_masked",
+        ):
             if meta.get(key) is None:
                 meta[key] = ""
         currency = meta.get("currency")

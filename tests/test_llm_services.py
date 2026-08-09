@@ -16,8 +16,9 @@ ingestion pipeline:
 * :mod:`app.services.llm.ollama_client` — same coverage for
   :class:`OllamaClient`.
 * :mod:`app.services.llm.opencode_zen_client` — same coverage
-  for :class:`OpenCodeZenClient` (Anthropic-format ``/messages``
-  endpoint, ``x-api-key`` and ``Authorization: Bearer`` headers).
+  for :class:`OpenCodeZenClient` (model-aware Anthropic
+  ``/messages`` and OpenAI-compatible ``/chat/completions``
+  contracts).
 * :mod:`app.services.llm.factory` — :func:`create_llm_client`
   dispatch and error model.
 
@@ -1095,7 +1096,7 @@ async def test_ollama_strips_markdown_fences_from_response() -> None:
     fenced = {
         "message": {
             "role": "assistant",
-            "content": '```json\n' + json.dumps(VALID_EXTRACTION_PAYLOAD) + '\n```',
+            "content": "```json\n" + json.dumps(VALID_EXTRACTION_PAYLOAD) + "\n```",
         }
     }
     client_http, _ = make_transport(lambda req: httpx.Response(200, json=fenced))
@@ -1115,7 +1116,7 @@ async def test_ollama_strips_markdown_fences_no_language_hint() -> None:
     fenced = {
         "message": {
             "role": "assistant",
-            "content": '```\n' + json.dumps(VALID_EXTRACTION_PAYLOAD) + '\n```',
+            "content": "```\n" + json.dumps(VALID_EXTRACTION_PAYLOAD) + "\n```",
         }
     }
     client_http, _ = make_transport(lambda req: httpx.Response(200, json=fenced))
@@ -1331,14 +1332,15 @@ def test_ollama_acloses_owned_client() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_zen_url_is_messages_endpoint() -> None:
+@pytest.mark.parametrize("model", ["qwen3.7-plus", "claude-haiku-4-5"])
+def test_zen_url_is_messages_endpoint(model: str) -> None:
     """The endpoint URL appends ``/messages`` to the base URL.
 
     The Anthropic-format path is the one the recommended
     Zen models use (``qwen3.7-plus``, ``claude-haiku-4-5``,
     etc.). A trailing slash on the base URL is normalised.
     """
-    settings = make_settings(LLM_API_ENDPOINT="https://opencode.ai/zen/v1/")
+    settings = make_settings(LLM_API_ENDPOINT="https://opencode.ai/zen/v1/", LLM_MODEL=model)
     client = OpenCodeZenClient(settings)
     assert client._endpoint_url() == "https://opencode.ai/zen/v1/messages"
 
@@ -1445,6 +1447,33 @@ async def test_zen_successful_call_returns_extraction_response() -> None:
     assert seen[0].headers["x-api-key"] == "sk-zen-test-key"
     assert seen[0].headers["Authorization"] == "Bearer sk-zen-test-key"
     assert seen[0].headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.asyncio
+async def test_zen_openai_compatible_model_uses_chat_completions_contract() -> None:
+    """OpenAI-compatible Zen models retain the chat-completions contract."""
+    client_http, seen = make_transport(lambda req: httpx.Response(200, json=OPENAI_STYLE_RESPONSE))
+    settings = make_settings(
+        LLM_MODEL="deepseek-v4-flash-free",
+        LLM_API_KEY="sk-zen-test-key",
+    )
+    llm = OpenCodeZenClient(settings, http_client=client_http)
+    try:
+        result = await llm.extract_transactions(NACIONAL_SAMPLE_TEXT, "NACIONAL")
+    finally:
+        await llm.aclose()
+
+    assert isinstance(result, ExtractionResponse)
+    assert len(result.transactions) == 3
+    assert seen[0].url.path == "/chat/completions"
+    body = json.loads(seen[0].content)
+    assert body["model"] == "deepseek-v4-flash-free"
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["temperature"] == 0.0
+    assert "max_tokens" not in body
+    assert seen[0].headers["Authorization"] == "Bearer sk-zen-test-key"
+    assert "x-api-key" not in seen[0].headers
+    assert "anthropic-version" not in seen[0].headers
 
 
 @pytest.mark.asyncio

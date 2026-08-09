@@ -100,7 +100,7 @@ class TransactionExtraction(BaseModel):
     transactions.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     date: str = Field(
         min_length=1,
@@ -191,12 +191,14 @@ class StatementMetadata(BaseModel):
     type them in the upload form.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     card_number_masked: str = Field(
         default="",
         max_length=25,
-        description=("Masked PAN as it appears on the statement (e.g. 'XXXX XXXX XXXX 0951'). Empty if the model did not read the header."),
+        description=(
+            "Masked PAN as it appears on the statement (e.g. 'XXXX XXXX XXXX 0951'). Empty if the model did not read the header."
+        ),
     )
     cardholder: str = Field(
         default="",
@@ -205,6 +207,7 @@ class StatementMetadata(BaseModel):
     )
     currency: str = Field(
         default="",
+        min_length=3,
         max_length=3,
         description="ISO-4217 currency code: 'CLP' for NACIONAL, 'USD' for INTERNACIONAL. Empty if the model did not emit it; the orchestrator fills it from the detected variant.",
     )
@@ -262,7 +265,7 @@ class ExtractionResponse(BaseModel):
     later review.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     transactions: list[TransactionExtraction] = Field(
         min_length=0,
