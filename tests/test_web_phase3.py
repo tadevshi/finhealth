@@ -341,6 +341,8 @@ async def test_dashboard_shell_navigation_uses_valid_active_links(client: AsyncC
     assert 'href="/recurring"' not in body
     assert 'href="/settings"' not in body
     assert 'href="/anomaly"' not in body
+    assert 'data-testid="shared-navigation"' not in body
+    assert "Phase 0 foundation." not in body
     assert 'aria-current="page"' in body
     assert body.count('data-testid="dashboard-nav-link"') == 4
     assert body.count('data-testid="dashboard-mobile-nav-link"') == 4

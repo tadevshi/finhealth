@@ -129,6 +129,10 @@ async def _query_transactions(
         # ``func.lower`` on both sides so the SQL is portable.
         needle = f"%{description.lower()}%"
         query = query.where(func.lower(Transaction.description).like(needle))
+    # The form's "All" option serialises as ``currency=``; FastAPI binds
+    # that empty value as an empty string, which means "no currency filter".
+    if currency == "":
+        currency = None
     if currency is not None:
         query = query.where(Transaction.currency == currency)
 
