@@ -195,19 +195,45 @@
          :class="{% block sidebar_classes %}{% endblock %}">
         {% block topbar %}
         <header class="border-b border-border bg-canvas">
-            <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
-                <a href="/" class="text-xl font-semibold text-text-primary">
+            <div class="max-w-5xl mx-auto flex flex-wrap items-center justify-between gap-x-4 gap-y-3 px-4 py-4">
+                <a href="/" class="order-1 text-xl font-semibold text-text-primary">
                     {{ app_name }}
                 </a>
+                {% set current_path = request.url.path %}
+                <nav class="order-3 flex w-full items-center gap-1 overflow-x-auto sm:order-2 sm:w-auto"
+                     aria-label="Primary navigation"
+                     data-testid="shared-navigation">
+                    <a href="/dashboard"
+                       {% if current_path == '/dashboard' %}aria-current="page"{% endif %}
+                       data-testid="shared-nav-link"
+                       class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs
+                              {% if current_path == '/dashboard' %}bg-accent/15 font-semibold text-accent-light ring-1 ring-accent/30{% else %}font-medium text-text-secondary hover:bg-surface-container-high hover:text-text-primary{% endif %}">
+                        Dashboard
+                    </a>
+                    <a href="/transactions"
+                       {% if current_path == '/transactions' %}aria-current="page"{% endif %}
+                       data-testid="shared-nav-link"
+                       class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs
+                              {% if current_path == '/transactions' %}bg-accent/15 font-semibold text-accent-light ring-1 ring-accent/30{% else %}font-medium text-text-secondary hover:bg-surface-container-high hover:text-text-primary{% endif %}">
+                        Transactions
+                    </a>
+                    <a href="/upload"
+                       {% if current_path == '/upload' %}aria-current="page"{% endif %}
+                       data-testid="shared-nav-link"
+                       class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs
+                              {% if current_path == '/upload' %}bg-accent/15 font-semibold text-accent-light ring-1 ring-accent/30{% else %}font-medium text-text-secondary hover:bg-surface-container-high hover:text-text-primary{% endif %}">
+                        Upload
+                    </a>
+                </nav>
                 <button
                     type="button"
                     data-testid="dark-mode-toggle"
                     aria-label="Toggle dark mode"
-                    class="px-3 py-1.5 rounded-md text-sm font-medium
+                    class="order-2 shrink-0 px-3 py-1.5 rounded-md text-sm font-medium
                            bg-surface-container-high hover:bg-surface-container-higher
                            text-text-primary
                            focus:outline-none focus:ring-2 focus:ring-offset-2
-                           focus:ring-accent"
+                           focus:ring-accent sm:order-3"
                     @click="toggle()"
                     x-text="isDark ? '☀ Light' : '☾ Dark'"
                 ></button>
@@ -217,15 +243,15 @@
         <main class="flex-1">
             {% block content %}{% endblock %}
         </main>
-    </div>
 
-    {# --- Footer (optional but cheap) ------------------------------------ #}
-    {% block dashboard_footer %}
-    <footer class="border-t border-gray-200 dark:border-gray-700">
-        <div class="max-w-5xl mx-auto px-4 py-4 text-sm text-gray-500 dark:text-gray-400">
-            {{ app_name }} &mdash; Phase 0 foundation.
-        </div>
-    </footer>
-    {% endblock %}
+        {# --- Footer (optional but cheap) -------------------------------- #}
+        {% block dashboard_footer %}
+        <footer class="w-full shrink-0 border-t border-gray-200 dark:border-gray-700">
+            <div class="max-w-5xl mx-auto px-4 py-4 text-sm text-gray-500 dark:text-gray-400">
+                {{ app_name }} &mdash; Phase 0 foundation.
+            </div>
+        </footer>
+        {% endblock %}
+    </div>
 </body>
 </html>

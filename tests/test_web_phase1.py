@@ -78,6 +78,16 @@ CATEGORY_SELECT_TESTID = 'data-testid="category-select"'
 DESCRIPTION_TESTID = 'data-testid="transaction-description"'
 AMOUNT_TESTID = 'data-testid="transaction-amount"'
 
+# The form's "All" currency option submits an explicit empty value.
+BLANK_CURRENCY_MATCHING_FILTERS = {
+    "currency": "",
+    "date_from": "2026-04-15",
+    "date_to": "2026-04-15",
+    "min_amount": "89900",
+    "max_amount": "89900",
+    "description": "PARIS",
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -317,6 +327,57 @@ async def test_upload_page_returns_200_html(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", [UPLOAD_PATH, TRANSACTIONS_PATH])
+async def test_shared_pages_render_correct_footer_structure(client: AsyncClient, path: str) -> None:
+    """The default footer stays inside the shared main content column."""
+    body = (await client.get(path)).text
+    content_column_start = body.index('<div class="flex-1 flex flex-col min-w-0"')
+    main_start = body.index('<main class="flex-1">', content_column_start)
+    main_end = body.index("</main>", main_start)
+    footer_start = body.index(
+        '<footer class="w-full shrink-0 border-t border-gray-200 dark:border-gray-700">'
+    )
+    footer_end = body.index("</footer>", footer_start)
+    content_column_end = body.rfind("</div>", 0, body.index("</body>"))
+
+    assert content_column_start < main_start < main_end < footer_start
+    assert footer_end < content_column_end
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "active_path"),
+    [(UPLOAD_PATH, UPLOAD_PATH), (TRANSACTIONS_PATH, TRANSACTIONS_PATH)],
+)
+async def test_non_dashboard_pages_render_shared_navigation(
+    client: AsyncClient, path: str, active_path: str
+) -> None:
+    """Upload and transactions expose the shared dashboard destinations."""
+    body = (await client.get(path)).text
+    nav_start = body.index('<nav class="order-3 flex w-full')
+    nav_end = body.index("</nav>", nav_start)
+    nav = body[nav_start:nav_end]
+
+    for destination in ("/dashboard", TRANSACTIONS_PATH, UPLOAD_PATH):
+        assert f'href="{destination}"' in nav
+        response = await client.get(destination)
+        assert response.status_code == 200
+
+    active_start = nav.index(f'<a href="{active_path}"')
+    active_end = nav.index("</a>", active_start)
+    active_link = nav[active_start:active_end]
+    assert 'aria-current="page"' in active_link
+    assert "bg-accent/15" in active_link
+
+    for destination in ("/dashboard", TRANSACTIONS_PATH, UPLOAD_PATH):
+        if destination == active_path:
+            continue
+        link_start = nav.index(f'<a href="{destination}"')
+        link_end = nav.index("</a>", link_start)
+        assert 'aria-current="page"' not in nav[link_start:link_end]
+
+
+@pytest.mark.asyncio
 async def test_upload_page_extends_base_layout(client: AsyncClient) -> None:
     """The page inherits the shared ``base.html`` (Tailwind, HTMX, Alpine)."""
     body = (await client.get(UPLOAD_PATH)).text
@@ -534,6 +595,19 @@ async def test_transactions_page_filter_by_currency(
     assert "No transactions match" in body
 
 
+@pytest.mark.asyncio
+async def test_transactions_page_blank_currency_preserves_matching_filters(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """An empty currency value behaves like the form's unfiltered "All" option."""
+    response = await client.get(TRANSACTIONS_PATH, params=BLANK_CURRENCY_MATCHING_FILTERS)
+    body = response.text
+    assert response.status_code == 200
+    assert "PARIS" in body
+    assert body.count(ROW_TESTID) == 1
+    assert "No transactions match" not in body
+
+
 # ---------------------------------------------------------------------------
 # HTMX partial
 # ---------------------------------------------------------------------------
@@ -579,6 +653,19 @@ async def test_transactions_rows_filter_by_description(
     body = response.text
     assert "PARIS" in body
     assert "SUPERMERCADOS" not in body
+
+
+@pytest.mark.asyncio
+async def test_transactions_rows_blank_currency_preserves_matching_filters(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """The HTMX partial treats an empty currency value as no currency filter."""
+    response = await client.get(ROWS_PATH, params=BLANK_CURRENCY_MATCHING_FILTERS)
+    body = response.text
+    assert response.status_code == 200
+    assert "PARIS" in body
+    assert body.count(ROW_TESTID) == 1
+    assert "No transactions match" not in body
 
 
 @pytest.mark.asyncio
