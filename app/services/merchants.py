@@ -63,6 +63,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Insert-scoped uniqueness recovery (deterministic path only): only these
+# two insert sites may swallow an ``IntegrityError``; all else propagates.
+
+_MERCHANT_NAME_UNIQUE_KEY: Final = "ix_merchants_name"
+_ALIAS_TEXT_UNIQUE_KEY: Final = "merchant_aliases_alias_text_key"
+
+
+def _is_target_unique_violation(exc: IntegrityError, unique_key: str) -> bool:
+    """True only for a PostgreSQL unique violation on ``unique_key``.
+
+    The asyncpg adapter exposes the SQLSTATE (23505) on the wrapped exception;
+    the raw driver error carrying the violated index/constraint name is in
+    ``__cause__``.
+    """
+    orig = exc.orig
+    if getattr(orig, "sqlstate", None) != "23505":
+        return False
+    for candidate in (orig, getattr(orig, "__cause__", None)):
+        if getattr(candidate, "constraint_name", None) == unique_key:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # KNOWN_MERCHANT_PATTERNS (D1, D4)
 # ---------------------------------------------------------------------------
@@ -407,32 +430,26 @@ class MerchantNormalizer:
             default_category_id=default_category.id if default_category is not None else None,
             is_active=True,
         )
-        session.add(merchant)
+        # Flush caller-owned pending work BEFORE the guarded insert so an
+        # unrelated caller flush failure is never mistaken for a race.
+        await session.flush()
         try:
-            # Flush so the merchant gets a UUID before we
-            # build the alias row that references it. The
-            # ``UNIQUE(merchants.name)`` constraint is
-            # enforced now, and a concurrent ingest that
-            # won the race for the same canonical key
-            # (e.g. ``"MCDONALDS SUC 12"`` and
-            # ``"MCDONALDS SUC 13"`` both normalising to
-            # ``"mcdonalds"``) raises an ``IntegrityError``
-            # that we catch and recover from below.
-            await session.flush()
-        except IntegrityError:
-            # A concurrent ingest won the race for the
-            # merchant row. Roll back our insert and
-            # re-query the merchant table to bind the
-            # alias to the winning row. The race is a
-            # defensive measure; the single-user
-            # use-case means it almost never fires in
-            # practice, but the error path is here so
-            # the second concurrent upload is not lost.
-            await session.rollback()
-            rerun_merchant = await session.execute(
-                select(Merchant).where(Merchant.name == canonical)
-            )
-            merchant = rerun_merchant.scalar_one()
+            # Insert-scoped savepoint: a lost race rolls back ONLY this
+            # candidate insert, leaving earlier caller-owned writes intact.
+            async with session.begin_nested():
+                session.add(merchant)
+                await session.flush()
+        except IntegrityError as exc:
+            if not _is_target_unique_violation(exc, _MERCHANT_NAME_UNIQUE_KEY):
+                raise
+            # Re-query the winner; no rollback/commit — the caller owns
+            # the outer transaction boundary.
+            winner = (
+                await session.execute(select(Merchant).where(Merchant.name == canonical))
+            ).scalar_one_or_none()
+            if winner is None:
+                raise
+            merchant = winner
 
         alias = MerchantAlias(
             merchant_id=merchant.id,
@@ -441,38 +458,25 @@ class MerchantNormalizer:
             source=MerchantAliasSource.AUTO,
             confidence=None,
         )
-        session.add(alias)
         try:
-            # Flush the alias so the ``UNIQUE(alias_text)``
-            # constraint is enforced now. The session-level
-            # commit happens later in the ingestion
-            # orchestrator; flushing here turns a race
-            # collision into an immediate IntegrityError
-            # that we can catch and recover from (per
-            # design decision D3).
-            await session.flush()
-        except IntegrityError:
-            # A concurrent ingest won the race for this
-            # raw alias. Roll back our insert and
-            # re-query the alias table to return the
-            # winning merchant. The race is a
-            # defensive measure; the single-user
-            # use-case means it almost never fires in
-            # practice, but the error path is here so
-            # the second concurrent upload is not lost.
-            await session.rollback()
-            rerun = await session.execute(
-                select(MerchantAlias).where(MerchantAlias.normalized == canonical)
-            )
-            winner = rerun.scalar_one_or_none()
-            if winner is not None:
-                return winner.merchant, False
-            # If the rerun also misses (extremely
-            # unlikely — the unique constraint is on
-            # the raw text, not the normalized), we
-            # re-raise so the operator can
-            # investigate.
-            raise
+            # Separate savepoint: a merchant-name conflict can bind a NEW
+            # alias to the existing merchant; alias-text recovers alone.
+            async with session.begin_nested():
+                session.add(alias)
+                await session.flush()
+        except IntegrityError as exc:
+            if not _is_target_unique_violation(exc, _ALIAS_TEXT_UNIQUE_KEY):
+                raise
+            # The constraint is on the RAW ``alias_text``; re-query by the
+            # exact key, not by the non-unique ``normalized``.
+            alias_winner = (
+                await session.execute(
+                    select(MerchantAlias).where(MerchantAlias.alias_text == description)
+                )
+            ).scalar_one_or_none()
+            if alias_winner is None:
+                raise
+            return alias_winner.merchant, False
 
         return merchant, True
 

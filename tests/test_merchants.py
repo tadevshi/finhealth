@@ -33,15 +33,25 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from datetime import date
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.main import create_app
-from app.models import Category, Merchant, MerchantAlias
+from app.models import (
+    Bank,
+    Category,
+    CreditCard,
+    Merchant,
+    MerchantAlias,
+    Statement,
+    StatementStatus,
+)
 from app.models.merchant import MerchantAliasSource
 from app.services.llm.schemas import ExtractionResponse, StatementMetadata
 from app.services.merchants import (
@@ -906,3 +916,123 @@ class TestNormalizeEdgeCases:
     def test_normalize_collapses_whitespace(self) -> None:
         """Runs of whitespace are collapsed to a single space and trimmed."""
         assert normalize("  MCDONALDS   SUC   12  ") == "mcdonalds"
+
+
+async def _add_pending_statement(session: AsyncSession) -> Statement:
+    """Add an uncommitted pending ingestion-style statement (caller-owned work).
+
+    A ``Session.rollback()`` inside ``resolve_merchant`` would discard it.
+    """
+    bank = Bank(name=f"bank-{uuid.uuid4().hex[:8]}", display_name="Banco", password_formula="x")
+    card = CreditCard(
+        bank=bank, card_number_masked="****1111", cardholder="Test User", currency="CLP"
+    )
+    statement = Statement(
+        credit_card=card,
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        statement_date=date(2026, 9, 5),
+        file_path="uploads/test.pdf",
+        file_hash=uuid.uuid4().hex,
+        status=StatementStatus.PENDING,
+    )
+    session.add(statement)
+    await session.flush()
+    return statement
+
+
+async def _committed_count(engine: AsyncEngine, model: type, **filters: object) -> int:
+    """Count committed rows matching ``filters`` from a fresh independent session."""
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as fresh:
+        result = await fresh.execute(select(func.count()).select_from(model).filter_by(**filters))
+        return int(result.scalar_one())
+
+
+class TestDeterministicConflictRecovery:
+    """Real PostgreSQL insert conflicts inside ``resolve_merchant`` (not lookup
+    hits); caller-owned pending work must survive each recovery.
+    """
+
+    async def test_merchant_name_conflict_preserves_pending_caller_work(
+        self, engine, session_with_categories, categories_by_name
+    ) -> None:
+        """Merchant-name conflict recovers to the winner, keeping caller work."""
+        # Winner has NO alias: the candidate INSERT hits ``ix_merchants_name``.
+        winner = Merchant(name="mcdonalds", is_active=True)
+        session_with_categories.add(winner)
+        await session_with_categories.commit()
+        statement = await _add_pending_statement(session_with_categories)
+
+        merchant, was_new = await MerchantNormalizer().resolve_merchant(
+            session_with_categories, "MCDONALDS SUC 12", categories_by_name
+        )
+        await session_with_categories.commit()
+
+        assert merchant is not None and merchant.id == winner.id and was_new is True
+        assert await _committed_count(engine, Statement, id=statement.id) == 1
+        assert await _committed_count(engine, MerchantAlias, alias_text="MCDONALDS SUC 12") == 1
+
+    async def test_raw_alias_conflict_recovers_to_existing_winner(
+        self, engine, session_with_categories, categories_by_name
+    ) -> None:
+        """A UNIQUE(alias_text) conflict recovers via the exact raw key."""
+        # Winner alias: SAME raw text, DIFFERENT normalized value, so the
+        # lookup misses and recovery must re-query by exact raw ``alias_text``.
+        winner = Merchant(name="paris tienda", is_active=True)
+        session_with_categories.add(winner)
+        session_with_categories.add(
+            MerchantAlias(merchant=winner, alias_text="PARIS 03/06", normalized="paris cuota")
+        )
+        await session_with_categories.commit()
+        statement = await _add_pending_statement(session_with_categories)
+
+        merchant, was_new = await MerchantNormalizer().resolve_merchant(
+            session_with_categories, "PARIS 03/06", categories_by_name
+        )
+        await session_with_categories.commit()
+
+        assert merchant is not None and merchant.id == winner.id and was_new is False
+        assert await _committed_count(engine, Statement, id=statement.id) == 1
+        # The candidate "paris" merchant was created inside the failed savepoint.
+        assert await _committed_count(engine, Merchant, name="paris") == 0
+        assert await _committed_count(engine, MerchantAlias, alias_text="PARIS 03/06") == 1
+
+    async def test_non_target_integrity_error_propagates(
+        self, engine, session_with_categories, categories_by_name
+    ) -> None:
+        """A non-unique integrity failure propagates instead of false success."""
+        # Known-pattern description + nonexistent default category id -> the
+        # candidate merchant INSERT violates the FK (not a uniqueness race).
+        ghost = Category(name="Ghost", display_name="Ghost", sort_order=99)
+        ghost.id = uuid.uuid4()
+        broken = {**categories_by_name, "dining out": ghost}
+        await _add_pending_statement(session_with_categories)
+
+        with pytest.raises(IntegrityError):
+            await MerchantNormalizer().resolve_merchant(
+                session_with_categories, "MCDONALDS SUC 12", broken
+            )
+
+        assert await _committed_count(engine, Merchant, name="mcdonalds") == 0
+
+    async def test_ambiguous_normalized_alias_does_not_pick_a_winner(
+        self, session_with_categories, categories_by_name
+    ) -> None:
+        """Ambiguous normalized aliases propagate instead of picking a winner."""
+        # The normalized index is non-unique by design: two committed aliases
+        # with the same normalized value must never be silently resolved.
+        first, second = (
+            Merchant(name=name, is_active=True) for name in ("mcdonalds", "mac donalds")
+        )
+        session_with_categories.add_all([first, second])
+        for merchant, text in ((first, "MCDONALDS SUC 12"), (second, "MAC DONALDS")):
+            session_with_categories.add(
+                MerchantAlias(merchant=merchant, alias_text=text, normalized="mcdonalds")
+            )
+        await session_with_categories.commit()
+
+        with pytest.raises(MultipleResultsFound):
+            await MerchantNormalizer().resolve_merchant(
+                session_with_categories, "MCDONALDS SUC 13", categories_by_name
+            )
