@@ -369,3 +369,188 @@ final verification.
 - Native SDD attempt token from the parent prompt: PR2 attempt recorded;
   persisted-task checkboxes for sections 2.1–2.3 marked `[x]` in
   `tasks.md` (re-read and confirmed).
+
+## Status: PR 3 complete — Ready for verify (PR 3 slice)
+
+PR 3 (nested metadata schemas and internal parent planning) is implemented
+under strict TDD with PostgreSQL-backed evidence. PR1/PR2 files are
+untouched (`app/services/merchants.py`, `tests/test_merchants.py`,
+models, migrations, ingestion, routes all unmodified). PR4 (persistence +
+routes) and PR5 are not started. No route persistence exists: the service
+stops at an explicit, test-pinned `NotImplementedError` boundary after
+planning succeeds, and `app/api/v1/transactions.py` has no POST handlers.
+
+Delivery decision consumed from the parent prompt (recorded here per the
+`ask-on-risk` gate): `feature-branch-chain`, PR3 slice assigned with a
+declared 350-changed-line budget and a native attempt token.
+
+## Changed lines (PR 3 slice)
+
+| File | Additions | Deletions |
+|---|---|---|
+| `app/schemas/__init__.py` | 6 | 0 |
+| `app/schemas/domain.py` | 125 | 4 |
+| `app/services/transaction_creation.py` (new) | 331 | 0 |
+| `tests/test_transaction_creation.py` (new) | 637 | 0 |
+| **Authored total (additions + deletions)** | **1103** | |
+
+Measured with `git diff --numstat` plus new-file line counts. **This
+slice exceeds the declared 350-line budget (1103 authored lines).** The
+overage is structural, not accidental: tasks 3.1–3.4 enumerate ~25
+distinct behaviors (four required metadata fields, ten forbidden nested
+fields, money float/bool/non-finite/precision/range rules, installment
+INTEGER overflow, batch bounds and indexed locations, six planner rules
+plus bounds/no-writes/boundary tests), and strict TDD requires one
+failing test per behavior before implementation. **Budget-breach
+decision referred to the parent** under `ask-on-risk`: either re-slice
+PR3 into 3a (schemas + schema tests) and 3b (planner service + service
+tests) as separate chain entries, or explicitly accept `size:exception`
+before PR creation. No commit was made, so re-slicing before the PR
+boundary is still possible. Coverage was not trimmed to force the budget
+because every test maps 1:1 to an enumerated task behavior.
+
+## TDD Cycle Evidence (PR 3)
+
+Command prefix for every run below:
+
+```sh
+POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth \
+POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 \
+POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest
+```
+
+### RED (tasks 3.1 + 3.3)
+
+- Schema RED: `pytest tests/test_transaction_creation.py -q --no-cov` →
+  collection `ImportError: cannot import name 'StatementMetadataCreate'
+  from 'app.schemas'` (schema additions absent).
+- Planner RED: after schemas landed, appending the service tests →
+  collection `ImportError` on `app.services.transaction_creation`
+  (module absent).
+
+### GREEN (tasks 3.2 + 3.4)
+
+- `pytest tests/test_transaction_creation.py -q --no-cov` → `62 passed`
+  after the schema additions (metadata closure/period rules, extended
+  `TransactionCreate` with `category_id`/`statement`/money guard/
+  INTEGER bounds, bounded batch contracts and indexed locations).
+- `pytest tests/test_transaction_creation.py -q --no-cov` → `79 passed`
+  after the planning service (conflict/required/duplicate codes with
+  field+index attribution, metadata-anywhere, mixed IDs, unknown-card
+  404, lowest-index precedence, no-writes, persistence boundary).
+
+### TRIANGULATE (task 3.4)
+
+- Added multiple-new-parents (two new UUIDs, metadata on first and last
+  items, distinct authoritative objects) and a USD-card plan (currency
+  resolved from the card row, not assumed CLP).
+- Parametrized boundaries already in the suite: metadata at first/middle/
+  last index; existing-parent conflict with matching AND mismatching
+  metadata; duplicate metadata identical AND conflicting; three
+  lowest-index-wins orderings across 409/422 classes; plan-definition
+  pass preceding card lookup (higher-index plan violation beats
+  lower-index unknown-card 404, per the design's validation order).
+- Result: `81 passed in 4.19s`.
+
+### REFACTOR
+
+- Merged the double `isinstance` in the money guard (SIM101), replaced a
+  dict-comprehension that mypy rejected in `dict()` form with an indexed
+  row projection (C416 vs SQLAlchemy `Result` typing), moved the service
+  import into the top import block (drops `noqa: E402`), switched the
+  test timestamp to `datetime.UTC` (UP017), and ran `ruff format`.
+  No behavior change; suite re-run green (`81 passed`).
+
+## Verification evidence (PR 3)
+
+| Command | Result |
+|---|---|
+| `... pytest tests/test_transaction_creation.py -q --no-cov` | `81 passed in 4.35s` |
+| `... pytest tests/test_transaction_creation.py tests/test_merchants.py tests/test_transactions.py tests/test_models.py tests/test_categories.py -q --no-cov` | `151 passed in 16.42s` |
+| `... pytest tests/test_ingestion.py tests/test_web_phase1.py tests/test_health.py tests/test_db.py -q --no-cov` | `103 passed, 50 skipped in 18.08s` — skips are exclusively TEST_RUT real-PDF E2E prerequisites (unavailable, not passed) |
+| `ruff check app tests` | All checks passed |
+| `ruff format --check` (4 touched files) | All formatted |
+| `mypy --strict app/services/transaction_creation.py app/schemas/domain.py app/schemas/__init__.py` (clean cache) | 0 errors in these files; full `mypy --strict app/` shows the 6 pre-existing baseline errors elsewhere (dashboard, seed_demo, llm client, web/router ×3) and none in PR3 files |
+
+Runtime harness scenario: PostgreSQL-backed disposable databases via the
+`engine` fixture for every planner test (planning reads real persisted
+parents/cards); schema tests are pure Pydantic. No skipped database test
+was used as evidence.
+
+## Implementation notes and deviations from design
+
+- The planner implements the design's two-phase validation order: the
+  parent-definition pass (409 existing+metadata / 422 missing / 422
+  duplicate, lowest offending index) runs before card resolution
+  (unknown new-parent card → 404 at its metadata index). A test pins
+  this precedence.
+- `plan_parents` is an internal seam the caller must invoke inside an
+  active transaction; `create_many` owns the single outer transaction
+  (`session.begin()` before the first read) and re-enforces the 1–200
+  batch bounds before opening it (`invalid_batch`).
+- Two defensive `creation_failed` branches exist for parent-linkage
+  integrity (persisted parent without card row; new plan without
+  metadata/card after validation). Both are unreachable through
+  FK-consistent data (the statement→card FK cannot be violated in a
+  seeded test), so they are untestable by construction; the design maps
+  invalid parent linkage to a generic 500 `creation_failed`, which is
+  what these branches raise. Recorded here rather than silently omitted.
+- `TransactionCreate` gained the creation-only money guard and INTEGER
+  `le` bounds directly (it is the creation schema and currently unused
+  by any route); `TransactionResponse` and PDF-specific
+  `StatementCreate` are unchanged, per tasks 3.2.
+- Metadata objects are compared never: an existing parent plus any
+  non-null metadata object conflicts regardless of values, so "matching"
+  is only exercised as identical-to-persisted input in tests.
+
+- Task 3.4's batch-fetch bullet lists "statements/cards/categories";
+  planning needs only statements and cards, so this slice fetches those.
+  The category set is fetched once each for per-item category/currency
+  validation in PR4 (design steps 2 and 5), which is where unknown
+  category 404s are specified (tasks 4.1).
+
+## Workload / PR boundary
+
+- PR boundary: creation-only schemas + internal parent-planning service
+  skeleton and their tests. No models, migrations, ingestion, merchants,
+  routes, docs, or PR1/PR2 behavior changes. The service performs reads
+  only and never persists; routes are absent.
+- Changed-line count: 1103 authored (additions + deletions) — **exceeds
+  the 350-line slice budget**; parent decision required before PR
+  creation (see Changed lines section).
+- Rollback boundary: delete `app/services/transaction_creation.py`,
+  `tests/test_transaction_creation.py`, and revert the schema additions
+  in `app/schemas/domain.py` (new `StatementMetadataCreate`,
+  `TransactionBatchCreate`, `TransactionBatchResponse`, `category_id`/
+  `statement` fields, money guard, installment `le` bounds) and the six
+  export lines in `app/schemas/__init__.py`. PR2 statement
+  compatibility (nullable files, source) remains intact; no data or
+  migration state is affected because this slice writes nothing. No
+  commit was made.
+
+## Remaining tasks (exact unchecked lines from tasks.md)
+
+Sections 4.1–4.4 (PR4), 5.1–5.5 (PR5), and section 6 final bookkeeping
+remain unchecked, plus the three scope guardrails at the top of the file
+(checked at final verification). PR3 sections 3.1–3.4 are fully checked
+(16 boxes re-read and confirmed `[x]`).
+
+## Structured status
+
+- Change: `add-transaction-creation-api`; artifact store: openspec
+  (Engram unavailable — evidence persisted here and in `tasks.md`
+  checkbox updates only; no memory-tool persistence claimed).
+- `actionContext`: repo-local, workspace root
+  `/home/tadashi/orca/workspaces/finhealth/transactions-api`; all edits
+  stayed inside the allowed edit roots and the declared PR3 surfaces
+  (`app/schemas/domain.py`, `app/schemas/__init__.py`, new
+  `app/services/transaction_creation.py`, new
+  `tests/test_transaction_creation.py`, PR3 sections of `tasks.md` and
+  this file).
+- Skill resolution: `paths-injected` (gentle-ai, work-unit-commits,
+  cognitive-doc-design SKILL.md files read before work; no registry
+  discovery, no child subagents spawned).
+- Native SDD attempt token from the parent prompt: PR3 attempt
+  `sha256:b6890e9494ae3ccb6f047a4be15f7abc1836bbb1b2d1c30e927625946d7a12fb`
+  recorded; persisted-task checkboxes for sections 3.1–3.4 marked `[x]`
+  in `tasks.md` (re-read and confirmed).
