@@ -554,3 +554,226 @@ remain unchecked, plus the three scope guardrails at the top of the file
   `sha256:b6890e9494ae3ccb6f047a4be15f7abc1836bbb1b2d1c30e927625946d7a12fb`
   recorded; persisted-task checkboxes for sections 3.1–3.4 marked `[x]`
   in `tasks.md` (re-read and confirmed).
+
+## Status: PR 4 complete — Ready for verify (PR 4 slice)
+
+PR 4 (atomic statement+transaction creation and public routes) is
+implemented under strict TDD with PostgreSQL-backed evidence. PR1–PR3
+files are untouched (`app/services/merchants.py`, models, migrations,
+ingestion, schemas, statement routes all unmodified). PR5 (race/rollback
+hardening, docs, full verification) is not started. The service's
+`NotImplementedError` persistence boundary is replaced by the full atomic
+write path, and `POST /api/v1/transactions` + `POST /api/v1/transactions/batch`
+are mounted in the existing transactions router (no `router.py` change —
+the transactions router was already registered).
+
+Delivery decision consumed from the parent prompt (recorded here per the
+`ask-on-risk` gate): `feature-branch-chain`, PR4 slice assigned with a
+declared 350-changed-line budget and a native attempt token; **the
+maintainer explicitly accepts `size:exception` for oversized
+implementation PRs**, so the budget overage below is authorized.
+
+## Changed lines (PR 4 slice)
+
+| File | Additions | Deletions |
+|---|---|---|
+| `app/api/v1/transactions.py` | 160 | 10 |
+| `app/services/transaction_creation.py` | 320 | 32 |
+| `tests/test_transaction_creation.py` | 519 | 24 |
+| `tests/test_transaction_creation_http.py` (new) | 526 | 0 |
+| **Authored total (additions + deletions)** | **1591** | |
+
+Measured with `git diff --numstat` plus the new-file line count.
+**This slice exceeds the declared 350-line budget (1591 authored
+lines).** The overage is structural: tasks 4.1–4.4 enumerate ~25
+distinct persistence/policy/HTTP behaviors and strict TDD requires one
+failing test per behavior; the maintainer's `size:exception` acceptance
+(from the parent prompt) covers this slice. No commit was made.
+
+## TDD Cycle Evidence (PR 4)
+
+Command prefix for every run below:
+
+```sh
+POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth \
+POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 \
+POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest
+```
+
+### RED (tasks 4.1 + 4.3)
+
+Command: `... pytest tests/test_transaction_creation.py
+tests/test_transaction_creation_http.py -q --no-cov`
+Result: `45 failed, 81 passed in 14.35s`
+
+* Service persistence RED: all 27 new `TestAtomicPersistence` tests
+  failed with `NotImplementedError: transaction persistence lands in
+  the next chain slice (PR4)` at the PR3 boundary — the planning half
+  passed, no write path existed.
+* HTTP RED: all 18 new route tests failed with `405 Method Not
+  Allowed` — no POST handlers existed.
+* The 81 passing tests are the pre-existing PR3 schema/planner suite,
+  confirming no regression at the RED stage.
+
+### GREEN (tasks 4.2 + 4.3)
+
+Change: completed `TransactionCreationService.create_many` on top of the
+same planning pass — `_fetch_categories` (one query, keyed by ID and
+lowercase name), `_validate_items` (currency + explicit category in
+input order, first failure raises with its index), `_create_new_statements`
+(canonical UUID order, individually flushed, `source=api`,
+`status=completed`, null files/error, supplied UUID/card/dates; only
+statement-PK `23505`+`pk_statements` maps to
+`statement_creation_conflict`, all other DB failures abort generically),
+`_build_transaction_rows` (merchant resolution for all items, rows added
+and flushed once after enrichment, explicit field allowlist, category
+precedence table, at-most-one deprecation warning per request,
+merchant length-bounds guard, no LLM path), and `_snapshot_rows`
+(one re-select populates SQL-expression defaults; response snapshots
+built before commit, returned only after the outer context exits).
+Routes: thin POST handlers in `app/api/v1/transactions.py` delegating to
+`TransactionCreationService.create_many([payload])` /
+`(payload.transactions)` with a single code→status mapping table
+(`{"detail": {"code", "message", "field"?, "index"?}}`; single-route
+mapping omits index) and JSONResponse bodies via `model_dump(mode="json")`
+(matching the statements-upload response convention for Decimal
+encoding). One service path serves single and batch.
+
+* `pytest tests/test_transaction_creation.py -q --no-cov` → `105 passed`
+  (after green; included the 2 obsolete-assert fixes in new tests).
+* `pytest tests/test_transaction_creation_http.py -q --no-cov` →
+  `20 passed`.
+
+### TRIANGULATE (tasks 4.4)
+
+* Batch 200 success with accurate count; 0/201 rejected 422 with zero
+  writes (HTTP).
+* Duplicate-looking identical items in one batch and repeated identical
+  submissions create distinct rows (HTTP: 3 identical items → 3 distinct
+  IDs; +1 repeat submission → 4 rows).
+* API append to an existing PDF statement leaves `source=pdf` and file
+  fields intact (HTTP).
+* Concurrent parent commit between the planning read and the parent
+  insert (hooked `_fetch_statement_cards` barrier): loser receives 409
+  `statement_creation_conflict` (field `statement_id`, index 0) with
+  zero request-owned writes, winner intact, and an explicit ID-only
+  retry succeeds (service).
+* Category precedence parametrized with/without legacy string; currency
+  policy parametrized across CLP/USD/`EUR`/lowercase `clp`/mismatch in
+  both directions; long-description guard parametrized at raw 201 and
+  canonical 109 (`MCDONALDS SUC 12 ` × 11); deprecation warning logged
+  exactly once for two legacy items and never for ID-only input.
+* Regression suites: `pytest tests/test_transactions.py
+  tests/test_merchants.py tests/test_categories.py tests/test_models.py
+  tests/test_ingestion.py -q --no-cov` → `116 passed, 50 skipped`
+  (skips are exclusively TEST_RUT real-PDF E2E prerequisites —
+  unavailable, not passed). GET filters, PATCH form/HTML/JSON, PATCH
+  clear sentinel, category, merchant and ingestion behavior unchanged.
+
+### REFACTOR
+
+* Removed the obsolete PR3 boundary pin
+  (`test_create_many_stops_at_persistence_boundary`) — superseded by the
+  completed persistence path.
+* Fixed the `_fetch_cards` eager-load hazard discovered by the
+  concurrent-conflict test: `select(CreditCard)` fired `lazy="selectin"`
+  on `statements` and pulled a concurrently committed winner into the
+  session identity map, emitting a SQLAlchemy identity-conflict warning
+  before the PK race resolved. The card fetch now uses
+  `noload(CreditCard.bank)` / `noload(CreditCard.statements)`; the race
+  surfaces as the database's own unique violation, mapped cleanly to
+  409. Suite re-run with `-W error::sqlalchemy.exc.SAWarning` →
+  `125 passed, 0 warnings`.
+* Dropped unused variables/imports, renamed the discriminator's fake
+  diagnostic class (N818), and ran `ruff format` on all four touched
+  files. No behavior change; suite re-run green (`125 passed`).
+
+## Verification evidence (PR 4)
+
+| Command | Result |
+|---|---|
+| `... pytest tests/test_transaction_creation.py tests/test_transaction_creation_http.py -q --no-cov` | `125 passed in 15.65s` (final, with `-W error::sqlalchemy.exc.SAWarning`) |
+| `... pytest tests/test_transactions.py tests/test_merchants.py tests/test_categories.py tests/test_models.py tests/test_ingestion.py -q --no-cov` | `116 passed, 50 skipped in 17.50s` — skips are exclusively TEST_RUT/sample-PDF E2E prerequisites (unavailable, not passed) |
+| `ruff check app tests` | All checks passed |
+| `ruff format --check` (4 touched files) | All formatted |
+| `mypy --strict app/` (clean cache) | 6 errors — all pre-existing baseline (dashboard, seed_demo, llm client, web/router ×3); 0 in PR4 files |
+
+Runtime harness scenario: real PostgreSQL 16 disposable databases
+created and dropped per test (`tests/conftest.py`); every
+persistence/atomicity/conflict assertion ran against real PostgreSQL, and
+durable-state assertions use independent sessions. No skipped database
+test was used as evidence. Real-PDF E2E remains environment-dependent
+(`TEST_RUT` + sample PDFs) — recorded as unavailable.
+
+## Implementation notes and deviations from design
+
+- Response serialization follows the statements-upload route's existing
+  convention (`JSONResponse` + `model_dump(mode="json")`), so Decimal
+  amounts serialize as strings in creation responses. Existing GET/PATCH
+  responses are untouched (their Decimal encoding is unchanged).
+- The single route omits `index` from error envelopes per the design's
+  error-mapping contract ("single-route mapping omits index"); batch
+  domain errors keep the zero-based index.
+- `_snapshot_rows` re-selects the flushed rows in one query so
+  `created_at`/`updated_at` (SQL-expression defaults) populate without a
+  per-row refresh, inside the transaction before commit — matching the
+  design's "any necessary refresh happens before commit" rule.
+- Merchant-binding eligibility is guarded by the design's length bounds
+  (raw > 200 or canonical > 100 skips the resolver, merchant NULL,
+  description preserved verbatim); alias hits for oversized descriptions
+  are intentionally skipped per the design's conservative choice.
+- The concurrent-parent test hooks `_fetch_statement_cards` (the
+  planner's first read) with an asyncio barrier to make the
+  winner-commits-between-read-and-insert race deterministic in one event
+  loop; the real two-session barrier matrix remains PR5 scope (5.2).
+- `test_planning_failure_writes_nothing` (PR3) and the new
+  `test_unknown_category_not_found_without_writes` /
+  currency/cleanup assertions together cover "no writes on domain
+  failures"; late-flush/commit-time failure injection remains PR5 (5.1).
+
+## Workload / PR boundary
+
+- PR boundary: atomic creation service persistence + the two public
+  POST routes and their tests. No models, migrations, ingestion,
+  merchants, schemas, statement routes, docs, or PR1–PR3 behavior
+  changes. `app/api/v1/router.py` unchanged (the POST routes are
+  registered on the already-mounted transactions router).
+- Changed-line count: 1591 authored (additions + deletions) — exceeds
+  the 350-line slice budget; covered by the maintainer's explicit
+  `size:exception` acceptance recorded in the parent prompt.
+- Rollback boundary: remove the two POST handlers and the
+  error-mapping helper from `app/api/v1/transactions.py`, revert the
+  persistence additions in `app/services/transaction_creation.py`
+  (restoring the PR3 planning-only skeleton), delete
+  `tests/test_transaction_creation_http.py`, and revert the PR4 test
+  additions in `tests/test_transaction_creation.py`. PR2 statement
+  compatibility (nullable files, source) and PR1 merchant savepoints
+  remain intact; any accepted API-created rows keep their `api`
+  provenance — never reclassify or delete them. No commit was made.
+
+## Remaining tasks (exact unchecked lines from tasks.md)
+
+Sections 5.1–5.5 (PR5) and section 6 final bookkeeping remain unchecked,
+plus the three scope guardrails at the top of the file (checked at final
+verification). PR4 sections 4.1–4.4 are fully checked (17 boxes re-read
+and confirmed `[x]`).
+
+## Structured status
+
+- Change: `add-transaction-creation-api`; artifact store: openspec
+  (Engram unavailable — evidence persisted here and in `tasks.md`
+  checkbox updates only; no memory-tool persistence claimed).
+- `actionContext`: repo-local, workspace root
+  `/home/tadashi/orca/workspaces/finhealth/transactions-api`; all edits
+  stayed inside the allowed edit roots and the declared PR4 surfaces
+  (`app/services/transaction_creation.py`,
+  `app/api/v1/transactions.py`, `tests/test_transaction_creation.py`,
+  new `tests/test_transaction_creation_http.py`, PR4 sections of
+  `tasks.md` and this file). `router.py` registration not required.
+- Skill resolution: `paths-injected` (gentle-ai, work-unit-commits,
+  cognitive-doc-design SKILL.md files read before work; no registry
+  discovery, no child subagents spawned).
+- Native SDD attempt token from the parent prompt: PR4 attempt
+  `sha256:e1e0e8818d4a8dda7fffbe12fdedcf0b0f92d0d5e9bf1f7a8ba4435d73bd1216`
+  recorded; persisted-task checkboxes for sections 4.1–4.4 marked `[x]`
+  in `tasks.md` (re-read and confirmed).
