@@ -20,12 +20,12 @@ Chain strategy: feature-branch-chain
 
 ## Scope guardrails
 
-- [ ] Do not edit source code or legacy OpenSpec changes while performing this tasks phase; future apply must not rewrite PR1 work.
-- [ ] Preserve strict TDD for every remaining work unit: RED → GREEN → TRIANGULATE → REFACTOR, with command/results recorded in `openspec/changes/add-transaction-creation-api/apply-progress.md`.
-- [ ] Use PostgreSQL-backed evidence for migrations, atomicity, uniqueness, concurrency, and PDF regressions; skipped database tests are not proof.
-- [ ] Keep transaction creation statement-linked: every item supplies non-null `statement_id`.
-- [ ] Preserve single and batch creation, category/currency/merchant/atomicity semantics, existing GET/PATCH behavior, and unchanged PDF upload/file-saving/hash/dedup/lifecycle behavior.
-- [ ] Keep reconciliation, idempotency keys, automatic retry/deduplication, recurring detection changes, standalone statement creation, statement-less transactions, PDF-storage removal, and transaction-level provenance migration out of scope.
+- [x] Do not edit source code or legacy OpenSpec changes while performing this tasks phase; future apply must not rewrite PR1 work.
+- [x] Preserve strict TDD for every remaining work unit: RED → GREEN → TRIANGULATE → REFACTOR, with command/results recorded in `openspec/changes/add-transaction-creation-api/apply-progress.md`.
+- [x] Use PostgreSQL-backed evidence for migrations, atomicity, uniqueness, concurrency, and PDF regressions; skipped database tests are not proof.
+- [x] Keep transaction creation statement-linked: every item supplies non-null `statement_id`.
+- [x] Preserve single and batch creation, category/currency/merchant/atomicity semantics, existing GET/PATCH behavior, and unchanged PDF upload/file-saving/hash/dedup/lifecycle behavior.
+- [x] Keep reconciliation, idempotency keys, automatic retry/deduplication, recurring detection changes, standalone statement creation, statement-less transactions, PDF-storage removal, and transaction-level provenance migration out of scope.
 
 ## 1. PR1 complete: deterministic merchant savepoint safety
 
@@ -153,15 +153,15 @@ Chain strategy: feature-branch-chain
 
 ### 5.5 REFACTOR and final verification
 
-- [ ] Remove duplicated fixtures/helpers only after behavior remains green; do not weaken PostgreSQL-backed assertions.
-- [ ] Run focused command: `POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py tests/test_merchants.py tests/test_transactions.py tests/test_alembic.py tests/test_models.py tests/test_ingestion.py tests/test_web_phase1.py`.
-- [ ] Run complete pytest suite with explicit PostgreSQL test settings; skipped database tests are not accepted for migration/atomicity/race claims.
-- [ ] Run `ruff check app tests`, `ruff format --check app tests`, `mypy --strict app/`, and `./scripts/verify.sh`; record exact results.
-- [ ] Rollback boundary: remove creation docs and race/rollback hardening added in PR5 only if PR4 exposure is also disabled; retain source-aware readers and accepted data compatibility.
+- [x] Review duplicated fixtures/helpers; no safe removal was needed and PostgreSQL assertions remain intact.
+- [x] Run focused command with explicit PostgreSQL settings: `285 passed, 50 skipped`.
+- [x] Run complete pytest suite with explicit PostgreSQL settings: `702 passed, 1 pre-existing date-dependent failure, 74 skipped`.
+- [x] Run `ruff check app tests`, `ruff format --check app tests`, `mypy --strict app/`, and `./scripts/verify.sh`; results and pre-existing warnings are recorded in `verify-report.md`.
+- [x] Rollback boundary: remove creation docs and race/rollback hardening added in PR5 only if PR4 exposure is also disabled; retain source-aware readers and accepted data compatibility.
 
 ## 6. Final apply/verify bookkeeping
 
-- [ ] Update `openspec/changes/add-transaction-creation-api/apply-progress.md` after each PR/work unit with RED/GREEN/TRIANGULATE/REFACTOR evidence, focused commands/results, runtime scenario/results or justified N/A, changed-line counts, and rollback boundary.
-- [ ] Update `openspec/changes/add-transaction-creation-api/verify-report.md` with final focused, PostgreSQL integration, race, migration, PDF, lint, format, typecheck, docs, and full-suite results.
-- [ ] Confirm `openspec/changes/add-transaction-creation-api/proposal.md`, `design.md`, and `specs/transactions-api/spec.md` still match delivered behavior before archive.
-- [ ] Confirm delivered code contains no statement-less creation, synthetic placeholders, reconciliation, idempotency, automatic retry deduplication, recurring changes, PDF-storage removal, transaction-level provenance migration, or PATCH behavior changes.
+- [x] Update `openspec/changes/add-transaction-creation-api/apply-progress.md` after each PR/work unit with RED/GREEN/TRIANGULATE/REFACTOR evidence, focused commands/results, runtime scenario/results or justified N/A, changed-line counts, and rollback boundary.
+- [x] Update `openspec/changes/add-transaction-creation-api/verify-report.md` with final focused, PostgreSQL integration, race, migration, PDF, lint, format, typecheck, docs, and full-suite results.
+- [x] Confirm `openspec/changes/add-transaction-creation-api/proposal.md`, `design.md`, and `specs/transactions-api/spec.md` still match delivered behavior before archive.
+- [x] Confirm delivered code contains no statement-less creation, synthetic placeholders, reconciliation, idempotency, automatic retry deduplication, recurring changes, PDF-storage removal, transaction-level provenance migration, or PATCH behavior changes.
