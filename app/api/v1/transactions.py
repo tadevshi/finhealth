@@ -1,16 +1,19 @@
 """Transaction-related HTTP endpoints.
 
-The transactions router owns the *read* and *edit* of individual
-:class:`app.models.Transaction` rows:
+The transactions router owns the *read*, *edit* and *create* of
+individual :class:`app.models.Transaction` rows:
 
 * :func:`list_transactions` — filterable, paginated list.
-* :func:`update_transaction` — patch a single transaction's
-  category.
+* :func:`create_transaction` — JSON single creation (statement-linked).
+* :func:`create_transaction_batch` — JSON batch creation (1-200 items).
+* :func:`update_transaction` — patch a single transaction's category.
 
-Statement creation lives in :mod:`app.api.v1.statements`; the
-boundary follows the aggregate root: a statement owns its
-transactions, but reading and editing individual rows does not
-require loading the parent statement.
+Statement creation (PDF upload) lives in :mod:`app.api.v1.statements`;
+the boundary follows the aggregate root: a statement owns its
+transactions, but reading, creating and editing individual rows does
+not require loading the parent statement. Creation delegates all
+business rules to :class:`TransactionCreationService` — the handlers
+below are thin transport shims.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from pathlib import Path
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, or_, select
@@ -31,7 +34,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
 from app.models import Category, Transaction
-from app.schemas.domain import TransactionResponse
+from app.schemas.domain import (
+    TransactionBatchCreate,
+    TransactionBatchResponse,
+    TransactionCreate,
+    TransactionResponse,
+)
+from app.services.transaction_creation import (
+    TransactionCreationError,
+    TransactionCreationService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +352,142 @@ async def list_transactions(
     return list(result.scalars().all())
 
 
+# ---------------------------------------------------------------------------
+# Creation: thin POST handlers over the creation service
+# ---------------------------------------------------------------------------
+
+
+#: Domain error code -> HTTP status. The service stays transport-agnostic;
+#: this table is the single mapping point for the creation routes.
+_CREATION_STATUS_BY_CODE: Final[dict[str, int]] = {
+    "invalid_batch": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "statement_metadata_required": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "duplicate_statement_metadata": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "statement_already_exists": status.HTTP_409_CONFLICT,
+    "statement_creation_conflict": status.HTTP_409_CONFLICT,
+    "credit_card_not_found": status.HTTP_404_NOT_FOUND,
+    "category_not_found": status.HTTP_404_NOT_FOUND,
+    "unsupported_currency": status.HTTP_400_BAD_REQUEST,
+    "currency_mismatch": status.HTTP_400_BAD_REQUEST,
+    "creation_failed": status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
+
+
+def _raise_creation_failure(error: TransactionCreationError, *, include_index: bool) -> None:
+    """Translate a domain creation failure into the documented HTTP envelope.
+
+    The body is ``{"detail": {"code", "message", "field"?, "index"?}}``
+    with ``field``/``index`` omitted when inapplicable. Single-route
+    mapping omits the index (there is only one item); batch mapping keeps
+    it so the client can locate the failing row. The service has already
+    rolled back its outer transaction, so no request-owned writes exist
+    when this runs.
+    """
+    detail: dict[str, object] = {"code": error.code, "message": error.message}
+    if error.field is not None:
+        detail["field"] = error.field
+    if include_index and error.index is not None:
+        detail["index"] = error.index
+    raise HTTPException(status_code=_CREATION_STATUS_BY_CODE[error.code], detail=detail) from error
+
+
+@router.post(
+    "",
+    response_model=TransactionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create one transaction linked to an existing or new statement",
+    responses={
+        status.HTTP_201_CREATED: {
+            "description": "Transaction created and committed.",
+            "model": TransactionResponse,
+        },
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Unsupported currency or currency mismatch with the parent card.",
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "Unknown card (nested metadata) or category_id.",
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "Statement already exists (metadata supplied for an existing "
+            "parent) or was created concurrently.",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "Invalid input or missing new-parent metadata.",
+        },
+    },
+)
+async def create_transaction(
+    payload: TransactionCreate,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    """Create one transaction atomically against its parent statement.
+
+    Every item requires ``statement_id``: an existing parent is referenced
+    by ID only (nested metadata is a 409 conflict), and a missing parent is
+    created under that UUID from the nested ``statement`` metadata with
+    ``source=api`` and ``status=completed``. Currency must match the parent
+    card exactly (CLP or USD). The response is a single
+    :class:`TransactionResponse`; duplicate-looking submissions are not
+    deduplicated — every success appends a new row.
+    """
+    try:
+        snapshots = await TransactionCreationService(session).create_many([payload])
+    except TransactionCreationError as error:
+        _raise_creation_failure(error, include_index=False)
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=snapshots[0].model_dump(mode="json"),
+    )
+
+
+@router.post(
+    "/batch",
+    response_model=TransactionBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create 1-200 transactions in input order",
+    responses={
+        status.HTTP_201_CREATED: {
+            "description": "Batch committed atomically; responses keep input order.",
+            "model": TransactionBatchResponse,
+        },
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Unsupported currency or currency mismatch with a parent card.",
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "Unknown card (nested metadata) or category_id.",
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "Statement already exists (metadata supplied for an existing "
+            "parent) or was created concurrently.",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "Invalid input, batch bounds, or missing/duplicate new-parent metadata.",
+        },
+    },
+)
+async def create_transaction_batch(
+    payload: TransactionBatchCreate,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    """Create 1-200 transactions atomically in input order.
+
+    Same rules as the single route; repeated items for one new statement
+    share the single nested metadata object, additional objects are a 422
+    at the second metadata-bearing index, and item-level failures carry
+    their zero-based input index. ``count`` is constructed from the
+    committed response list, never supplied by the client.
+    """
+    try:
+        snapshots = await TransactionCreationService(session).create_many(payload.transactions)
+    except TransactionCreationError as error:
+        _raise_creation_failure(error, include_index=True)
+    batch = TransactionBatchResponse(transactions=snapshots, count=len(snapshots))
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=batch.model_dump(mode="json"),
+    )
+
+
 @router.patch(
     "/{transaction_id}",
     response_model=TransactionResponse,
@@ -530,6 +678,8 @@ async def update_transaction(
 
 __all__ = [
     "TransactionCategoryUpdate",
+    "create_transaction",
+    "create_transaction_batch",
     "list_transactions",
     "router",
     "update_transaction",

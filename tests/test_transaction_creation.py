@@ -1,26 +1,40 @@
-"""PR3 tests for ``add-transaction-creation-api``.
+"""Tests for ``add-transaction-creation-api``.
 
 Covers the closed creation schemas (``StatementMetadataCreate``, the
 extended ``TransactionCreate``, bounded ``TransactionBatchCreate`` and
-``TransactionBatchResponse``) and the request-wide parent-planning half
-of ``TransactionCreationService``. Persistence and HTTP routes are later
-chain slices: after planning succeeds the service stops at an explicit
-``NotImplementedError`` boundary and never writes.
+``TransactionBatchResponse``), the request-wide parent-planning half of
+``TransactionCreationService`` and, from PR4 on, the atomic persistence
+half: new API statements, category/currency/merchant policy and ordered
+response snapshots inside one outer transaction. HTTP routes live in
+:mod:`tests.test_transaction_creation_http`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.db.session import create_session_factory
-from app.models import Bank, CreditCard, Statement, Transaction
+from app.models import (
+    Bank,
+    Category,
+    CreditCard,
+    Merchant,
+    MerchantAlias,
+    Statement,
+    Transaction,
+)
+from app.models.statement import StatementSource, StatementStatus
 from app.schemas import (
     StatementMetadataCreate,
     TransactionBatchCreate,
@@ -28,6 +42,7 @@ from app.schemas import (
     TransactionCreate,
     TransactionResponse,
 )
+from app.services.merchants import KNOWN_MERCHANT_PATTERNS, MerchantNormalizer
 from app.services.transaction_creation import (
     ParentPlan,
     TransactionCreationError,
@@ -327,7 +342,14 @@ class TestTransactionBatchContracts:
         assert batch.transactions[0].statement_id == _STATEMENT_ID
 
 
-async def _seed_parent(engine: AsyncEngine, currency: str = "CLP") -> tuple[uuid.UUID, uuid.UUID]:
+async def _seed_parent(
+    engine: AsyncEngine,
+    currency: str = "CLP",
+    *,
+    status: StatementStatus = StatementStatus.PENDING,
+    error_message: str | None = None,
+    is_active: bool = True,
+) -> tuple[uuid.UUID, uuid.UUID]:
     """Seed one bank/card/statement parent; return (statement_id, card_id)."""
     factory = create_session_factory(engine)
     async with factory() as session:
@@ -341,6 +363,7 @@ async def _seed_parent(engine: AsyncEngine, currency: str = "CLP") -> tuple[uuid
             card_number_masked="XXXX XXXX XXXX 4242",
             cardholder="PLANNING USER",
             currency=currency,
+            is_active=is_active,
         )
         statement = Statement(
             credit_card=card,
@@ -349,6 +372,8 @@ async def _seed_parent(engine: AsyncEngine, currency: str = "CLP") -> tuple[uuid
             statement_date=date(2026, 10, 1),
             file_path="planning/test.pdf",
             file_hash="b" * 64,
+            status=status,
+            error_message=error_message,
         )
         session.add_all([bank, card, statement])
         await session.commit()
@@ -593,22 +618,6 @@ class TestParentPlanningRules:
                 await service.create_many([_service_item(uuid.uuid4())] * 201)
             assert oversized.value.code == "invalid_batch"
 
-    async def test_create_many_stops_at_persistence_boundary(self, engine: AsyncEngine) -> None:
-        """A fully valid plan reaches the explicit PR4 persistence boundary."""
-        statement_id, card_id = await _seed_parent(engine)
-        new_id = uuid.uuid4()
-        items = [
-            _service_item(statement_id),
-            _service_item(new_id, metadata=_metadata_for(card_id)),
-        ]
-        before = await _table_count(engine, Statement)
-        factory = create_session_factory(engine)
-        async with factory() as session:
-            with pytest.raises(NotImplementedError):
-                await TransactionCreationService(session).create_many(items)
-        assert await _table_count(engine, Statement) == before
-        assert await _table_count(engine, Transaction) == 0
-
 
 class TestPlanningTriangulation:
     async def test_multiple_new_parents_plan_independently(self, engine: AsyncEngine) -> None:
@@ -635,3 +644,489 @@ class TestPlanningTriangulation:
         plans = await _plan(engine, items)
         assert plans[new_id].card is not None
         assert plans[new_id].card.currency == "USD"
+
+
+# ---------------------------------------------------------------------------
+# PR4 — atomic persistence (service)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_categories(engine: AsyncEngine) -> dict[str, uuid.UUID]:
+    """Seed two closed-set categories; return ``name -> id``."""
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        rows = [
+            Category(name="Groceries", display_name="Groceries", sort_order=2),
+            Category(name="Dining Out", display_name="Dining Out", sort_order=1),
+        ]
+        session.add_all(rows)
+        await session.commit()
+        return {row.name: row.id for row in rows}
+
+
+class TestAtomicPersistence:
+    """PostgreSQL-backed persistence and policy tests for ``create_many``."""
+
+    async def test_new_statement_created_with_api_provenance(self, engine: AsyncEngine) -> None:
+        """A new parent is persisted under the caller UUID with API provenance."""
+        _, card_id = await _seed_parent(engine)
+        await _seed_categories(engine)
+        new_id = uuid.uuid4()
+        items = [
+            _service_item(
+                new_id,
+                metadata=_metadata_for(card_id),
+                description="LIDER COM 3",
+            )
+        ]
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(items)
+
+        assert len(snapshots) == 1
+        snapshot = snapshots[0]
+        assert snapshot.statement_id == new_id
+        assert snapshot.description == "LIDER COM 3"
+        assert snapshot.amount == Decimal("12500.00")
+        assert snapshot.created_at is not None
+        assert snapshot.updated_at is not None
+
+        async with factory() as session:
+            statement = await session.get(Statement, new_id)
+            assert statement is not None
+            assert statement.credit_card_id == card_id
+            assert statement.period_start == date(2026, 9, 1)
+            assert statement.period_end == date(2026, 9, 30)
+            assert statement.statement_date == date(2026, 10, 1)
+            assert statement.source == StatementSource.API
+            assert statement.status == StatementStatus.COMPLETED
+            assert statement.file_path is None
+            assert statement.file_hash is None
+            assert statement.error_message is None
+            result = await session.execute(
+                select(Transaction).where(Transaction.statement_id == new_id)
+            )
+            rows = list(result.scalars().all())
+            assert len(rows) == 1
+            assert rows[0].id == snapshot.id
+            assert rows[0].recurring_rule_id is None
+
+    async def test_appending_keeps_existing_statement_state(self, engine: AsyncEngine) -> None:
+        """Appending to an existing parent never rewrites its lifecycle state."""
+        statement_id, _ = await _seed_parent(
+            engine, status=StatementStatus.FAILED, error_message="parse boom"
+        )
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            before = await session.get(Statement, statement_id)
+            assert before is not None
+            before_created, before_updated = before.created_at, before.updated_at
+            before_source, before_status = before.source, before.status
+            before_files, before_error = (before.file_path, before.file_hash), before.error_message
+
+        async with factory() as session:
+            await TransactionCreationService(session).create_many([_service_item(statement_id)])
+
+        async with factory() as session:
+            after = await session.get(Statement, statement_id)
+            assert after is not None
+            assert (after.source, after.status) == (before_source, before_status)
+            assert (after.file_path, after.file_hash) == before_files
+            assert after.error_message == before_error
+            assert (after.created_at, after.updated_at) == (before_created, before_updated)
+
+    @pytest.mark.parametrize("with_legacy_string", [True, False])
+    async def test_category_id_precedence(
+        self, engine: AsyncEngine, with_legacy_string: bool
+    ) -> None:
+        """A supplied category ID wins and marks the row confident."""
+        statement_id, _ = await _seed_parent(engine)
+        categories = await _seed_categories(engine)
+        overrides: dict[str, object] = {"category_id": str(categories["Groceries"])}
+        if with_legacy_string:
+            overrides["category"] = "My Own Label"
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, **overrides)]
+            )
+        snapshot = snapshots[0]
+        assert snapshot.category_id == categories["Groceries"]
+        assert snapshot.category == "Groceries"
+        assert snapshot.low_confidence is False
+
+    async def test_legacy_category_string_preserved(self, engine: AsyncEngine) -> None:
+        """Without an ID the legacy string is stored verbatim, low confidence."""
+        statement_id, _ = await _seed_parent(engine)
+        await _seed_categories(engine)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, category="Bodega de barrio")]
+            )
+        snapshot = snapshots[0]
+        assert snapshot.category == "Bodega de barrio"
+        assert snapshot.category_id is None
+        assert snapshot.low_confidence is True
+
+    async def test_no_category_stays_uncategorized(self, engine: AsyncEngine) -> None:
+        """No category input stores NULL category, low confidence (not 'Uncategorized')."""
+        statement_id, _ = await _seed_parent(engine)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id)]
+            )
+        snapshot = snapshots[0]
+        assert snapshot.category is None
+        assert snapshot.category_id is None
+        assert snapshot.low_confidence is True
+
+    async def test_unknown_category_not_found_without_writes(self, engine: AsyncEngine) -> None:
+        """An unknown category UUID is a 404 at its index and persists nothing."""
+        statement_id, _ = await _seed_parent(engine)
+        items = [
+            _service_item(statement_id),
+            _service_item(statement_id, category_id=str(uuid.uuid4())),
+        ]
+        await _expect_plan_error(engine, items, "category_not_found", 1, field="category_id")
+        assert await _table_count(engine, Statement) == 1
+        assert await _table_count(engine, Transaction) == 0
+
+    @pytest.mark.parametrize(
+        ("item_currency", "card_currency", "expected"),
+        [
+            ("CLP", "CLP", None),
+            ("USD", "USD", None),
+            ("EUR", "CLP", "unsupported_currency"),
+            ("clp", "CLP", "unsupported_currency"),
+            ("CLP", "USD", "currency_mismatch"),
+            ("USD", "CLP", "currency_mismatch"),
+        ],
+    )
+    async def test_currency_policy(
+        self, engine: AsyncEngine, item_currency: str, card_currency: str, expected: str | None
+    ) -> None:
+        """Supported exact codes must match the parent card's currency."""
+        statement_id, _ = await _seed_parent(engine, currency=card_currency)
+        items = [_service_item(statement_id, currency=item_currency)]
+        if expected is None:
+            factory = create_session_factory(engine)
+            async with factory() as session:
+                snapshots = await TransactionCreationService(session).create_many(items)
+            assert snapshots[0].currency == item_currency
+        else:
+            await _expect_plan_error(engine, items, expected, 0, field="currency")
+            assert await _table_count(engine, Transaction) == 0
+
+    async def test_inactive_card_and_failed_parent_accepted(self, engine: AsyncEngine) -> None:
+        """Existing parents are accepted regardless of card activity or status."""
+        statement_id, _ = await _seed_parent(
+            engine,
+            status=StatementStatus.FAILED,
+            error_message="extract failed",
+            is_active=False,
+        )
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id)]
+            )
+        assert snapshots[0].statement_id == statement_id
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            statement = await session.get(Statement, statement_id)
+            assert statement is not None
+            assert statement.status == StatementStatus.FAILED
+            assert statement.error_message == "extract failed"
+
+    async def test_out_of_period_transaction_accepted(self, engine: AsyncEngine) -> None:
+        """Transaction dates outside the billing period stay accepted."""
+        statement_id, _ = await _seed_parent(engine)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, date="2026-08-01")]
+            )
+        assert snapshots[0].date == date(2026, 8, 1)
+
+    async def test_batch_output_follows_input_order(self, engine: AsyncEngine) -> None:
+        """Responses keep input order despite reversed dates and two parents."""
+        existing_id, card_id = await _seed_parent(engine)
+        await _seed_categories(engine)
+        new_id = uuid.uuid4()
+        items = [
+            _service_item(existing_id, date="2026-09-20", description="SECOND"),
+            _service_item(
+                new_id, metadata=_metadata_for(card_id), date="2026-09-10", description="FIRST-NEW"
+            ),
+            _service_item(existing_id, date="2026-09-05", description="OLDEST"),
+            _service_item(new_id, description="FOURTH"),
+        ]
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(items)
+        assert [snapshot.description for snapshot in snapshots] == [
+            "SECOND",
+            "FIRST-NEW",
+            "OLDEST",
+            "FOURTH",
+        ]
+        assert snapshots[1].statement_id == new_id
+        assert snapshots[3].statement_id == new_id
+
+    async def test_merchant_created_then_reused(self, engine: AsyncEngine) -> None:
+        """Deterministic normalization creates the merchant once, then reuses it."""
+        statement_id, _ = await _seed_parent(engine)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, description="MCDONALDS SUC 12")]
+            )
+            merchants_after_create = await _table_count(engine, Merchant)
+            aliases_after_create = await _table_count(engine, MerchantAlias)
+            await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, description="MCDONALDS SUC 12")]
+            )
+        assert merchants_after_create == 1
+        assert aliases_after_create == 1
+        # Merchant linkage is verified at the database level: the response
+        # does not expose merchant_id, so reload the rows.
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            result = await session.execute(select(Transaction))
+            rows = list(result.scalars().all())
+            assert len(rows) == 2
+            assert all(row.merchant_id is not None for row in rows)
+            assert len({row.merchant_id for row in rows}) == 1
+        assert await _table_count(engine, Merchant) == 1
+        assert await _table_count(engine, MerchantAlias) == 1
+
+    @pytest.mark.parametrize(
+        ("description", "canonical_len"),
+        [
+            ("x" * 201, None),
+            ("MCDONALDS SUC 12 " * 11, None),
+        ],
+    )
+    async def test_long_description_skips_merchant_binding(
+        self, engine: AsyncEngine, description: str, canonical_len: int | None
+    ) -> None:
+        """Oversized raw/canonical descriptions keep merchant NULL and full text."""
+        statement_id, _ = await _seed_parent(engine)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, description=description)]
+            )
+        assert snapshots[0].description == description
+        assert await _table_count(engine, Merchant) == 0
+        assert await _table_count(engine, MerchantAlias) == 0
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            result = await session.execute(select(Transaction))
+            row = result.scalar_one()
+            assert row.merchant_id is None
+            assert row.description == description
+
+    async def test_llm_path_never_invoked(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Creation never calls the optional LLM resolver, even on misses."""
+        statement_id, _ = await _seed_parent(engine)
+
+        def _explode(*args: object, **kwargs: object) -> None:
+            raise AssertionError("resolve_merchant_with_llm must never be called")
+
+        monkeypatch.setattr(MerchantNormalizer, "resolve_merchant_with_llm", _explode)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, description="ZARA STORE 7")]
+            )
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            result = await session.execute(select(Transaction))
+            row = result.scalar_one()
+            assert row.merchant_id is not None  # deterministic auto-create bound it
+
+    async def test_merchant_defaults_do_not_infer_category(self, engine: AsyncEngine) -> None:
+        """A known merchant's default category never fills the transaction row."""
+        statement_id, _ = await _seed_parent(engine)
+        categories = await _seed_categories(engine)
+        assert KNOWN_MERCHANT_PATTERNS["lider"] == "Groceries"
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(statement_id, description="LIDER COM 3")]
+            )
+        assert snapshots[0].category is None
+        assert snapshots[0].low_confidence is True
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            result = await session.execute(select(Transaction))
+            row = result.scalar_one()
+            assert row.merchant_id is not None
+            merchant = await session.get(Merchant, row.merchant_id)
+            assert merchant is not None
+            assert merchant.default_category_id == categories["Groceries"]
+
+    async def test_legacy_deprecation_logged_once_per_request(
+        self, engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Legacy category use logs at most one warning; ID-only use logs none."""
+        statement_id, _ = await _seed_parent(engine)
+        with caplog.at_level(logging.WARNING, logger="app.services.transaction_creation"):
+            factory = create_session_factory(engine)
+            async with factory() as session:
+                await TransactionCreationService(session).create_many(
+                    [
+                        _service_item(statement_id, category="Alpha"),
+                        _service_item(statement_id, category="Beta"),
+                    ]
+                )
+        legacy_records = [
+            record for record in caplog.records if "deprecation" in record.getMessage()
+        ]
+        assert len(legacy_records) == 1
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="app.services.transaction_creation"):
+            factory = create_session_factory(engine)
+            async with factory() as session:
+                with pytest.raises(TransactionCreationError):
+                    await TransactionCreationService(session).create_many(
+                        [_service_item(statement_id, category_id=str(uuid.uuid4()))]
+                    )
+        assert caplog.records == []  # the ID path never logs, even on failure
+
+    async def test_enrichment_failure_rolls_back_everything(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A late enrichment failure discards parents, merchants and aliases."""
+        existing_id, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        items = [
+            _service_item(new_id, metadata=_metadata_for(card_id), description="LIDER COM 3"),
+            _service_item(existing_id, description="SECOND ROW"),
+        ]
+
+        normalizer = MerchantNormalizer()
+        original = normalizer.resolve_merchant
+        calls = {"count": 0}
+
+        async def _fail_on_second(
+            self: MerchantNormalizer,
+            session: AsyncSession,
+            description: str,
+            categories_by_name: dict[str, Category],
+        ) -> tuple[Merchant, bool]:
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise RuntimeError("injected enrichment failure")
+            return await original(session, description, categories_by_name)
+
+        monkeypatch.setattr(MerchantNormalizer, "resolve_merchant", _fail_on_second)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            with pytest.raises(RuntimeError, match="injected enrichment failure"):
+                await TransactionCreationService(session).create_many(items)
+        assert await _table_count(engine, Statement) == 1
+        assert await _table_count(engine, Transaction) == 0
+        assert await _table_count(engine, Merchant) == 0
+        assert await _table_count(engine, MerchantAlias) == 0
+
+    async def test_concurrent_parent_commit_conflicts_during_flush(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A committed concurrent winner maps to an atomic 409, with ID-only retry."""
+        _, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        items = [_service_item(new_id, metadata=_metadata_for(card_id))]
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = TransactionCreationService._fetch_statement_cards
+
+        async def _hold(
+            self: TransactionCreationService,
+            statement_ids: set[uuid.UUID],
+        ) -> dict[uuid.UUID, uuid.UUID]:
+            found = await original(self, statement_ids)
+            started.set()
+            await release.wait()
+            return found
+
+        monkeypatch.setattr(TransactionCreationService, "_fetch_statement_cards", _hold)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            task = asyncio.create_task(TransactionCreationService(session).create_many(items))
+            await started.wait()
+            # A concurrent winner commits the same UUID while the request is
+            # between its planning read and the parent insert.
+            async with factory() as winner_session:
+                winner_session.add(
+                    Statement(
+                        id=new_id,
+                        credit_card_id=card_id,
+                        period_start=date(2026, 9, 1),
+                        period_end=date(2026, 9, 30),
+                        statement_date=date(2026, 10, 1),
+                        file_path=None,
+                        file_hash=None,
+                        source=StatementSource.API,
+                        status=StatementStatus.COMPLETED,
+                    )
+                )
+                await winner_session.commit()
+            release.set()
+            with pytest.raises(TransactionCreationError) as excinfo:
+                await task
+        error = excinfo.value
+        assert (error.code, error.field, error.index) == (
+            "statement_creation_conflict",
+            "statement_id",
+            0,
+        )
+
+        # The loser persisted nothing; the winner is intact.
+        assert await _table_count(engine, Statement) == 2
+        assert await _table_count(engine, Transaction) == 0
+        assert await _table_count(engine, Merchant) == 0
+        assert await _table_count(engine, MerchantAlias) == 0
+
+        # The explicit ID-only retry succeeds without touching the winner.
+        async with factory() as session:
+            snapshots = await TransactionCreationService(session).create_many(
+                [_service_item(new_id)]
+            )
+        assert snapshots[0].statement_id == new_id
+        assert await _table_count(engine, Statement) == 2
+        assert await _table_count(engine, Transaction) == 1
+
+    async def test_statement_pk_discriminator(self) -> None:
+        """Only a 23505 on ``pk_statements`` classifies as the parent conflict."""
+        from app.services.transaction_creation import _is_statement_pk_violation
+
+        class _DiagInfo:
+            def __init__(self, sqlstate: str | None, constraint_name: str | None) -> None:
+                self.sqlstate = sqlstate
+                self.constraint_name = constraint_name
+                self.__cause__ = None
+
+        @dataclass
+        class _Case:
+            sqlstate: str | None
+            constraint: str | None
+            expected: bool
+
+        cases = [
+            _Case("23505", "pk_statements", True),
+            _Case("23505", "uq_statements_credit_card_id_file_hash", False),
+            _Case("23503", "pk_statements", False),
+            _Case(None, None, False),
+        ]
+        for case in cases:
+            exc = IntegrityError(
+                "INSERT INTO statements ...", None, _DiagInfo(case.sqlstate, case.constraint)
+            )
+            assert _is_statement_pk_violation(exc) is case.expected

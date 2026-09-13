@@ -95,32 +95,32 @@ Chain strategy: feature-branch-chain
 
 ### 4.1 RED: domain policy and persistence behavior
 
-- [ ] Add failing PostgreSQL service tests for creating new statements under caller UUID with source `api`, status `completed`, null file fields/errors, supplied card/dates, no ingestion/PDF/recurring work, and no changes to existing statement source/status/errors/timestamps.
-- [ ] Add failing tests for single and batch transaction persistence: category ID precedence, legacy category preservation, no-category low confidence, unknown category 404, exact CLP/USD support, card currency mismatch 400, inactive/non-completed existing parent acceptance, out-of-period transaction acceptance, and ordered outputs.
-- [ ] Add failing tests for deterministic merchant reuse/creation under creation flow, long-description merchant guard, no LLM invocation, and merchant defaults not inferring transaction category.
-- [ ] Record RED evidence.
+- [x] Add failing PostgreSQL service tests for creating new statements under caller UUID with source `api`, status `completed`, null file fields/errors, supplied card/dates, no ingestion/PDF/recurring work, and no changes to existing statement source/status/errors/timestamps.
+- [x] Add failing tests for single and batch transaction persistence: category ID precedence, legacy category preservation, no-category low confidence, unknown category 404, exact CLP/USD support, card currency mismatch 400, inactive/non-completed existing parent acceptance, out-of-period transaction acceptance, and ordered outputs.
+- [x] Add failing tests for deterministic merchant reuse/creation under creation flow, long-description merchant guard, no LLM invocation, and merchant defaults not inferring transaction category.
+- [x] Record RED evidence.
 
 ### 4.2 GREEN: atomic service persistence
 
-- [ ] Complete `TransactionCreationService.create_many(items)` so new statements are inserted in canonical UUID order and flushed before transaction enrichment; catch only statement PK `23505` conflicts as `statement_creation_conflict` 409 and let all other database failures abort generically.
-- [ ] Validate category/currency/merchant policy, build transaction rows in input order, flush once, build `TransactionResponse` snapshots before commit, and return snapshots only after the outer transaction succeeds.
-- [ ] Ensure all request-created statements, transactions, merchants, and aliases share one outer transaction; no service or normalizer path commits caller work.
-- [ ] Run focused service tests and record GREEN evidence.
+- [x] Complete `TransactionCreationService.create_many(items)` so new statements are inserted in canonical UUID order and flushed before transaction enrichment; catch only statement PK `23505` conflicts as `statement_creation_conflict` 409 and let all other database failures abort generically.
+- [x] Validate category/currency/merchant policy, build transaction rows in input order, flush once, build `TransactionResponse` snapshots before commit, and return snapshots only after the outer transaction succeeds.
+- [x] Ensure all request-created statements, transactions, merchants, and aliases share one outer transaction; no service or normalizer path commits caller work.
+- [x] Run focused service tests and record GREEN evidence.
 
 ### 4.3 RED/GREEN: HTTP routes and indexed errors
 
-- [ ] Add failing HTTP tests for `POST /api/v1/transactions` and `POST /api/v1/transactions/batch`: existing parent ID-only 201, new parent 201, mixed batch 201, input-order responses, 1/200 bounds, duplicate-looking rows and repeated successful submissions not deduplicated, visibility through existing GET, and batch count accuracy.
-- [ ] Add failing HTTP tests for 422 schema/content errors, missing metadata, duplicate metadata, 409 existing-parent metadata, 404 unknown card/category, 400 currency business rule failures, indexed batch domain errors, and generic 500 bodies with `raise_app_exceptions=False`.
-- [ ] Update `app/api/v1/transactions.py` with thin POST handlers using existing router/session dependency and local service-error mapping; preserve existing GET/PATCH transport and response contracts.
-- [ ] Run focused HTTP tests and record GREEN evidence.
+- [x] Add failing HTTP tests for `POST /api/v1/transactions` and `POST /api/v1/transactions/batch`: existing parent ID-only 201, new parent 201, mixed batch 201, input-order responses, 1/200 bounds, duplicate-looking rows and repeated successful submissions not deduplicated, visibility through existing GET, and batch count accuracy.
+- [x] Add failing HTTP tests for 422 schema/content errors, missing metadata, duplicate metadata, 409 existing-parent metadata, 404 unknown card/category, 400 currency business rule failures, indexed batch domain errors, and generic 500 bodies with `raise_app_exceptions=False`.
+- [x] Update `app/api/v1/transactions.py` with thin POST handlers using existing router/session dependency and local service-error mapping; preserve existing GET/PATCH transport and response contracts.
+- [x] Run focused HTTP tests and record GREEN evidence.
 
 ### 4.4 TRIANGULATE/REFACTOR and PR4 regression
 
-- [ ] Add compatibility regressions for transaction GET filters, PATCH form/HTML/JSON response behavior, PATCH empty-string clear sentinel, category tests, merchant API tests, and ingestion tests remaining unchanged.
-- [ ] TRIANGULATE batch size 200 success/201 failure without writes, duplicate-looking items in the same batch creating distinct IDs, and API additions to existing PDF statements leaving statement source `pdf`.
-- [ ] REFACTOR service/route helpers for readability only; maintain one service path for single and batch.
-- [ ] Run focused creation/transaction/merchant tests, `ruff check app tests`, `ruff format --check app tests`, and `mypy --strict app/`; record results.
-- [ ] Rollback boundary: remove POST route wiring and creation-service persistence behavior while retaining PR2 statement compatibility for any accepted API-created rows.
+- [x] Add compatibility regressions for transaction GET filters, PATCH form/HTML/JSON response behavior, PATCH empty-string clear sentinel, category tests, merchant API tests, and ingestion tests remaining unchanged.
+- [x] TRIANGULATE batch size 200 success/201 failure without writes, duplicate-looking items in the same batch creating distinct IDs, and API additions to existing PDF statements leaving statement source `pdf`.
+- [x] REFACTOR service/route helpers for readability only; maintain one service path for single and batch.
+- [x] Run focused creation/transaction/merchant tests, `ruff check app tests`, `ruff format --check app tests`, and `mypy --strict app/`; record results.
+- [x] Rollback boundary: remove POST route wiring and creation-service persistence behavior while retaining PR2 statement compatibility for any accepted API-created rows.
 
 ## 5. PR5 candidate: race/rollback hardening, PDF regression, docs, and full verification
 
