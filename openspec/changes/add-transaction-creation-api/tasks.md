@@ -65,31 +65,31 @@ Chain strategy: feature-branch-chain
 
 ### 3.1 RED: closed creation schemas and nested statement metadata
 
-- [ ] Add failing schema tests in `tests/test_transaction_creation.py` for `StatementMetadataCreate` requiring `credit_card_id`, `period_start`, `period_end`, `statement_date`; rejecting nested `id`, files, source, status, errors, currency, timestamps, and unknown fields; allowing statement date outside period; rejecting `period_start > period_end`; treating nested `statement: null` as omitted.
-- [ ] Add failing schema tests for `TransactionCreate.statement`, required non-null `statement_id`, optional `category_id`, closed top-level input, Decimal string/integer acceptance, float/bool/non-finite money rejection, installment bounds/overflow, optional `raw_json`, and malformed UUID/date/currency cases.
-- [ ] Add failing batch schema tests for `TransactionBatchCreate` 0/1/200/201 bounds and indexed nested validation locations.
-- [ ] Record RED evidence.
+- [x] Add failing schema tests in `tests/test_transaction_creation.py` for `StatementMetadataCreate` requiring `credit_card_id`, `period_start`, `period_end`, `statement_date`; rejecting nested `id`, files, source, status, errors, currency, timestamps, and unknown fields; allowing statement date outside period; rejecting `period_start > period_end`; treating nested `statement: null` as omitted.
+- [x] Add failing schema tests for `TransactionCreate.statement`, required non-null `statement_id`, optional `category_id`, closed top-level input, Decimal string/integer acceptance, float/bool/non-finite money rejection, installment bounds/overflow, optional `raw_json`, and malformed UUID/date/currency cases.
+- [x] Add failing batch schema tests for `TransactionBatchCreate` 0/1/200/201 bounds and indexed nested validation locations.
+- [x] Record RED evidence.
 
 ### 3.2 GREEN: schema additions without persistence behavior
 
-- [ ] Update `app/schemas/domain.py` and `app/schemas/__init__.py` with `StatementMetadataCreate`, extended `TransactionCreate`, creation-only money validators, bounded `TransactionBatchCreate`, and `TransactionBatchResponse`.
-- [ ] Keep `TransactionResponse` unchanged and keep PDF input schemas source-appropriate.
-- [ ] Run focused schema tests and record GREEN evidence.
+- [x] Update `app/schemas/domain.py` and `app/schemas/__init__.py` with `StatementMetadataCreate`, extended `TransactionCreate`, creation-only money validators, bounded `TransactionBatchCreate`, and `TransactionBatchResponse`.
+- [x] Keep `TransactionResponse` unchanged and keep PDF input schemas source-appropriate.
+- [x] Run focused schema tests and record GREEN evidence.
 
 ### 3.3 RED: request-wide parent metadata planning rules
 
-- [ ] Add failing service-unit tests for a pure/internal parent-planning helper in `app/services/transaction_creation.py`: existing `statement_id` plus nested metadata returns 409 even when matching; missing parent with no metadata returns 422; exactly one metadata object may appear anywhere for a new ID; duplicate identical or conflicting metadata returns 422 at the second metadata-bearing index; mixed existing/new statement IDs resolve independently; lowest offending index wins.
-- [ ] Add failing tests for unknown new-parent card 404, card/currency lookup preparation, no writes during planning failures, and null metadata followers sharing the one authoritative object.
-- [ ] Record RED evidence.
+- [x] Add failing service-unit tests for a pure/internal parent-planning helper in `app/services/transaction_creation.py`: existing `statement_id` plus nested metadata returns 409 even when matching; missing parent with no metadata returns 422; exactly one metadata object may appear anywhere for a new ID; duplicate identical or conflicting metadata returns 422 at the second metadata-bearing index; mixed existing/new statement IDs resolve independently; lowest offending index wins.
+- [x] Add failing tests for unknown new-parent card 404, card/currency lookup preparation, no writes during planning failures, and null metadata followers sharing the one authoritative object.
+- [x] Record RED evidence.
 
 ### 3.4 GREEN/TRIANGULATE: internal service skeleton and parent planner
 
-- [ ] Create `app/services/transaction_creation.py` with `TransactionCreationService`, a small service exception (`code`, safe `message`, optional `field`, optional zero-based `index`), and an internal parent-planning path that starts one outer transaction before reads but does not expose routes yet.
-- [ ] Batch-fetch persisted statements/cards/categories needed by planning; validate parent definitions before dependent writes; keep existing statement metadata/source/status/errors unchanged.
-- [ ] TRIANGULATE metadata appearing first/middle/last, repeated batch items sharing one metadata object, multiple new parents, existing-parent conflict precedence, and missing metadata 422.
-- [ ] REFACTOR helper names and test fixtures only after focused tests pass.
-- [ ] Run `pytest tests/test_transaction_creation.py` with PostgreSQL settings plus `ruff`/`mypy`; record results.
-- [ ] Rollback boundary: remove schema additions and the internal transaction creation service skeleton/tests; PR2 source/nullable statement compatibility remains intact.
+- [x] Create `app/services/transaction_creation.py` with `TransactionCreationService`, a small service exception (`code`, safe `message`, optional `field`, optional zero-based `index`), and an internal parent-planning path that starts one outer transaction before reads but does not expose routes yet.
+- [x] Batch-fetch persisted statements/cards/categories needed by planning; validate parent definitions before dependent writes; keep existing statement metadata/source/status/errors unchanged.
+- [x] TRIANGULATE metadata appearing first/middle/last, repeated batch items sharing one metadata object, multiple new parents, existing-parent conflict precedence, and missing metadata 422.
+- [x] REFACTOR helper names and test fixtures only after focused tests pass.
+- [x] Run `pytest tests/test_transaction_creation.py` with PostgreSQL settings plus `ruff`/`mypy`; record results.
+- [x] Rollback boundary: remove schema additions and the internal transaction creation service skeleton/tests; PR2 source/nullable statement compatibility remains intact.
 
 ## 4. PR4 candidate: atomic statement+transaction creation and public routes
 

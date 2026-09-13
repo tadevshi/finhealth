@@ -14,7 +14,10 @@ from app.schemas.domain import (
     RecurringRuleResponse,
     RecurringRuleUpdate,
     StatementCreate,
+    StatementMetadataCreate,
     StatementResponse,
+    TransactionBatchCreate,
+    TransactionBatchResponse,
     TransactionCreate,
     TransactionResponse,
 )
@@ -34,8 +37,11 @@ __all__ = [
     "RecurringRuleResponse",
     "RecurringRuleUpdate",
     "StatementCreate",
+    "StatementMetadataCreate",
     "StatementResponse",
     "StatementSource",
+    "TransactionBatchCreate",
+    "TransactionBatchResponse",
     "TransactionCreate",
     "TransactionResponse",
 ]
