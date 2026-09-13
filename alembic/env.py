@@ -4,7 +4,6 @@ import asyncio
 from logging.config import fileConfig
 
 import sqlalchemy as sa
-from alembic.script import ScriptDirectory
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -46,23 +45,33 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    """Refuse non-empty user databases before a destructive baseline runs."""
+    """Run migrations with guards for unversioned populated databases.
+
+    - A populated database with **no** ``alembic_version`` stamp is
+      refused: it predates the destructive baseline and must never be
+      auto-stamped or baselined.
+    - A recognized versioned database (empty or populated) traverses
+      normal Alembic forward/backward revisions, including no-op runs at
+      head and guarded downgrades.
+    """
     if connection.dialect.name != "postgresql":
         raise RuntimeError("PostgreSQL is required for Alembic migrations")
 
     context.configure(connection=connection, target_metadata=target_metadata)
     migration_context = context.get_context()
-    script_head = ScriptDirectory.from_config(config).get_current_head()
-    if migration_context.get_current_revision() == script_head:
-        return
+    current_revision = migration_context.get_current_revision()
+    if current_revision is None:
+        # Unversioned database: the destructive baseline may only initialize
+        # a truly empty one. Never auto-stamp or baseline a populated DB.
+        user_tables = list(connection.execute(_USER_TABLES).scalars())
+        if user_tables:
+            raise RuntimeError(
+                "Refusing to initialize non-empty database; found user tables: "
+                + ", ".join(user_tables)
+            )
 
-    user_tables = list(connection.execute(_USER_TABLES).scalars())
-    if user_tables:
-        raise RuntimeError(
-            "Refusing to initialize non-empty database; found user tables: "
-            + ", ".join(user_tables)
-        )
-
+    # Recognized versioned databases (including at head) traverse normal
+    # Alembic revisions: upgrades, no-op runs and guarded downgrades.
     with context.begin_transaction():
         context.run_migrations()
 
