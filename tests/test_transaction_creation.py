@@ -20,7 +20,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -42,7 +42,7 @@ from app.schemas import (
     TransactionCreate,
     TransactionResponse,
 )
-from app.services.merchants import KNOWN_MERCHANT_PATTERNS, MerchantNormalizer
+from app.services.merchants import KNOWN_MERCHANT_PATTERNS, MerchantNormalizer, normalize
 from app.services.transaction_creation import (
     ParentPlan,
     TransactionCreationError,
@@ -427,6 +427,52 @@ async def _table_count(engine: AsyncEngine, model: type) -> int:
     factory = create_session_factory(engine)
     async with factory() as session:
         result = await session.execute(select(func.count()).select_from(model))
+        return int(result.scalar_one())
+
+
+async def _assert_no_request_created_rows(
+    engine: AsyncEngine,
+    *,
+    statement_ids: set[uuid.UUID],
+    descriptions: set[str],
+    merchant_names: set[str] | None = None,
+) -> None:
+    """Verify rollback durability in a fresh session, scoped to request-owned keys."""
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        statement_count = await session.scalar(
+            select(func.count()).select_from(Statement).where(Statement.id.in_(statement_ids))
+        )
+        transaction_count = await session.scalar(
+            select(func.count())
+            .select_from(Transaction)
+            .where(Transaction.description.in_(descriptions))
+        )
+        merchant_count = await session.scalar(
+            select(func.count())
+            .select_from(Merchant)
+            .where(Merchant.name.in_(merchant_names or descriptions))
+        )
+        alias_count = await session.scalar(
+            select(func.count())
+            .select_from(MerchantAlias)
+            .where(MerchantAlias.alias_text.in_(descriptions))
+        )
+    assert statement_count == 0
+    assert transaction_count == 0
+    assert merchant_count == 0
+    assert alias_count == 0
+
+
+async def _description_count(engine: AsyncEngine, description: str) -> int:
+    """Count durable transactions with the exact description in a fresh session."""
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(Transaction)
+            .where(Transaction.description == description)
+        )
         return int(result.scalar_one())
 
 
@@ -1102,6 +1148,422 @@ class TestAtomicPersistence:
         assert snapshots[0].statement_id == new_id
         assert await _table_count(engine, Statement) == 2
         assert await _table_count(engine, Transaction) == 1
+
+    async def test_failure_after_new_statement_flush_rolls_back_parent(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failure after a new parent flush leaves no request-created rows durable."""
+        _, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        description = "PR5 NEW PARENT FLUSH"
+        items = [_service_item(new_id, metadata=_metadata_for(card_id), description=description)]
+        original_flush = AsyncSession.flush
+        failed = False
+
+        async def _fail_after_parent_flush(
+            self: AsyncSession, objects: object | None = None
+        ) -> None:
+            nonlocal failed
+            pending_statement = any(
+                isinstance(obj, Statement) and obj.id == new_id for obj in self.sync_session.new
+            )
+            await original_flush(self, objects)
+            if pending_statement and not failed:
+                failed = True
+                raise RuntimeError("injected failure after statement flush")
+
+        monkeypatch.setattr(AsyncSession, "flush", _fail_after_parent_flush)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            with pytest.raises(RuntimeError, match="after statement flush"):
+                await TransactionCreationService(session).create_many(items)
+
+        await _assert_no_request_created_rows(
+            engine,
+            statement_ids={new_id},
+            descriptions={description},
+            merchant_names={normalize(description)},
+        )
+        assert await _table_count(engine, Statement) == 1  # pre-existing seed only
+
+    async def test_failure_after_merchant_alias_writes_rolls_back_all_request_rows(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Merchant and alias rows are not durable when a later item fails."""
+        existing_id, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        first_description = "PR5 MERCHANT ALIAS WRITTEN"
+        second_description = "PR5 FAIL AFTER ALIAS"
+        items = [
+            _service_item(new_id, metadata=_metadata_for(card_id), description=first_description),
+            _service_item(existing_id, description=second_description),
+        ]
+        original = MerchantNormalizer.resolve_merchant
+        calls = 0
+
+        async def _fail_after_first_alias(
+            self: MerchantNormalizer,
+            session: AsyncSession,
+            description: str,
+            categories_by_name: dict[str, Category],
+        ) -> tuple[Merchant, bool]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected failure after alias write")
+            return await original(self, session, description, categories_by_name)
+
+        monkeypatch.setattr(MerchantNormalizer, "resolve_merchant", _fail_after_first_alias)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            with pytest.raises(RuntimeError, match="after alias write"):
+                await TransactionCreationService(session).create_many(items)
+
+        await _assert_no_request_created_rows(
+            engine,
+            statement_ids={new_id},
+            descriptions={first_description, second_description},
+            merchant_names={normalize(first_description), normalize(second_description)},
+        )
+        assert await _table_count(engine, Statement) == 1
+
+    async def test_failure_during_transaction_flush_rolls_back_parent_and_merchants(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transaction flush failure rolls back earlier parent/merchant writes."""
+        _, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        description = "PR5 TRANSACTION FLUSH"
+        items = [_service_item(new_id, metadata=_metadata_for(card_id), description=description)]
+        original_flush = AsyncSession.flush
+
+        async def _fail_transaction_flush(
+            self: AsyncSession, objects: object | None = None
+        ) -> None:
+            if any(isinstance(obj, Transaction) for obj in self.sync_session.new):
+                raise RuntimeError("injected transaction flush failure")
+            await original_flush(self, objects)
+
+        monkeypatch.setattr(AsyncSession, "flush", _fail_transaction_flush)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            with pytest.raises(RuntimeError, match="transaction flush failure"):
+                await TransactionCreationService(session).create_many(items)
+
+        await _assert_no_request_created_rows(
+            engine,
+            statement_ids={new_id},
+            descriptions={description},
+            merchant_names={normalize(description)},
+        )
+        assert await _table_count(engine, Statement) == 1
+
+    async def test_response_snapshot_validation_failure_rolls_back_flushed_rows(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Snapshot validation happens before commit and can still abort atomically."""
+        _, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        description = "PR5 SNAPSHOT VALIDATION"
+        items = [_service_item(new_id, metadata=_metadata_for(card_id), description=description)]
+
+        def _fail_snapshot(_row: object) -> TransactionResponse:
+            raise ValueError("injected snapshot validation failure")
+
+        monkeypatch.setattr(TransactionResponse, "model_validate", staticmethod(_fail_snapshot))
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            with pytest.raises(ValueError, match="snapshot validation failure"):
+                await TransactionCreationService(session).create_many(items)
+
+        await _assert_no_request_created_rows(
+            engine,
+            statement_ids={new_id},
+            descriptions={description},
+            merchant_names={normalize(description)},
+        )
+        assert await _table_count(engine, Statement) == 1
+
+    async def test_before_commit_failure_rolls_back_all_flushed_rows(
+        self, engine: AsyncEngine
+    ) -> None:
+        """A failure immediately before commit leaves no request-created rows durable."""
+        _, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        description = "PR5 BEFORE COMMIT"
+        items = [_service_item(new_id, metadata=_metadata_for(card_id), description=description)]
+        factory = create_session_factory(engine)
+        async with factory() as session:
+
+            def _raise_before_commit(_sync_session: object) -> None:
+                raise RuntimeError("injected before commit failure")
+
+            event.listen(session.sync_session, "before_commit", _raise_before_commit)
+            with pytest.raises(RuntimeError, match="before commit failure"):
+                await TransactionCreationService(session).create_many(items)
+
+        await _assert_no_request_created_rows(
+            engine,
+            statement_ids={new_id},
+            descriptions={description},
+            merchant_names={normalize(description)},
+        )
+        assert await _table_count(engine, Statement) == 1
+
+    @pytest.mark.parametrize("different_metadata", [False, True])
+    async def test_two_sessions_racing_same_new_statement_conflict_atomically(
+        self,
+        engine: AsyncEngine,
+        monkeypatch: pytest.MonkeyPatch,
+        different_metadata: bool,
+    ) -> None:
+        """Two real sessions both observe absence; one wins and the loser gets atomic 409."""
+        _, card_id = await _seed_parent(engine)
+        new_id = uuid.uuid4()
+        winner_or_loser_descriptions = [
+            f"PR5 RACE {'DIFF' if different_metadata else 'MATCH'} A",
+            f"PR5 RACE {'DIFF' if different_metadata else 'MATCH'} B",
+        ]
+        first_metadata = _metadata_for(card_id)
+        second_metadata = (
+            _metadata_for(card_id, statement_date="2026-10-02")
+            if different_metadata
+            else dict(first_metadata)
+        )
+        items_by_request = [
+            [
+                _service_item(
+                    new_id, metadata=first_metadata, description=winner_or_loser_descriptions[0]
+                )
+            ],
+            [
+                _service_item(
+                    new_id, metadata=second_metadata, description=winner_or_loser_descriptions[1]
+                )
+            ],
+        ]
+        observed_absence: list[dict[uuid.UUID, uuid.UUID]] = []
+        both_read = asyncio.Event()
+        release_inserts = asyncio.Event()
+        observation_lock = asyncio.Lock()
+        original = TransactionCreationService._fetch_statement_cards
+
+        async def _barrier_after_absence_read(
+            self: TransactionCreationService,
+            statement_ids: set[uuid.UUID],
+        ) -> dict[uuid.UUID, uuid.UUID]:
+            found = await original(self, statement_ids)
+            async with observation_lock:
+                observed_absence.append(found)
+                if len(observed_absence) == 2:
+                    both_read.set()
+            await both_read.wait()
+            await release_inserts.wait()
+            return found
+
+        monkeypatch.setattr(
+            TransactionCreationService, "_fetch_statement_cards", _barrier_after_absence_read
+        )
+        factory = create_session_factory(engine)
+
+        async def _create(
+            index: int,
+        ) -> tuple[int, list[TransactionResponse] | TransactionCreationError]:
+            async with factory() as session:
+                try:
+                    return index, await TransactionCreationService(session).create_many(
+                        items_by_request[index]
+                    )
+                except TransactionCreationError as exc:
+                    return index, exc
+
+        tasks = [asyncio.create_task(_create(0)), asyncio.create_task(_create(1))]
+        await both_read.wait()
+        assert observed_absence == [{}, {}]
+        release_inserts.set()
+        results = await asyncio.gather(*tasks)
+
+        successes = [(index, result) for index, result in results if isinstance(result, list)]
+        conflicts = [
+            (index, result)
+            for index, result in results
+            if isinstance(result, TransactionCreationError)
+        ]
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        success_index, success_rows = successes[0]
+        conflict_index, conflict = conflicts[0]
+        assert success_rows[0].statement_id == new_id
+        assert success_rows[0].description == winner_or_loser_descriptions[success_index]
+        assert (conflict.code, conflict.field, conflict.index) == (
+            "statement_creation_conflict",
+            "statement_id",
+            0,
+        )
+
+        # Before retry, the losing request owns no durable rows; the winner remains intact.
+        assert await _table_count(engine, Statement) == 2
+        assert await _description_count(engine, winner_or_loser_descriptions[success_index]) == 1
+        assert await _description_count(engine, winner_or_loser_descriptions[conflict_index]) == 0
+
+        # Retrying explicitly with ID-only linkage succeeds; resending metadata remains a 409.
+        async with factory() as session:
+            retry_rows = await TransactionCreationService(session).create_many(
+                [_service_item(new_id, description=winner_or_loser_descriptions[conflict_index])]
+            )
+        assert retry_rows[0].statement_id == new_id
+        assert retry_rows[0].description == winner_or_loser_descriptions[conflict_index]
+        assert await _table_count(engine, Statement) == 2
+        assert await _description_count(engine, winner_or_loser_descriptions[conflict_index]) == 1
+
+        async with factory() as session:
+            with pytest.raises(TransactionCreationError) as retry_with_metadata:
+                await TransactionCreationService(session).create_many(
+                    items_by_request[conflict_index]
+                )
+        assert retry_with_metadata.value.code == "statement_already_exists"
+
+    async def test_reversed_multi_parent_conflict_rolls_back_earlier_loser_parent(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A later parent conflict rolls back earlier flushed loser-owned parents."""
+        _, card_id = await _seed_parent(engine)
+        earlier_new_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        contested_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        items = [
+            _service_item(
+                contested_id,
+                metadata=_metadata_for(card_id),
+                description="PR5 CONFLICT CONTESTED",
+            ),
+            _service_item(
+                earlier_new_id,
+                metadata=_metadata_for(card_id, statement_date="2026-10-02"),
+                description="PR5 CONFLICT EARLIER PARENT",
+            ),
+        ]
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = TransactionCreationService._fetch_statement_cards
+
+        async def _hold_after_absence_read(
+            self: TransactionCreationService,
+            statement_ids: set[uuid.UUID],
+        ) -> dict[uuid.UUID, uuid.UUID]:
+            found = await original(self, statement_ids)
+            started.set()
+            await release.wait()
+            return found
+
+        monkeypatch.setattr(
+            TransactionCreationService, "_fetch_statement_cards", _hold_after_absence_read
+        )
+        factory = create_session_factory(engine)
+        async with factory() as loser_session:
+            task = asyncio.create_task(TransactionCreationService(loser_session).create_many(items))
+            await started.wait()
+            async with factory() as winner_session:
+                winner_session.add(
+                    Statement(
+                        id=contested_id,
+                        credit_card_id=card_id,
+                        period_start=date(2026, 9, 1),
+                        period_end=date(2026, 9, 30),
+                        statement_date=date(2026, 10, 1),
+                        file_path=None,
+                        file_hash=None,
+                        source=StatementSource.API,
+                        status=StatementStatus.COMPLETED,
+                    )
+                )
+                await winner_session.commit()
+            release.set()
+            with pytest.raises(TransactionCreationError) as excinfo:
+                await task
+
+        assert (excinfo.value.code, excinfo.value.field, excinfo.value.index) == (
+            "statement_creation_conflict",
+            "statement_id",
+            0,
+        )
+        async with factory() as session:
+            assert await session.get(Statement, contested_id) is not None
+            assert await session.get(Statement, earlier_new_id) is None
+        await _assert_no_request_created_rows(
+            engine,
+            statement_ids={earlier_new_id},
+            descriptions={"PR5 CONFLICT CONTESTED", "PR5 CONFLICT EARLIER PARENT"},
+            merchant_names={
+                normalize("PR5 CONFLICT CONTESTED"),
+                normalize("PR5 CONFLICT EARLIER PARENT"),
+            },
+        )
+
+    async def test_winner_rollback_allows_waiting_request_to_create_parent(
+        self, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the first inserter rolls back, the waiting request can succeed."""
+        _, card_id = await _seed_parent(engine)
+        contested_id = uuid.uuid4()
+        first_inserted = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+        call_lock = asyncio.Lock()
+        original = TransactionCreationService._create_new_statements
+
+        async def _first_inserter_rolls_back(
+            self: TransactionCreationService,
+            plans: dict[uuid.UUID, ParentPlan],
+        ) -> None:
+            nonlocal calls
+            async with call_lock:
+                calls += 1
+                call_number = calls
+            if call_number == 1:
+                await original(self, plans)
+                first_inserted.set()
+                await release_first.wait()
+                raise RuntimeError("injected first-inserter rollback")
+            await first_inserted.wait()
+            await original(self, plans)
+
+        monkeypatch.setattr(
+            TransactionCreationService, "_create_new_statements", _first_inserter_rolls_back
+        )
+        factory = create_session_factory(engine)
+        first_items = [
+            _service_item(
+                contested_id,
+                metadata=_metadata_for(card_id),
+                description="PR5 ROLLBACK FIRST",
+            )
+        ]
+        second_items = [
+            _service_item(
+                contested_id,
+                metadata=_metadata_for(card_id),
+                description="PR5 ROLLBACK SECOND",
+            )
+        ]
+
+        async def _create(items: list[TransactionCreate]) -> list[TransactionResponse]:
+            async with factory() as session:
+                return await TransactionCreationService(session).create_many(items)
+
+        first_task = asyncio.create_task(_create(first_items))
+        await first_inserted.wait()
+        second_task = asyncio.create_task(_create(second_items))
+        await asyncio.sleep(0)
+        release_first.set()
+
+        with pytest.raises(RuntimeError, match="first-inserter rollback"):
+            await first_task
+        second_rows = await second_task
+        assert second_rows[0].statement_id == contested_id
+        assert second_rows[0].description == "PR5 ROLLBACK SECOND"
+        assert await _description_count(engine, "PR5 ROLLBACK FIRST") == 0
+        assert await _description_count(engine, "PR5 ROLLBACK SECOND") == 1
+        assert await _table_count(engine, Statement) == 2
 
     async def test_statement_pk_discriminator(self) -> None:
         """Only a 23505 on ``pk_statements`` classifies as the parent conflict."""

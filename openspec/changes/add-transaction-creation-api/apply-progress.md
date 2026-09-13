@@ -777,3 +777,352 @@ and confirmed `[x]`).
   `sha256:e1e0e8818d4a8dda7fffbe12fdedcf0b0f92d0d5e9bf1f7a8ba4435d73bd1216`
   recorded; persisted-task checkboxes for sections 4.1–4.4 marked `[x]`
   in `tasks.md` (re-read and confirmed).
+
+## Status: PR 5 slice A complete — request-wide rollback hardening tests
+
+PR 5 slice A adds PostgreSQL failure-injection coverage for the existing
+transaction creation service's request-wide rollback boundary. The service code
+was inspected through the new tests and did not require a behavior change: the
+PR4 `async with session.begin()` boundary already rolls back request-created
+statements, transactions, merchants, and aliases for the injected failure points.
+No concurrency, docs, PDF tests, unrelated routes, or PR5 sections beyond 5.1
+were implemented in this slice.
+
+Delivery decision consumed from the parent prompt: PR5 slice A only, with
+`size:exception` accepted for the chain and native attempt token
+`sha256:e5d30373ece278596add367f3c562aaf275c351704923e815df611d15ba01a81`.
+
+## Changed lines (PR 5 slice A)
+
+| File | Change |
+|---|---|
+| `tests/test_transaction_creation.py` | Added fresh-session rollback assertion helper and five PostgreSQL failure-injection tests: after new statement flush, after merchant/alias writes, during transaction flush, during response snapshot validation, and before commit. |
+| `openspec/changes/add-transaction-creation-api/tasks.md` | Marked the completed PR5 5.1 slice-A checkboxes and left the broader PR5 5.1 concurrency/late-invalid/recovered-conflict checkbox unchecked. |
+| `openspec/changes/add-transaction-creation-api/apply-progress.md` | Recorded this evidence. |
+
+## TDD Cycle Evidence (PR 5 slice A)
+
+Command prefix:
+
+```sh
+POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth \
+POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 \
+POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest
+```
+
+### RED (task 5.1 slice A)
+
+Strict RED did not produce an observed failure: after adding the five
+failure-injection tests, the current PR4 service passed them immediately.
+Observed command: `... pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` →
+`30 passed in 6.89s` before formatting, then `30 passed in 7.02s` after formatting.
+
+This is recorded as a strict-TDD exception for a hardening/characterization slice:
+no service implementation change was needed to make the new behavior-level tests
+pass, so no failing RED can be claimed.
+
+### GREEN (task 5.1 slice A)
+
+No service code changed. The same focused PostgreSQL command is the GREEN evidence:
+`... pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` →
+`30 passed in 7.02s`.
+
+### TRIANGULATE
+
+The new tests cover five distinct abort points and each verifies durable state
+from a fresh independent session using request-owned statement IDs/descriptions:
+
+- after an API statement is flushed, before merchant/transaction work;
+- after deterministic merchant and raw alias writes, before the second item completes;
+- during the transaction flush after parent and merchant/alias writes;
+- during `TransactionResponse` snapshot validation after transaction rows flush;
+- immediately before commit via a SQLAlchemy `before_commit` hook.
+
+Each assertion confirms no request-created statement, transaction, merchant, or
+alias rows survived, while the pre-existing seeded parent statement remains.
+
+### REFACTOR
+
+No service refactor. Test helper extraction only (`_assert_no_request_created_rows`)
+so each failure-injection test uses the same fresh-session durable-state check.
+
+## Verification evidence (PR 5 slice A)
+
+| Command | Result |
+|---|---|
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` | `30 passed in 7.02s` |
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py -q --no-cov` | `110 passed in 10.42s` |
+| `ruff check tests/test_transaction_creation.py` | All checks passed |
+| `ruff format --check tests/test_transaction_creation.py` | 1 file already formatted |
+
+Runtime harness scenario: disposable PostgreSQL databases from the existing
+`engine` fixture; rollback durability verified through fresh independent sessions.
+No skipped database test was used as evidence.
+
+## Workload / PR boundary
+
+- PR boundary: failure-injection tests for request-wide rollback only. No service
+  behavior change, no routes, no docs/README, no PDF regression tests, and no
+  PR5 concurrent race work.
+- Rollback boundary: revert the PR5 additions in `tests/test_transaction_creation.py`
+  plus the PR5 5.1 evidence/checkbox edits in `tasks.md` and this file. PR1–PR4
+  implementation remains intact.
+- Remaining PR5 work: the broader 5.1 second checkbox (late invalid batch items,
+  multiple flushed new parents, recovered merchant conflicts followed by later
+  failure, and existing/concurrent parent conflicts), 5.2 concurrency race matrix,
+  5.3 PDF/migration regressions, 5.4 documentation, 5.5 final verification, and
+  section 6 bookkeeping.
+
+## Structured status
+
+- Change: `add-transaction-creation-api`; artifact store: openspec.
+- `actionContext`: repo-local, workspace root
+  `/home/tadashi/orca/workspaces/finhealth/transactions-api`; all edits stayed
+  inside the allowed edit surfaces for PR5 slice A.
+- Skill resolution: `paths-injected` (gentle-ai and work-unit-commits SKILL.md
+  files read before work; no registry discovery, no child subagents spawned).
+
+## Status: PR 5 slice B complete — true new-statement race hardening tests
+
+PR 5 slice B adds PostgreSQL two-session/barrier coverage for concurrent creation
+of the same missing `statement_id`. Both service invocations use independent
+sessions, both read the parent set before either insert is released, and the real
+statement primary key decides the race. No service behavior change was required:
+the PR4 parent-flush conflict mapping already returns `statement_creation_conflict`
+and the outer transaction rolls back loser-owned rows.
+
+No docs, PDF, migration, final verification, route rewrites, or PR5 tasks outside
+this narrow 5.2 race slice are claimed complete.
+
+Delivery decision consumed from the parent prompt: PR5 slice B only, with
+`size:exception` accepted for the chain and native attempt token
+`sha256:e5d30373ece278596add367f3c562aaf275c351704923e815df611d15ba01a81`.
+
+## Changed lines (PR 5 slice B)
+
+| File | Change |
+|---|---|
+| `tests/test_transaction_creation.py` | Added `_description_count` and a parametrized two-session/barrier race test for matching and differing valid metadata. The test asserts both sessions observed absence, exactly one request succeeded, the loser received `statement_creation_conflict` 409-equivalent service error, loser-owned transaction rows were absent before retry, explicit ID-only retry succeeded, and resending metadata after success remained 409. |
+| `openspec/changes/add-transaction-creation-api/tasks.md` | Marked the first PR5 5.2 concurrency checkbox complete only; broader 5.2 extras, PDF/docs/final verification remain unchecked. |
+| `openspec/changes/add-transaction-creation-api/apply-progress.md` | Recorded this slice-B evidence. |
+
+## TDD Cycle Evidence (PR 5 slice B)
+
+Command prefix:
+
+```sh
+POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth \
+POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 \
+POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest
+```
+
+### RED (task 5.2 slice B)
+
+Strict RED did not produce an observed failure: after adding the two-session
+barrier race test, the current service passed both matching and differing metadata
+cases immediately.
+
+Observed command:
+`... pytest tests/test_transaction_creation.py::TestAtomicPersistence::test_two_sessions_racing_same_new_statement_conflict_atomically -q --no-cov` →
+`2 passed in 0.62s`.
+
+This is recorded as a strict-TDD exception for a hardening/characterization slice:
+no implementation defect was exposed, so no failing RED can be claimed.
+
+### GREEN (task 5.2 slice B)
+
+No service code changed. Focused PostgreSQL command after formatting:
+`... pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` →
+`32 passed in 7.75s`.
+
+### TRIANGULATE
+
+The parametrized race covers two metadata cases for the same new statement UUID:
+
+- matching valid metadata in both requests;
+- differing but independently valid metadata (`statement_date` differs).
+
+For both cases, the test proves both independent sessions observed `{}` from the
+parent lookup before inserts were released, exactly one request committed the
+statement+transaction, the loser raised `statement_creation_conflict` with field
+`statement_id` and index `0`, the loser description had zero durable transactions
+before retry, the winner row remained durable, an explicit ID-only loser retry
+succeeded, and resending metadata after success returned `statement_already_exists`.
+
+### REFACTOR
+
+No service refactor. Test-only helper extraction (`_description_count`) keeps the
+race assertions scoped to exact loser/winner descriptions.
+
+## Verification evidence (PR 5 slice B)
+
+| Command | Result |
+|---|---|
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py::TestAtomicPersistence::test_two_sessions_racing_same_new_statement_conflict_atomically -q --no-cov` | `2 passed in 0.62s` |
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` | `32 passed in 7.75s` |
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py -q --no-cov` | `112 passed in 11.03s` |
+| `ruff check tests/test_transaction_creation.py` | All checks passed |
+| `ruff format --check tests/test_transaction_creation.py` | 1 file already formatted |
+
+Runtime harness scenario: disposable PostgreSQL databases from the existing
+`engine` fixture; two independent `AsyncSession` instances synchronized by an
+async barrier after the absence read and before parent insert. No skipped database
+test was used as race evidence.
+
+## Workload / PR boundary
+
+- PR boundary: true service-level new-parent race tests only. No service behavior
+  change, no HTTP route changes, no docs/README, no PDF/migration regression tests,
+  and no final verification.
+- Rollback boundary: revert the PR5 slice-B additions in
+  `tests/test_transaction_creation.py` plus the PR5 5.2 evidence/checkbox edits in
+  `tasks.md` and this file. PR1–PR5 slice A implementation remains intact.
+- Remaining PR5 work: the broader 5.1 second checkbox, 5.2 extras not claimed by
+  this slice (reversed multi-parent order, earlier inserted loser parents, winner
+  rollback allowing the other insert to succeed, no automatic retry/reuse beyond
+  the explicit retry assertion, and non-PK error classification beyond the existing
+  discriminator), 5.3 PDF/migration regressions, 5.4 documentation, 5.5 final
+  verification, and section 6 bookkeeping.
+
+## Structured status
+
+- Change: `add-transaction-creation-api`; artifact store: openspec.
+- `actionContext`: repo-local, workspace root
+  `/home/tadashi/orca/workspaces/finhealth/transactions-api`; all edits stayed
+  inside the allowed edit surfaces for PR5 slice B.
+- Skill resolution: `paths-injected` (gentle-ai and work-unit-commits SKILL.md
+  files read before work; no registry discovery, no child subagents spawned).
+
+## Status: PR 5 slice C complete — docs and final PR5 compatibility regressions
+
+PR 5 slice C completes the remaining PR5 regression/documentation work without
+marking the final verify/archive tasks complete. It adds two PostgreSQL race
+triangulation tests for the parent-creation edge cases left after slices A/B,
+documents the transaction creation API contract in `README.md`, and re-runs the
+focused compatibility suites for transaction creation, migrations/source
+separation, models, and PDF ingestion. No application source code changed.
+
+Delivery decision consumed from the parent prompt: PR5 slice C only, with
+`size:exception` accepted for the chain and native attempt token
+`sha256:e5d30373ece278596add367f3c562aaf275c351704923e815df611d15ba01a81`.
+
+## Changed lines (PR 5 slice C)
+
+| File | Change |
+|---|---|
+| `tests/test_transaction_creation.py` | Added PR5 race triangulation for reversed multi-parent input where an earlier flushed loser-owned parent is rolled back after a later contested parent conflict, plus a winner-rollback case where a waiting request succeeds instead of receiving a false 409. |
+| `README.md` | Added the transaction creation API contract: existing-parent ID-only usage, new-parent nested metadata, mixed batch/shared metadata, 409 ID-only retry, nullable statement response/source, API completed-status meaning, category/merchant/currency rules, 1-200 bounds, non-idempotent timeout caveats, and explicit non-goals. |
+| `openspec/changes/add-transaction-creation-api/tasks.md` | Marked PR5 5.1 remaining regression coverage, 5.2 race extras/discriminator evidence, 5.3 compatibility regressions, and 5.4 docs complete; final verification/archive tasks remain unchecked. |
+| `openspec/changes/add-transaction-creation-api/apply-progress.md` | Recorded this slice-C evidence. |
+
+## TDD Cycle Evidence (PR 5 slice C)
+
+Command prefix for PostgreSQL-backed pytest runs:
+
+```sh
+POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth \
+POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 \
+POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest
+```
+
+### RED (tasks 5.1, 5.2, 5.4)
+
+Strict RED did not produce an observed failure for the two new race tests: they are
+hardening/characterization coverage of behavior already implemented by PR4 and
+partly proved by slices A/B. After adding the tests, the current service passed the
+focused class immediately.
+
+Observed command:
+`... pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` →
+`34 passed in 8.37s`.
+
+Manual documentation RED checklist before editing `README.md`: the existing README
+had no transaction-creation section documenting existing-parent ID-only examples,
+new-parent nested metadata, mixed batch/shared metadata, 409 ID-only retry,
+nullable statement response/source, API completed-status meaning,
+category/currency/merchant behavior, 1-200 bounds, append-only/non-idempotent/
+timeout duplicate caveats, or explicit non-goals.
+
+### GREEN (tasks 5.1, 5.2, 5.4)
+
+No service code changed. README now contains the required API contract and examples.
+Focused PostgreSQL command after `ruff format`:
+`... pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` →
+`34 passed in 12.30s`.
+
+### TRIANGULATE (task 5.3)
+
+- Reversed multi-parent/input-order conflict: request input lists the contested
+  parent before another new parent, but canonical UUID insert order flushes the
+  earlier UUID first; a concurrently committed contested winner causes
+  `statement_creation_conflict`, and the earlier loser-owned parent is absent in a
+  fresh session.
+- Winner rollback: first inserter flushes the contested parent then raises before
+  commit; the waiting request then creates the parent successfully, proving rollback
+  permits the next insert rather than being mapped as a race conflict.
+- Existing slice-B tests still cover matching and differing concurrent metadata,
+  loser atomic 409, no loser-owned transaction rows, explicit ID-only retry success,
+  and resending metadata after success returning `statement_already_exists`.
+- `test_statement_pk_discriminator` covers exact `pk_statements`/SQLSTATE 23505
+  classification and rejects card/hash uniqueness and FK/non-unique/non-diagnostic
+  failures as parent races.
+- Focused regression command:
+  `... pytest tests/test_transaction_creation.py tests/test_transaction_creation_http.py tests/test_alembic.py tests/test_models.py tests/test_ingestion.py -q --no-cov` →
+  `206 passed, 50 skipped in 44.85s`.
+  The skipped tests are the real-PDF E2E/upload pipeline tests gated on
+  `TEST_RUT` (sample PDF prerequisites are present enough for collection, but the
+  RUT is unavailable). These skips are recorded as unavailable, not passed. The
+  ungated portions rerun route/source/API separation, migration upgrade/downgrade,
+  nullable/source, unsafe downgrade, uniqueness, model, and ingestion regressions.
+- `./scripts/verify.sh` → focused dashboard/config/docs/docker checks passed:
+  first pytest phase `30 passed, 89 skipped` (skips require `POSTGRES_TEST_HOST`,
+  because the script does not export PostgreSQL test settings), Ruff passed, docs
+  phase `8 passed`. The script completed with exit code 0.
+
+### REFACTOR
+
+No production refactor and no duplicated helpers removed. Test-only additions reuse
+existing helpers where possible; `ruff format tests/test_transaction_creation.py`
+reformatted the touched test file, then the focused class was re-run green.
+
+## Verification evidence (PR 5 slice C)
+
+| Command | Result |
+|---|---|
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py::TestAtomicPersistence -q --no-cov` | `34 passed in 12.30s` |
+| `POSTGRES_USER=finhealth POSTGRES_PASSWORD=secret POSTGRES_DB=finhealth POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=5432 POSTGRES_TEST_USER=finhealth POSTGRES_TEST_PASSWORD=secret pytest tests/test_transaction_creation.py tests/test_transaction_creation_http.py tests/test_alembic.py tests/test_models.py tests/test_ingestion.py -q --no-cov` | `206 passed, 50 skipped in 44.85s`; real-PDF E2E prerequisites unavailable because `TEST_RUT` is unset, recorded as unavailable rather than passed |
+| `ruff check tests/test_transaction_creation.py && ruff format --check tests/test_transaction_creation.py` | All checks passed; 1 file already formatted |
+| `./scripts/verify.sh` | Exit 0; first pytest phase `30 passed, 89 skipped`, Ruff passed, docs/docker phase `8 passed`; skips require `POSTGRES_TEST_HOST` because the script does not export PostgreSQL test settings |
+
+Runtime harness scenario: disposable PostgreSQL databases from the existing
+fixtures for transaction-creation/migration/model/ingestion tests. No skipped
+database test was used as migration/race/atomicity evidence. Real-PDF E2E remains
+environment-dependent (`TEST_RUT` and local sample PDFs); unavailable prerequisites
+are recorded explicitly.
+
+## Workload / PR boundary
+
+- PR boundary: PR5 remaining race/regression/docs slice only. No application source
+  code changed. Final full-suite/typecheck verification and verify-report/archive
+  bookkeeping remain unchecked by instruction.
+- Rollback boundary: remove the slice-C additions in
+  `tests/test_transaction_creation.py`, remove the transaction-creation API section
+  and POST endpoint rows from `README.md`, and revert the slice-C checkbox/evidence
+  edits in `tasks.md` and this file. PR1-PR5 slice A/B implementation and evidence
+  remain intact.
+
+## Remaining tasks (exact unchecked lines from tasks.md)
+
+Section 5.5 final verification remains unchecked by instruction, as do section 6
+final apply/verify bookkeeping and archive-oriented confirmation tasks. The scope
+guardrails at the top also remain unchecked until final verification.
+
+## Structured status
+
+- Change: `add-transaction-creation-api`; artifact store: openspec.
+- `actionContext`: repo-local, workspace root
+  `/home/tadashi/orca/workspaces/finhealth/transactions-api`; all edits stayed
+  inside the allowed edit surfaces for PR5 slice C.
+- Skill resolution: `paths-injected` (gentle-ai, cognitive-doc-design, and
+  work-unit-commits SKILL.md files read before work; no registry discovery, no
+  child subagents spawned).
