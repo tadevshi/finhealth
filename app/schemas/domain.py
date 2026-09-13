@@ -19,11 +19,17 @@ import math
 import uuid
 from datetime import date as date_typ
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-from app.models.statement import StatementStatus
+from app.models.statement import StatementSource, StatementStatus
 
 # ---------------------------------------------------------------------------
 # Bank
@@ -161,13 +167,29 @@ class StatementResponse(BaseModel):
     period_start: date_typ
     period_end: date_typ
     statement_date: date_typ
-    file_path: str
-    file_hash: str
+    source: StatementSource = Field(
+        description=(
+            "How the statement was created: ``pdf`` (upload/ingestion) or "
+            "``api`` (transaction creation). Statement-level creation "
+            "provenance, not per-transaction origin."
+        ),
+    )
+    file_path: str | None = Field(
+        description=(
+            "Path to the stored PDF relative to PDF_UPLOAD_DIR; null for "
+            "file-free API-created statements."
+        ),
+    )
+    file_hash: str | None = Field(
+        description=(
+            "SHA-256 of the stored PDF contents; null for file-free API-created statements."
+        ),
+    )
     status: StatementStatus
     error_message: str | None
     transactions: list[TransactionResponse] = Field(
         default_factory=list,
-        description="All transactions extracted from this statement.",
+        description="All transactions attached to this statement.",
     )
     created_at: datetime
     updated_at: datetime
@@ -176,6 +198,38 @@ class StatementResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Transaction
 # ---------------------------------------------------------------------------
+
+
+class StatementMetadataCreate(BaseModel):
+    """Creation-only nested statement metadata for transaction creation.
+
+    Supplied inside ``TransactionCreate.statement`` when the referenced
+    ``statement_id`` does not exist yet and the request must create the
+    parent atomically. The object is deliberately closed: ``id``, file
+    fields, source, status, error metadata, currency and timestamps are
+    server-assigned or forbidden — the ``statement_id`` outside this
+    object is the sole new-parent identity. The statement date MAY fall
+    outside the billing period (banks issue statements after the period
+    closes); only ``period_start <= period_end`` is enforced.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    credit_card_id: uuid.UUID = Field(
+        description="UUID of the existing credit card the new statement belongs to."
+    )
+    period_start: date_typ = Field(description="First day of the billing period.")
+    period_end: date_typ = Field(description="Last day of the billing period (inclusive).")
+    statement_date: date_typ = Field(
+        description="Date the bank issued the statement; may fall outside the period."
+    )
+
+    @model_validator(mode="after")
+    def _period_is_ordered(self) -> StatementMetadataCreate:
+        """Reject reversed periods; equal bounds and out-of-period dates stay valid."""
+        if self.period_start > self.period_end:
+            raise ValueError("period_start must be on or before period_end")
+        return self
 
 
 class TransactionCreate(BaseModel):
@@ -208,12 +262,20 @@ class TransactionCreate(BaseModel):
     installment_number: int | None = Field(
         default=None,
         ge=1,
-        description="Current installment number (1-indexed).",
+        le=2147483647,
+        description=(
+            "Current installment number (1-indexed). Values beyond PostgreSQL"
+            " INTEGER capacity are content errors, not accounting rules."
+        ),
     )
     installment_total: int | None = Field(
         default=None,
         ge=1,
-        description="Total number of installments in the plan.",
+        le=2147483647,
+        description=(
+            "Total number of installments in the plan. Values beyond PostgreSQL"
+            " INTEGER capacity are content errors, not accounting rules."
+        ),
     )
     installment_value: Decimal | None = Field(
         default=None,
@@ -221,10 +283,54 @@ class TransactionCreate(BaseModel):
         decimal_places=2,
         description="Per-installment value. None for one-off charges.",
     )
+    category_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Optional canonical category UUID. Takes precedence over the legacy"
+            " ``category`` string when supplied."
+        ),
+    )
+    statement: StatementMetadataCreate | None = Field(
+        default=None,
+        description=(
+            "Creation-only nested statement metadata. Null means omitted: an"
+            " existing parent is referenced by ``statement_id`` only, and exactly"
+            " one item per new statement carries this object."
+        ),
+    )
     raw_json: dict[str, object] | list[object] | None = Field(
         default=None,
         description="Verbatim LLM extraction output. Preserved for re-derivation.",
     )
+
+    @field_validator("amount", "installment_value", mode="before")
+    @classmethod
+    def _reject_float_money(cls, value: object) -> object:
+        """Creation-only money guard: floats, bools and non-finite values.
+
+        JSON monetary values must arrive as decimal strings (e.g.
+        ``"-1234.50"``) or integers. Fractional JSON numbers parse to Python
+        floats and are rejected here, before Pydantic's Decimal coercion
+        could silently accept them. Non-finite decimals (``NaN``/``Infinity``
+        strings) are rejected as well — no rounding or coercion makes
+        invalid input fit.
+        """
+        if isinstance(value, bool | float):
+            raise ValueError("money values must be decimal strings or integers, not floats")
+        if isinstance(value, Decimal):
+            decimal_value = value
+        elif isinstance(value, str):
+            try:
+                decimal_value = Decimal(value)
+            except InvalidOperation as exc:
+                raise ValueError("money values must be valid decimal strings") from exc
+        elif isinstance(value, int):
+            decimal_value = Decimal(value)
+        else:
+            return value
+        if not decimal_value.is_finite():
+            raise ValueError("money values must be finite")
+        return decimal_value
 
 
 class TransactionResponse(BaseModel):
@@ -247,6 +353,37 @@ class TransactionResponse(BaseModel):
     raw_json: dict[str, object] | list[object] | None
     created_at: datetime
     updated_at: datetime
+
+
+class TransactionBatchCreate(BaseModel):
+    """Bounded batch payload for transaction creation.
+
+    Closed object carrying 1-200 items. The bounds are enforced here and
+    defensively again at the service boundary; items are never truncated
+    or split into independent commits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    transactions: list[TransactionCreate] = Field(
+        min_length=1,
+        max_length=200,
+        description="Transaction items in input order; 1-200 items.",
+    )
+
+
+class TransactionBatchResponse(BaseModel):
+    """Batch creation response: committed rows in input order plus the count."""
+
+    transactions: list[TransactionResponse] = Field(
+        description="Created transactions in input order.",
+    )
+    count: int = Field(
+        description=(
+            "Number of committed transactions; constructed from the response"
+            " list, never supplied by the client."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

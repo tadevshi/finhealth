@@ -51,7 +51,8 @@ from app.db.session import get_session
 from app.main import create_app
 from app.models.bank import Bank
 from app.models.base import Base
-from app.models.statement import StatementStatus
+from app.models.credit_card import CreditCard
+from app.models.statement import Statement, StatementSource, StatementStatus
 from app.services.ingestion import (
     BankNotFoundError,
     IngestionError,
@@ -1607,6 +1608,10 @@ class TestUploadEndpoint:
         assert body["status"] == "completed"
         assert body["credit_card_id"]
         assert len(body["transactions"]) == 3
+        # PDF uploads must remain explicitly sourced as PDF with files.
+        assert body["source"] == "pdf"
+        assert body["file_path"]
+        assert body["file_hash"]
 
         # The upload was persisted under the configured dir
         uploads = list(upload_dir.iterdir())
@@ -1875,6 +1880,9 @@ class TestGetStatementEndpoint:
         assert body["id"] == statement_id
         assert body["status"] == "completed"
         assert len(body["transactions"]) == 3
+        assert body["source"] == "pdf"
+        assert body["file_path"]
+        assert body["file_hash"]
 
     @pytest.mark.asyncio
     async def test_returns_404_for_missing_statement(
@@ -1896,6 +1904,70 @@ class TestGetStatementEndpoint:
 
         assert response.status_code == 404
         assert "not found" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# HTTP integration: source-aware statement reads (no PDF prerequisites)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_api_statement(
+    factory: async_sessionmaker[AsyncSession],
+) -> uuid.UUID:
+    """Insert a file-free API-style statement and return its UUID."""
+    async with factory() as session:
+        bank = Bank(
+            name="api_compat", display_name="API Compat Bank", password_formula="rut_sin_dv"
+        )
+        card = CreditCard(
+            bank=bank,
+            card_number_masked="XXXX XXXX XXXX 7777",
+            cardholder="API USER",
+            currency="CLP",
+        )
+        statement = Statement(
+            credit_card=card,
+            period_start=date(2026, 9, 1),
+            period_end=date(2026, 9, 30),
+            statement_date=date(2026, 10, 1),
+            file_path=None,
+            file_hash=None,
+            source=StatementSource.API,
+            status=StatementStatus.COMPLETED,
+        )
+        session.add_all([bank, card, statement])
+        await session.commit()
+        return statement.id
+
+
+class TestGetApiStyleStatementEndpoint:
+    """``GET /api/v1/statements/{id}`` must serialize file-free API rows."""
+
+    @pytest.mark.asyncio
+    async def test_returns_api_statement_with_null_files_and_source(
+        self,
+        test_settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """An API statement exposes ``source=api`` and nullable file fields."""
+        statement_id = await _seed_api_statement(session_factory)
+        app = create_app(test_settings)
+        app.dependency_overrides[get_session] = _make_session_override(session_factory)
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.get(f"/api/v1/statements/{statement_id}")
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == str(statement_id)
+        assert body["source"] == "api"
+        assert body["file_path"] is None
+        assert body["file_hash"] is None
+        assert body["status"] == "completed"
+        assert body["error_message"] is None
 
 
 # ---------------------------------------------------------------------------

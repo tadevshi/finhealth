@@ -60,7 +60,7 @@ from app.models.bank import Bank
 from app.models.category import Category
 from app.models.credit_card import CreditCard
 from app.models.merchant import MerchantAlias
-from app.models.statement import Statement, StatementStatus
+from app.models.statement import Statement, StatementSource, StatementStatus
 from app.models.transaction import Transaction
 from app.services.llm.protocol import LLMProvider
 from app.services.llm.schemas import (
@@ -381,6 +381,9 @@ class IngestionService:
             statement_date=statement_date,
             file_path=str(file_path),
             file_hash=file_hash,
+            # Explicit PDF provenance: statement source describes how the
+            # parent was created, never the origin of its transactions.
+            source=StatementSource.PDF,
             status=StatementStatus.PENDING,
         )
         self._session.add(statement)

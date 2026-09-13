@@ -273,6 +273,8 @@ for the per-section contract.
 | POST   | `/api/v1/statements/upload`           | Upload a PDF + run the ingestion pipeline     |
 | GET    | `/api/v1/statements/{statement_id}`   | Read a single statement (with transactions)   |
 | GET    | `/api/v1/transactions`                | List transactions with filters                |
+| POST   | `/api/v1/transactions`                | Create one JSON transaction linked to an existing or new statement |
+| POST   | `/api/v1/transactions/batch`          | Create 1-200 JSON transactions atomically     |
 | PATCH  | `/api/v1/transactions/{transaction_id}` | Update a single transaction's category      |
 | GET    | `/api/v1/categories`                  | List the 12 closed-set Y-NAB categories (PR #2) |
 | POST   | `/api/v1/categories/{id}`             | Rename a category + propagate to its transactions (PR #2) |
@@ -285,6 +287,123 @@ for the per-section contract.
 | GET    | `/api/v1/dashboard/merchants`         | Phase 3 top-N merchants for a month (PR #9) |
 | GET    | `/api/v1/dashboard/monthly`           | Phase 3 monthly time series for the bar chart (PR #9) |
 | GET    | `/api/v1/dashboard/recurring`         | Phase 3 active recurring rules with an in-band occurrence (PR #9) |
+
+### Transaction creation API
+
+Use the JSON creation endpoints when a PDF is incomplete or no usable PDF exists.
+Every item is append-only and must name a `statement_id`; there is no
+statement-less transaction creation.
+
+#### Existing statement: ID-only
+
+For a statement that already exists, send only `statement_id` plus transaction
+fields. Do **not** copy nested statement metadata into later requests.
+
+```json
+{
+  "statement_id": "11111111-1111-4111-8111-111111111111",
+  "date": "2026-09-10",
+  "description": "LIDER COM 3",
+  "amount": "12500.00",
+  "currency": "CLP",
+  "category_id": "22222222-2222-4222-8222-222222222222"
+}
+```
+
+If `statement` metadata is supplied for an existing statement, the API returns
+`409 statement_already_exists` even when the metadata matches. Retry with
+ID-only linkage.
+
+#### New statement: nested metadata
+
+For a missing statement UUID, include one nested `statement` object. The server
+creates that parent and the transaction in one database transaction.
+
+```json
+{
+  "statement_id": "44444444-4444-4444-8444-444444444444",
+  "statement": {
+    "credit_card_id": "33333333-3333-4333-8333-333333333333",
+    "period_start": "2026-09-01",
+    "period_end": "2026-09-30",
+    "statement_date": "2026-10-01"
+  },
+  "date": "2026-09-10",
+  "description": "LIDER COM 3",
+  "amount": "12500.00",
+  "currency": "CLP"
+}
+```
+
+API-created statements are returned with `source: "api"`, `status: "completed"`,
+and `file_path` / `file_hash` set to `null`. Here `completed` means the API
+write completed; it does not mean PDF extraction ran or that the statement is a
+complete financial record. PDF-created statements keep `source: "pdf"` and
+non-null file metadata.
+
+#### Batch and shared metadata
+
+`POST /api/v1/transactions/batch` accepts `{ "transactions": [...] }` with 1 to
+200 items. The response preserves input order and returns `{ "transactions":
+[...], "count": N }` only after all rows commit.
+
+A batch may mix existing and new statements. For each new `statement_id`, exactly
+one item supplies the nested `statement` object; the metadata-bearing item may be
+before or after other items that reference the same UUID. Additional metadata
+objects for the same new UUID return 422, even if identical.
+
+```json
+{
+  "transactions": [
+    {
+      "statement_id": "11111111-1111-4111-8111-111111111111",
+      "date": "2026-09-10",
+      "description": "EXISTING PARENT ROW",
+      "amount": "12500.00",
+      "currency": "CLP"
+    },
+    {
+      "statement_id": "44444444-4444-4444-8444-444444444444",
+      "date": "2026-09-11",
+      "description": "NEW PARENT ROW BEFORE METADATA",
+      "amount": "9900.00",
+      "currency": "CLP"
+    },
+    {
+      "statement_id": "44444444-4444-4444-8444-444444444444",
+      "statement": {
+        "credit_card_id": "33333333-3333-4333-8333-333333333333",
+        "period_start": "2026-09-01",
+        "period_end": "2026-09-30",
+        "statement_date": "2026-10-01"
+      },
+      "date": "2026-09-12",
+      "description": "NEW PARENT METADATA CARRIER",
+      "amount": "5000.00",
+      "currency": "CLP"
+    }
+  ]
+}
+```
+
+#### Categories, merchants, currencies, and retries
+
+| Topic | Contract |
+| --- | --- |
+| Category | `category_id` wins, stores the canonical category name, and marks the row confident. Without `category_id`, legacy `category` is stored verbatim and low confidence. With neither field, both stay null and low confidence. |
+| Merchant | Creation uses deterministic merchant normalization and aliases only. It does not call the optional LLM path and does not infer a transaction category from merchant defaults. |
+| Currency | The transaction currency must be exactly `CLP` or `USD` and must match the resolved statement's card currency. No conversion or inference is performed. |
+| Concurrent new statement | If two clients create the same new `statement_id`, one may succeed and the loser receives 409 with no request-owned rows persisted. The retry is an explicit later request using ID-only linkage. |
+| Duplicate caveat | Successful creation is not idempotent. Re-sending the same body may append another ordinary row. If a client times out after commit, verify existing rows before retrying. |
+| Response/source caveat | Statement `source` describes how the parent statement was created, not transaction-level provenance. API rows appended to a PDF statement leave that statement as `source: "pdf"`. |
+
+#### Non-goals
+
+This API does not add statement-less transactions, standalone statement creation,
+synthetic placeholder statements, idempotency keys, automatic retry deduplication,
+PDF reconciliation/merge/replacement, recurring-detection changes, transaction-level
+provenance, or PDF-storage removal. PDF upload, file saving, hashing, deduplication,
+and ingestion lifecycle remain the PDF workflow's contract.
 
 ### Quick health check
 
