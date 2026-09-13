@@ -1,5 +1,6 @@
 """Pydantic schemas for request/response payloads."""
 
+from app.models.statement import StatementSource
 from app.schemas.domain import (
     BankCreate,
     BankResponse,
@@ -34,6 +35,7 @@ __all__ = [
     "RecurringRuleUpdate",
     "StatementCreate",
     "StatementResponse",
+    "StatementSource",
     "TransactionCreate",
     "TransactionResponse",
 ]

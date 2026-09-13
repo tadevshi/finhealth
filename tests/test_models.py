@@ -34,6 +34,7 @@ from app.models import (
     Bank,
     CreditCard,
     Statement,
+    StatementSource,
     StatementStatus,
     Transaction,
 )
@@ -348,6 +349,136 @@ async def test_file_hash_unique_per_credit_card(
             ),
         )
         await s.commit()
+
+
+# ---------------------------------------------------------------------------
+# Statement source and file-free (API) statements
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_statement_sources_default_to_pdf_and_support_null_files(
+    session: AsyncSession,
+) -> None:
+    """Omitted source defaults to ``pdf``; API rows store null files."""
+    bank = Bank(name="santander", display_name="Banco Santander", password_formula="rut_sin_dv")
+    card = CreditCard(
+        bank=bank,
+        card_number_masked="XXXX XXXX XXXX 0951",
+        cardholder="JOHN DOE",
+        currency="CLP",
+    )
+    pdf_statement = Statement(
+        credit_card=card,
+        period_start=date(2026, 5, 1),
+        period_end=date(2026, 5, 31),
+        statement_date=date(2026, 6, 1),
+        file_path="santander/2026-05.pdf",
+        file_hash="a" * 64,
+    )
+    api_statement = Statement(
+        credit_card=card,
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 9, 30),
+        statement_date=date(2026, 10, 1),
+        file_path=None,
+        file_hash=None,
+        source=StatementSource.API,
+        status=StatementStatus.COMPLETED,
+    )
+    session.add_all([bank, card, pdf_statement, api_statement])
+    await session.commit()
+    await session.refresh(pdf_statement)
+    await session.refresh(api_statement)
+
+    # Omitted source defaults to PDF; explicit API provenance round-trips
+    # with null files and the completed status the creation flow assigns.
+    assert pdf_statement.source == StatementSource.PDF
+    assert api_statement.source == StatementSource.API
+    assert api_statement.file_path is None
+    assert api_statement.file_hash is None
+    assert api_statement.status == StatementStatus.COMPLETED
+    assert api_statement.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_multiple_api_statements_with_null_hashes_allowed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two API statements on the same card with null hashes both persist."""
+    async with session_factory() as s:
+        bank = Bank(name="itau", display_name="Itaú", password_formula="rut_sin_dv")
+        card = CreditCard(
+            bank=bank,
+            card_number_masked="XXXX XXXX XXXX 3333",
+            cardholder="BOB",
+            currency="CLP",
+        )
+        s.add_all([bank, card])
+        await s.commit()
+        card_id = card.id
+
+    for period_start in (date(2026, 9, 1), date(2026, 10, 1)):
+        async with session_factory() as s:
+            s.add(
+                Statement(
+                    credit_card_id=card_id,
+                    period_start=period_start,
+                    period_end=date(period_start.year, period_start.month, 28),
+                    statement_date=date(period_start.year, period_start.month, 30),
+                    file_path=None,
+                    file_hash=None,
+                    source=StatementSource.API,
+                    status=StatementStatus.COMPLETED,
+                ),
+            )
+            await s.commit()  # must not raise UniqueViolationError
+
+    async with session_factory() as s:
+        count = len((await s.execute(select(Statement))).scalars().all())
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_statement_source_rejects_invalid_value(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A non-enum source value fails validation at flush time."""
+    async with session_factory() as s:
+        bank = Bank(name="itau", display_name="Itaú", password_formula="rut_sin_dv")
+        card = CreditCard(
+            bank=bank,
+            card_number_masked="XXXX XXXX XXXX 4444",
+            cardholder="CAROL",
+            currency="CLP",
+        )
+        statement = Statement(
+            credit_card=card,
+            period_start=date(2026, 9, 1),
+            period_end=date(2026, 9, 30),
+            statement_date=date(2026, 10, 1),
+            file_path="x.pdf",
+            file_hash="a" * 64,
+        )
+        statement.source = "web"  # type: ignore[assignment]
+        s.add_all([bank, card, statement])
+        with pytest.raises(IntegrityError, match="ck_statements_source"):
+            await s.commit()
+
+
+def test_statement_table_constraints_match_migration_names() -> None:
+    """ORM DDL carries the same PK/CHECK names the baseline and 0002 use.
+
+    PK-name parity (``pk_statements``) lets later creation-flow tests
+    exercise exact-name conflict mapping against ``create_all`` schemas;
+    the CHECK name keeps migration/model definitions aligned.
+    """
+    constraints = {c.name for c in Statement.__table__.constraints}
+    assert {
+        "pk_statements",
+        "uq_statements_credit_card_id_file_hash",
+        "ck_statements_source",
+    } <= constraints
 
 
 # ---------------------------------------------------------------------------

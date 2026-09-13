@@ -23,7 +23,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models.statement import StatementStatus
+from app.models.statement import StatementSource, StatementStatus
 
 # ---------------------------------------------------------------------------
 # Bank
@@ -161,13 +161,29 @@ class StatementResponse(BaseModel):
     period_start: date_typ
     period_end: date_typ
     statement_date: date_typ
-    file_path: str
-    file_hash: str
+    source: StatementSource = Field(
+        description=(
+            "How the statement was created: ``pdf`` (upload/ingestion) or "
+            "``api`` (transaction creation). Statement-level creation "
+            "provenance, not per-transaction origin."
+        ),
+    )
+    file_path: str | None = Field(
+        description=(
+            "Path to the stored PDF relative to PDF_UPLOAD_DIR; null for "
+            "file-free API-created statements."
+        ),
+    )
+    file_hash: str | None = Field(
+        description=(
+            "SHA-256 of the stored PDF contents; null for file-free API-created statements."
+        ),
+    )
     status: StatementStatus
     error_message: str | None
     transactions: list[TransactionResponse] = Field(
         default_factory=list,
-        description="All transactions extracted from this statement.",
+        description="All transactions attached to this statement.",
     )
     created_at: datetime
     updated_at: datetime
