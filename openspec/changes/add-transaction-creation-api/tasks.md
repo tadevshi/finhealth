@@ -126,30 +126,30 @@ Chain strategy: feature-branch-chain
 
 ### 5.1 RED/GREEN: request-wide atomicity failures
 
-- [ ] Add failing PostgreSQL tests that inject failures after new parent flushes, after merchant/alias writes, during transaction flush, during response snapshot validation, and before/during commit; assert with a fresh independent session that no request-created statement, transaction, merchant, or alias rows survive.
-- [ ] Include late invalid batch items, multiple flushed new parents, recovered merchant conflicts followed by later failure, and existing/concurrent parent conflicts; assert pre-existing rows and independently committed winners remain.
-- [ ] Fix only `app/services/transaction_creation.py` or narrowly necessary shared code so failures propagate out of the transaction context and routes never return partial 201.
-- [ ] Record RED/GREEN PostgreSQL evidence.
+- [x] Add failing PostgreSQL tests that inject failures after new parent flushes, after merchant/alias writes, during transaction flush, during response snapshot validation, and before/during commit; assert with a fresh independent session that no request-created statement, transaction, merchant, or alias rows survive.
+- [x] Include late invalid batch items, multiple flushed new parents, recovered merchant conflicts followed by later failure, and existing/concurrent parent conflicts; assert pre-existing rows and independently committed winners remain.
+- [x] Fix only `app/services/transaction_creation.py` or narrowly necessary shared code so failures propagate out of the transaction context and routes never return partial 201. No service fix was required for slice A: the existing PR4 outer transaction already rolled back every injected failure path.
+- [x] Record RED/GREEN PostgreSQL evidence.
 
 ### 5.2 RED/GREEN: real concurrent new-statement races
 
-- [ ] Add two-session/barrier PostgreSQL tests where concurrent requests attempt the same new `statement_id` with matching and different valid metadata; both observe absence, one succeeds, loser receives atomic 409, and loser request-created rows are absent.
-- [ ] Add tests for reversed multi-parent input order, earlier inserted loser parent(s), winner rollback allowing the other insert to succeed, no automatic retry/reuse, explicit ID-only retry success, and resending metadata after success still returning 409.
-- [ ] Ensure conflict mapping uses exact statement PK uniqueness and does not classify card/hash/FK/deadlock/connection errors as parent races.
-- [ ] Record RED/GREEN evidence.
+- [x] Add two-session/barrier PostgreSQL tests where concurrent requests attempt the same new `statement_id` with matching and different valid metadata; both observe absence, one succeeds, loser receives atomic 409, and loser request-created rows are absent.
+- [x] Add tests for reversed multi-parent input order, earlier inserted loser parent(s), winner rollback allowing the other insert to succeed, no automatic retry/reuse, explicit ID-only retry success, and resending metadata after success still returning 409.
+- [x] Ensure conflict mapping uses exact statement PK uniqueness and does not classify card/hash/FK/deadlock/connection errors as parent races.
+- [x] Record RED/GREEN evidence.
 
 ### 5.3 TRIANGULATE: PDF, migration, and source regressions under full flow
 
-- [ ] Run or add regressions proving PDF upload still saves identical bytes, hashes real content, returns `source=pdf`/non-null file metadata, deduplicates by card/hash, preserves lifecycle/failure/recurring behavior, and remains separate from similar API-created statements.
-- [ ] Re-run migration downgrade/upgrade, nullable/source, unsafe downgrade, and uniqueness tests after routes exist.
-- [ ] Verify API calls create no files and never schedule PDF, LLM, recurring, reconciliation, or idempotency behavior.
-- [ ] Record focused PostgreSQL/PDF evidence; if real PDF E2E prerequisites (`TEST_RUT`, sample PDFs) are unavailable, record unavailable rather than passed.
+- [x] Run or add regressions proving PDF upload still saves identical bytes, hashes real content, returns `source=pdf`/non-null file metadata, deduplicates by card/hash, preserves lifecycle/failure/recurring behavior, and remains separate from similar API-created statements.
+- [x] Re-run migration downgrade/upgrade, nullable/source, unsafe downgrade, and uniqueness tests after routes exist.
+- [x] Verify API calls create no files and never schedule PDF, LLM, recurring, reconciliation, or idempotency behavior.
+- [x] Record focused PostgreSQL/PDF evidence; if real PDF E2E prerequisites (`TEST_RUT`, sample PDFs) are unavailable, record unavailable rather than passed.
 
 ### 5.4 RED/GREEN: documentation
 
-- [ ] Add executable documentation checks if available, or record a manual RED checklist for `README.md` requiring existing-parent ID-only examples, new-parent nested metadata examples, mixed batch/shared metadata rules, 409 retry with ID-only linkage, nullable statement response fields/source, API completed-status meaning, category/currency/merchant behavior, 1–200 batch limit, append-only/non-idempotent/timeout duplicate caveats, and no reconciliation/recurring/PDF-storage-removal promises.
-- [ ] Update `README.md` with concise JSON examples and caveats; avoid implying statement source is transaction-level provenance.
-- [ ] Run `./scripts/verify.sh` when docs/config/web are touched, or record exact unavailable prerequisites.
+- [x] Add executable documentation checks if available, or record a manual RED checklist for `README.md` requiring existing-parent ID-only examples, new-parent nested metadata examples, mixed batch/shared metadata rules, 409 retry with ID-only linkage, nullable statement response fields/source, API completed-status meaning, category/currency/merchant behavior, 1–200 batch limit, append-only/non-idempotent/timeout duplicate caveats, and no reconciliation/recurring/PDF-storage-removal promises.
+- [x] Update `README.md` with concise JSON examples and caveats; avoid implying statement source is transaction-level provenance.
+- [x] Run `./scripts/verify.sh` when docs/config/web are touched, or record exact unavailable prerequisites.
 
 ### 5.5 REFACTOR and final verification
 
