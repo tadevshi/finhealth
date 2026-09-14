@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import date as date_typ
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -50,6 +50,52 @@ TEMPLATES_DIR: Path = Path(__file__).parent / "templates"
 templates: Jinja2Templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 web_router: APIRouter = APIRouter(tags=["web"])
+
+
+def parse_optional_date(raw: str | None, *, field: str) -> date_typ | None:
+    """Parse a query-string date, treating an empty value as "no filter".
+
+    The HTML filter form serialises untouched fields as empty
+    strings (``date_from=&date_to=&min_amount=``), and programmatic
+    clients can send the same shape. An empty or whitespace-only
+    value therefore means "absent" and yields ``None``.
+
+    A non-empty unparseable value keeps the strict 422 contract —
+    "treat empty as absent" must never become "ignore invalid". The
+    error detail names the offending ``field`` so the client can
+    locate the bad value.
+
+    The JSON API at ``app.api.v1.transactions`` imports these helpers
+    so the HTML and JSON surfaces share one parsing rule.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return date_typ.fromisoformat(raw.strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"`{field}` must be an ISO date (YYYY-MM-DD); got {raw!r}",
+        ) from exc
+
+
+def parse_optional_decimal(raw: str | None, *, field: str) -> Decimal | None:
+    """Parse a query-string decimal, treating an empty value as "no filter".
+
+    Mirrors :func:`parse_optional_date`: empty/whitespace-only values
+    are absent, garbage non-empty values raise HTTP 422 with a clear
+    detail naming the offending ``field``, and valid non-empty values
+    keep their exact behaviour.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return Decimal(raw.strip())
+    except InvalidOperation as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"`{field}` must be a decimal number; got {raw!r}",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -277,20 +323,38 @@ async def transactions_page(
         Query(description="Optional filter to a single statement."),
     ] = None,
     date_from: Annotated[
-        date_typ | None,
-        Query(description="Inclusive lower bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     date_to: Annotated[
-        date_typ | None,
-        Query(description="Inclusive upper bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     min_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive lower bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     max_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive upper bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     description: Annotated[
         str | None,
@@ -336,13 +400,19 @@ async def transactions_page(
     so the per-row ``<select>`` and the filter form's
     multi-select see the same 12 options in the same order.
     """
+    # Fix 3: the form serialises untouched fields as empty strings; the
+    # empty values mean "no filter" while garbage stays a 422.
+    parsed_date_from = parse_optional_date(date_from, field="date_from")
+    parsed_date_to = parse_optional_date(date_to, field="date_to")
+    parsed_min_amount = parse_optional_decimal(min_amount, field="min_amount")
+    parsed_max_amount = parse_optional_decimal(max_amount, field="max_amount")
     transactions = await _query_transactions(
         session,
         statement_id=statement_id,
-        date_from=date_from,
-        date_to=date_to,
-        min_amount=min_amount,
-        max_amount=max_amount,
+        date_from=parsed_date_from,
+        date_to=parsed_date_to,
+        min_amount=parsed_min_amount,
+        max_amount=parsed_max_amount,
         description=description,
         currency=currency,
         category_id=category_id,
@@ -358,10 +428,10 @@ async def transactions_page(
         "total": len(transactions),
         "filters": {
             "statement_id": statement_id,
-            "date_from": date_from,
-            "date_to": date_to,
-            "min_amount": min_amount,
-            "max_amount": max_amount,
+            "date_from": parsed_date_from,
+            "date_to": parsed_date_to,
+            "min_amount": parsed_min_amount,
+            "max_amount": parsed_max_amount,
             "description": description,
             "currency": currency,
             "category_id": category_id or [],
@@ -395,20 +465,38 @@ async def transactions_rows_partial(
         Query(description="Optional filter to a single statement."),
     ] = None,
     date_from: Annotated[
-        date_typ | None,
-        Query(description="Inclusive lower bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     date_to: Annotated[
-        date_typ | None,
-        Query(description="Inclusive upper bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     min_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive lower bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     max_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive upper bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     description: Annotated[
         str | None,
@@ -451,13 +539,19 @@ async def transactions_rows_partial(
     ``<select>`` markup stays meaningful when the partial is
     re-rendered (e.g. on first paint or after a PATCH swap).
     """
+    # Fix 3: the form serialises untouched fields as empty strings; the
+    # empty values mean "no filter" while garbage stays a 422.
+    parsed_date_from = parse_optional_date(date_from, field="date_from")
+    parsed_date_to = parse_optional_date(date_to, field="date_to")
+    parsed_min_amount = parse_optional_decimal(min_amount, field="min_amount")
+    parsed_max_amount = parse_optional_decimal(max_amount, field="max_amount")
     transactions = await _query_transactions(
         session,
         statement_id=statement_id,
-        date_from=date_from,
-        date_to=date_to,
-        min_amount=min_amount,
-        max_amount=max_amount,
+        date_from=parsed_date_from,
+        date_to=parsed_date_to,
+        min_amount=parsed_min_amount,
+        max_amount=parsed_max_amount,
         description=description,
         currency=currency,
         category_id=category_id,

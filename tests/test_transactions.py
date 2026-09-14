@@ -305,6 +305,76 @@ async def test_list_transactions_both_filters(
     assert set(_descriptions(body)) == {"FOOD-TX", "NULL-TX", "LOWCONF-TX"}
 
 
+@pytest.mark.asyncio
+async def test_list_transactions_empty_string_params_mean_no_filter(
+    seeded_engine: AsyncEngine, seeded_client: AsyncClient
+) -> None:
+    """Empty-string numeric/date query params are treated as absent (Fix 3).
+
+    The HTML filter form serialises untouched fields as empty
+    strings, and programmatic clients can too. The JSON API must
+    apply only the non-empty filters — not fail with 422
+    decimal/date parsing.
+    """
+    await _seed_diverse_transactions(seeded_engine)
+    response = await seeded_client.get(
+        "/api/v1/transactions",
+        params={
+            "date_from": "2026-06-07",
+            "date_to": "",
+            "min_amount": "",
+            "max_amount": "",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # Only the date_from floor is applied; the empty bounds are ignored.
+    assert set(_descriptions(body)) == {"NULL-TX", "LOWCONF-TX", "TRAVEL-TX"}
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_all_empty_string_params_return_everything(
+    seeded_engine: AsyncEngine, seeded_client: AsyncClient
+) -> None:
+    """Every filter field empty (``?date_from=&...&max_amount=``) == no filter."""
+    await _seed_diverse_transactions(seeded_engine)
+    response = await seeded_client.get(
+        "/api/v1/transactions",
+        params={
+            "date_from": "",
+            "date_to": "",
+            "min_amount": "",
+            "max_amount": "",
+        },
+    )
+    assert response.status_code == 200
+    assert len(response.json()) == 5
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_invalid_non_empty_values_still_422(
+    seeded_engine: AsyncEngine, seeded_client: AsyncClient
+) -> None:
+    """Garbage non-empty values keep the 422 validation contract (Fix 3).
+
+    "Treat empty as absent" must not become "ignore invalid": both
+    an unparseable date and an unparseable decimal stay client
+    errors with a clear detail.
+    """
+    await _seed_diverse_transactions(seeded_engine)
+
+    response = await seeded_client.get("/api/v1/transactions", params={"date_from": "banana"})
+    assert response.status_code == 422
+    assert "date_from" in str(response.json()["detail"])
+
+    response = await seeded_client.get("/api/v1/transactions", params={"min_amount": "banana"})
+    assert response.status_code == 422
+    assert "min_amount" in str(response.json()["detail"])
+
+    response = await seeded_client.get("/api/v1/transactions", params={"date_from": "   "})
+    assert response.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # PATCH /api/v1/transactions/{id} — Accept header dispatch
 # ---------------------------------------------------------------------------

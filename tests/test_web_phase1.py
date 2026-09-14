@@ -608,6 +608,77 @@ async def test_transactions_page_blank_currency_preserves_matching_filters(
     assert "No transactions match" not in body
 
 
+@pytest.mark.asyncio
+async def test_transactions_page_empty_numeric_and_date_params_mean_no_filter(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """Empty-string numeric/date query params are treated as absent (Fix 3).
+
+    The HTML filter form serialises untouched fields as empty
+    strings (``date_from=2026-04-01&min_amount=&max_amount=``).
+    The page must return 200 with the date filter applied and the
+    empty numeric bounds ignored — not the 422 decimal-parsing
+    failure the old signature produced.
+    """
+    response = await client.get(
+        TRANSACTIONS_PATH,
+        params={
+            "date_from": "2026-04-10",
+            "min_amount": "",
+            "max_amount": "",
+        },
+    )
+    assert response.status_code == 200
+    body = response.text
+    # Only COPEC (Apr 10) and PARIS (Apr 15) pass the date floor;
+    # LIDER (Apr 5) is filtered out by the date alone.
+    assert "COPEC" in body
+    assert "PARIS" in body
+    assert "LIDER" not in body
+
+
+@pytest.mark.asyncio
+async def test_transactions_page_invalid_non_empty_param_still_422(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """A garbage non-empty value keeps the 422 validation contract.
+
+    "Treat empty as absent" must not become "ignore invalid": a
+    non-empty unparseable amount stays a client error.
+    """
+    response = await client.get(TRANSACTIONS_PATH, params={"min_amount": "banana"})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_transactions_rows_empty_numeric_and_date_params_mean_no_filter(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """The HTMX partial shares the empty-string tolerance (Fix 3)."""
+    response = await client.get(
+        ROWS_PATH,
+        params={
+            "date_from": "2026-04-10",
+            "min_amount": "",
+            "max_amount": "",
+            "currency": "",
+        },
+    )
+    assert response.status_code == 200
+    body = response.text
+    assert body.count(ROW_TESTID) == 2
+    assert "LIDER" not in body
+
+
+@pytest.mark.asyncio
+async def test_transactions_rows_invalid_non_empty_param_still_422(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """A garbage non-empty date value keeps the 422 validation contract."""
+    response = await client.get(ROWS_PATH, params={"date_from": "banana"})
+    assert response.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # HTMX partial
 # ---------------------------------------------------------------------------
