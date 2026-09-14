@@ -31,11 +31,14 @@
 {% set txn_count = summary.transaction_count if summary.transaction_count is defined else 0 %}
 {% set clp_count = count_map.get('CLP', 0) %}
 {% set usd_count = count_map.get('USD', 0) %}
-{# ``recur_count`` and ``recur_monthly`` come from the live
-   service call in ``dashboard_section_summary`` (see the docstring).
-   They are ``0`` when no recurring rules match the period.            #}
+{# ``recur_count`` / ``recur_monthly`` / ``recur_total_per_currency``
+   come from the category-driven subscriptions summary (Fix 2): the
+   closed-set Subscriptions category, not the recurring-rules detector.
+   They are ``0`` / ``{}`` when no subscription charges match the window. #}
 {% set recur_count = recur_count|default(0) %}
 {% set recur_monthly = recur_monthly|default(0) %}
+{% set recur_totals = recur_total_per_currency if recur_total_per_currency is defined else {} %}
+{% set recur_usd = recur_totals.get('USD') %}
 
 <div data-testid="dashboard-summary"
      class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -151,7 +154,8 @@
   </div>
 
   {# --- Card 4: Suscripciones ------------------------------------ #}
-  {# ``recur_count`` and ``recur_monthly`` are live service values. #}
+  {# Category-driven values (Fix 2): count + per-currency totals
+     from the closed-set Subscriptions category in the window.     #}
   <div class="rounded-2xl border border-border bg-surface
               p-6 flex flex-col gap-4">
     <h3 class="text-[13px] text-text-subtle font-medium">
@@ -163,9 +167,22 @@
           {% if recur_count %}{{ recur_count }}{% else %}&mdash;{% endif %}
         </p>
         <p class="text-xs text-text-subtle">
-          {% if recur_monthly %}$ {{ "{:,.0f}".format(recur_monthly) }} / mes{% else %}sin cargos detectados{% endif %}
+          {% set recur_suffix = recur_suffix|default('/ mes') %}
+          {% if recur_monthly %}$ {{ "{:,.0f}".format(recur_monthly) }} {{ recur_suffix }}{% else %}sin cargos detectados{% endif %}
         </p>
       </div>
+      {% if recur_usd %}
+      <div class="h-px bg-surface-container-high"></div>
+      <div class="flex flex-col gap-1">
+        <div class="flex items-center gap-2">
+          <span class="w-1.5 h-1.5 rounded-full bg-success"></span>
+          <span class="font-mono text-[10px] font-semibold text-text-subtle tracking-[1px]">USD</span>
+        </div>
+        <p class="font-mono text-[18px] font-semibold text-text-secondary">
+          $ {{ "{:,.2f}".format(recur_usd) }}
+        </p>
+      </div>
+      {% endif %}
     </div>
   </div>
 

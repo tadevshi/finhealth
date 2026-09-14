@@ -1344,6 +1344,345 @@ class TestWindowedSections:
         assert rows[0].last_seen_date == date(2026, 7, 10)
 
 
+class TestSubscriptionsSummary:
+    """``subscriptions_summary`` rolls up the Subscriptions category.
+
+    Fix 2: the "Suscripciones" KPI card is driven by the closed-set
+    ``display_name == 'Subscriptions'`` category (resolved at query time,
+    never hard-coded by UUID) instead of the LLM-dependent recurring-rules
+    detector. Totals are per-currency: CLP and USD are never summed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_subscriptions_summary_counts_only_subscription_category(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Only ``Subscriptions``-tagged rows count; other categories are excluded.
+
+        Two subscription transactions (CLP 9,990 + CLP 5,990) and one
+        groceries transaction in the window -> ``count == 2`` and
+        ``total_per_currency == {"CLP": 15980.00}``.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        subscriptions = categories["Subscriptions"]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="9990.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="5990.00",
+                txn_date=date(2026, 7, 15),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="50000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            result = await DashboardService(session).subscriptions_summary(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
+
+        assert result["count"] == 2
+        assert result["total_per_currency"] == {"CLP": Decimal("15980.00")}
+
+    @pytest.mark.asyncio
+    async def test_subscriptions_summary_keeps_currencies_separate(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """CLP and USD subscription rows are reported side by side, never summed."""
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        statement_b = seeded_world["statement_b_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        merchant_usd = seeded_world["merchant_usd_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        subscriptions = categories["Subscriptions"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="9990.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_b,
+                merchant_id=merchant_usd,
+                amount="15.99",
+                txn_date=date(2026, 7, 8),
+                currency="USD",
+                category_id=subscriptions.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            result = await DashboardService(session).subscriptions_summary(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
+
+        assert result["count"] == 2
+        assert result["total_per_currency"] == {
+            "CLP": Decimal("9990.00"),
+            "USD": Decimal("15.99"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_subscriptions_summary_window_and_card_filter(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """The window bounds and the card filter both narrow the rollup.
+
+        Card A holds a July subscription; card B holds a June one. A
+        ``[2026-07-01, 2026-07-31]`` window with ``card_id=card_a`` sees
+        only the July row, even though both carry the Subscriptions
+        category.
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        statement_b = seeded_world["statement_b_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        merchant_usd = seeded_world["merchant_usd_id"]  # type: ignore[arg-type]
+        card_a = seeded_world["card_a_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        subscriptions = categories["Subscriptions"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="9990.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_b,
+                merchant_id=merchant_usd,
+                amount="15.99",
+                txn_date=date(2026, 6, 8),
+                currency="USD",
+                category_id=subscriptions.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            result = await DashboardService(session).subscriptions_summary(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id=card_a,
+            )
+
+        assert result["count"] == 1
+        assert result["total_per_currency"] == {"CLP": Decimal("9990.00")}
+
+    @pytest.mark.asyncio
+    async def test_subscriptions_summary_empty_when_category_missing(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """A missing Subscriptions category row degrades to "no subscriptions".
+
+        The design decision is explicit: the category is resolved by
+        ``display_name == 'Subscriptions'`` at query time, and a missing
+        row must produce an empty summary — never an error and never a
+        hard-coded UUID fallback.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        subscriptions = categories["Subscriptions"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="9990.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            await session.commit()
+            # Remove the category row so the display-name lookup misses.
+            # The FK is ON DELETE SET NULL, so the transaction survives
+            # with ``category_id = NULL`` — exactly the production shape
+            # when the taxonomy has not been seeded.
+            await session.delete(subscriptions)
+            await session.commit()
+
+        async with session_factory() as session:
+            result = await DashboardService(session).subscriptions_summary(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
+
+        assert result["count"] == 0
+        assert result["total_per_currency"] == {}
+
+
+class TestSubscriptionsTransactions:
+    """``subscriptions_transactions`` lists Subscriptions rows for the section."""
+
+    @pytest.mark.asyncio
+    async def test_subscriptions_transactions_returns_merchant_names(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Rows carry merchant name, date, amount, currency — ordered by date desc.
+
+        Non-subscription rows (including other categories and rows
+        outside the window) are excluded.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        subscriptions = categories["Subscriptions"]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="5990.00",
+                txn_date=date(2026, 7, 15),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="9990.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            # Excluded: different category.
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="50000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            # Excluded: outside the window.
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="1234.00",
+                txn_date=date(2026, 5, 1),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).subscriptions_transactions(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
+
+        assert len(rows) == 2
+        # Ordered by date descending: the newest subscription first.
+        assert rows[0]["merchant_name"] == "netflix"
+        assert rows[0]["date"] == date(2026, 7, 15)
+        assert rows[0]["amount"] == Decimal("5990.00")
+        assert rows[0]["currency"] == "CLP"
+        assert rows[1]["date"] == date(2026, 7, 3)
+
+    @pytest.mark.asyncio
+    async def test_subscriptions_transactions_limit_and_empty_category(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """The ``limit`` caps the list; a missing category yields no rows."""
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        subscriptions = categories["Subscriptions"]
+
+        async with session_factory() as session:
+            for day in (1, 2, 3):
+                _add_transaction(
+                    session,
+                    statement_id=statement_id,
+                    merchant_id=merchant_id,
+                    amount="999.00",
+                    txn_date=date(2026, 7, day),
+                    currency="CLP",
+                    category_id=subscriptions.id,
+                )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).subscriptions_transactions(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+                limit=2,
+            )
+        assert len(rows) == 2
+
+        # Missing category -> no rows (and no error).
+        async with session_factory() as session:
+            cat_row = await session.get(Category, subscriptions.id)
+            assert cat_row is not None
+            await session.delete(cat_row)
+            await session.commit()
+        async with session_factory() as session:
+            rows = await DashboardService(session).subscriptions_transactions(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
+        assert rows == []
+
+
 # ---------------------------------------------------------------------------
 # merchants
 # ---------------------------------------------------------------------------

@@ -1,17 +1,41 @@
-{# Partial: active recurring rules with real service data only. #}
+{# Partial: subscription transactions (category-driven; Fix 2).
+
+   The "Suscripciones" section lists the transactions in the window
+   whose category is the closed-set "Subscriptions" category
+   (``display_name == 'Subscriptions'``). The recurring-rules detector
+   is LLM-dependent and unstable, so this section is driven by the
+   closed-set category instead of the ``recurring_rules`` table.
+
+   Context variables
+   -----------------
+
+   recurring:
+       List of subscription transaction rows from
+       :meth:`app.services.dashboard.DashboardService.subscriptions_transactions`
+       (``id``, ``merchant_name``, ``description``, ``date``,
+       ``amount``, ``currency``), ordered by date descending.
+   period_label:
+       Pre-formatted period label for the subtitle.
+   recur_monthly:
+       CLP total for the window (optional; ``0``/undefined shows
+       the "Sin cargos" badge).
+   recur_total_per_currency:
+       Optional per-currency totals; the USD entry feeds the
+       secondary currency block.
+#}
 <div id="dashboard-recurring"
      data-testid="dashboard-recurring"
      class="rounded-2xl border border-border bg-surface p-6
-             flex min-w-0 flex-col gap-4 scroll-mt-24">
+                 flex min-w-0 flex-col gap-4 scroll-mt-24">
 
   <div class="flex items-center justify-between">
     <div>
       <h2 class="font-display text-lg font-semibold text-text-primary
                  tracking-[-0.25px]">
-        Suscripciones recurrentes
+        Suscripciones
       </h2>
       <p class="text-[12px] text-text-subtle mt-0.5">
-        {{ recurring|length }} cargos recurrentes con movimiento en {{ period_label }}
+        {{ recurring|length }} cargos con categor&iacute;a Subscriptions en {{ period_label }}
       </p>
     </div>
     <span class="px-3 py-1 rounded-full bg-surface-container-high
@@ -23,19 +47,19 @@
   {% if recurring|length == 0 %}
     <div class="rounded-xl border border-dashed border-border-strong bg-surface-container p-3 text-sm text-text-secondary"
        data-testid="dashboard-recurring-empty">
-      No active recurring charges have an in-band movement for this period. This stays empty until real recurring data matches the current filters.
+      No subscription-category transactions for this selection yet. Charges tagged with the Subscriptions category appear here once imported movements match the current filters.
     </div>
   {% else %}
     <ul class="flex flex-col divide-y divide-border"
         data-testid="dashboard-recurring-list">
-      {% for rule in recurring %}
-        {% set merch_name = merchants_by_id.get(rule.merchant_id, rule.merchant_id|string) %}
+      {% for txn in recurring %}
+        {% set merch_name = txn.merchant_name or txn.description %}
         {% set initial = merch_name[0]|upper if merch_name else '?' %}
         {% set colors = ['bg-danger', 'bg-success', 'bg-accent', 'bg-info', 'bg-warning'] %}
         {% set swatch = colors[loop.index0 % colors|length] %}
         <li class="flex w-full items-center gap-3.5 py-3.5 first:pt-0 last:pb-0"
             data-testid="dashboard-recurring-row"
-            data-rule-id="{{ rule.id }}">
+            data-transaction-id="{{ txn.id }}">
           <div class="size-8 flex-none rounded-lg {{ swatch }} grid place-items-center">
             <span class="font-display text-sm font-bold text-white">{{ initial }}</span>
           </div>
@@ -47,16 +71,15 @@
             </p>
             <p class="text-xs text-text-subtle"
                data-testid="dashboard-recurring-meta">
-              {{ rule.period_label }}
-              {% if rule.occurrences %}&middot; {{ rule.occurrences }} cargos{% endif %}
+              {{ txn.date }}
             </p>
           </div>
           <span class="font-mono text-sm font-semibold text-text-primary w-24 flex-none text-right whitespace-nowrap"
                 data-testid="dashboard-recurring-amount">
-            {% if rule.currency == 'CLP' %}
-              $ {{ "{:,.0f}".format(rule.amount_min) }}
+            {% if txn.currency == 'CLP' %}
+              $ {{ "{:,.0f}".format(txn.amount) }}
             {% else %}
-              $ {{ "{:,.2f}".format(rule.amount_min) }}
+              $ {{ "{:,.2f}".format(txn.amount) }} {{ txn.currency }}
             {% endif %}
           </span>
         </li>

@@ -13,6 +13,7 @@ surface lives under ``/api/v1`` and is wired separately by
 
 from __future__ import annotations
 
+import calendar
 import uuid
 from datetime import date as date_typ
 from decimal import Decimal, InvalidOperation
@@ -29,7 +30,6 @@ from app.db.session import get_session
 from app.models.bank import Bank
 from app.models.category import Category
 from app.models.credit_card import CreditCard
-from app.models.merchant import Merchant
 from app.models.statement import Statement
 from app.models.transaction import Transaction
 from app.services.dashboard import DashboardService
@@ -50,6 +50,11 @@ TEMPLATES_DIR: Path = Path(__file__).parent / "templates"
 templates: Jinja2Templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 web_router: APIRouter = APIRouter(tags=["web"])
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def parse_optional_date(raw: str | None, *, field: str) -> date_typ | None:
@@ -96,11 +101,6 @@ def parse_optional_decimal(raw: str | None, *, field: str) -> Decimal | None:
             status_code=422,
             detail=f"`{field}` must be a decimal number; got {raw!r}",
         ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 async def _query_transactions(
@@ -539,19 +539,15 @@ async def transactions_rows_partial(
     ``<select>`` markup stays meaningful when the partial is
     re-rendered (e.g. on first paint or after a PATCH swap).
     """
-    # Fix 3: the form serialises untouched fields as empty strings; the
-    # empty values mean "no filter" while garbage stays a 422.
-    parsed_date_from = parse_optional_date(date_from, field="date_from")
-    parsed_date_to = parse_optional_date(date_to, field="date_to")
-    parsed_min_amount = parse_optional_decimal(min_amount, field="min_amount")
-    parsed_max_amount = parse_optional_decimal(max_amount, field="max_amount")
+    # Fix 3: shared empty-string tolerance with the page (see
+    # :func:`parse_optional_date`).
     transactions = await _query_transactions(
         session,
         statement_id=statement_id,
-        date_from=parsed_date_from,
-        date_to=parsed_date_to,
-        min_amount=parsed_min_amount,
-        max_amount=parsed_max_amount,
+        date_from=parse_optional_date(date_from, field="date_from"),
+        date_to=parse_optional_date(date_to, field="date_to"),
+        min_amount=parse_optional_decimal(min_amount, field="min_amount"),
+        max_amount=parse_optional_decimal(max_amount, field="max_amount"),
         description=description,
         currency=currency,
         category_id=category_id,
@@ -733,14 +729,23 @@ async def _dashboard_context(
     monthly = await service.monthly_window(
         window_start=window_start, window_end=window_end, card_id=selection.card_id
     )
-    recurring_rows = await service.recurring(period=period_date, card_id=selection.card_id)
-    merchant_names = await _lookup_merchant_names(
-        session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
+    # Fix 2: the "Suscripciones" KPI card and the recurring section are
+    # driven by the closed-set Subscriptions category (the recurring-rules
+    # detector is LLM-dependent and unstable). Both render over the same
+    # resolved window as the other sections.
+    subscriptions_summary = await service.subscriptions_summary(
+        window_start=window_start,
+        window_end=window_end,
+        card_id=selection.card_id,
     )
-    recur_count = len(recurring_rows)
-    recur_monthly = sum(
-        int(row.get("amount_min", 0) or 0) for row in recurring_rows if row.get("currency") == "CLP"
+    subscription_rows = await service.subscriptions_transactions(
+        window_start=window_start,
+        window_end=window_end,
+        card_id=selection.card_id,
     )
+    recur_total_per_currency = subscriptions_summary["total_per_currency"]
+    recur_count = int(subscriptions_summary["count"])
+    recur_monthly = int(recur_total_per_currency.get("CLP", Decimal("0")))
     context: dict[str, Any] = {
         "request": request,
         "cards": cards,
@@ -748,8 +753,7 @@ async def _dashboard_context(
         "categories": categories,
         "merchants": merchants,
         "monthly": monthly,
-        "recurring": recurring_rows,
-        "merchants_by_id": merchant_names,
+        "recurring": subscription_rows,
         "period_label": labels.period_label,
         "period_iso": selection.period.iso(),
         "card_label": labels.card_label,
@@ -760,6 +764,8 @@ async def _dashboard_context(
         "selected_card_id": str(selection.card_id),
         "recur_count": recur_count,
         "recur_monthly": recur_monthly,
+        "recur_total_per_currency": recur_total_per_currency,
+        "recur_suffix": "" if selection.range_mode.kind == "all_time" else "/ mes",
         "window_start": window_start,
         "window_end": window_end,
     }
@@ -783,24 +789,6 @@ async def _list_active_cards(session: AsyncSession) -> list[CreditCard]:
         .order_by(CreditCard.bank_id.asc(), CreditCard.card_number_masked.asc())
     )
     return list(result.scalars().all())
-
-
-async def _lookup_merchant_names(
-    session: AsyncSession, merchant_ids: list[uuid.UUID]
-) -> dict[uuid.UUID, str]:
-    """Resolve ``merchant_id`` UUIDs to display names for the recurring partial.
-
-    The recurring section is the only section that needs the
-    merchant name in the template. Loading every merchant name
-    in a single round-trip keeps the partial render to one
-    extra query (instead of one per row).
-    """
-    if not merchant_ids:
-        return {}
-    result = await session.execute(
-        select(Merchant.id, Merchant.name).where(Merchant.id.in_(merchant_ids))
-    )
-    return dict[uuid.UUID, str](result.all())  # type: ignore[arg-type]
 
 
 @web_router.get(
@@ -927,20 +915,21 @@ async def dashboard_section_summary(
     service = DashboardService(session)
     summary = await service.summary(period=period_date, card_id=parsed_card_id)
 
-    # ``Suscripciones`` KPI card needs the live recurring rules, not a
-    # hard-coded count. We re-use the same service call the rest of
-    # the dashboard makes; the rules are already filtered by the
-    # service for in-band occurrences in the period.
-    recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
-    recur_count = len(recurring_rows)
-    # Sum the per-rule minimum amount (CLP only — USD is rare in the
-    # recurring dataset and would skew the total without FX conversion).
-    recur_monthly = 0
-    for row in recurring_rows:
-        amount = row.get("amount_min", 0) or 0
-        currency = row.get("currency", "CLP")
-        if currency == "CLP":
-            recur_monthly += int(amount)
+    # Fix 2: the ``Suscripciones`` KPI card is driven by the closed-set
+    # Subscriptions category (the recurring-rules detector is
+    # LLM-dependent and unstable). This partial is month-scoped (it
+    # receives no ``range_mode``), so the window is the period month.
+    month_start = period_date.replace(day=1)
+    last_day = calendar.monthrange(period_date.year, period_date.month)[1]
+    month_end = period_date.replace(day=last_day)
+    subscriptions = await service.subscriptions_summary(
+        window_start=month_start,
+        window_end=month_end,
+        card_id=parsed_card_id,
+    )
+    recur_total_per_currency = subscriptions["total_per_currency"]
+    recur_count = int(subscriptions["count"])
+    recur_monthly = int(recur_total_per_currency.get("CLP", Decimal("0")))
 
     context: dict[str, Any] = {
         "summary": summary,
@@ -949,6 +938,7 @@ async def dashboard_section_summary(
         "range_label": "",
         "recur_count": recur_count,
         "recur_monthly": recur_monthly,
+        "recur_total_per_currency": recur_total_per_currency,
     }
     return templates.TemplateResponse(
         request=request,
@@ -1086,7 +1076,13 @@ async def dashboard_section_recurring(
     period: Annotated[str, Query(description="ISO 'YYYY-MM' month label.")],
     card_id: Annotated[str, Query(description="UUID or 'all'.")] = "all",
 ) -> HTMLResponse:
-    """HTMX partial: render the active recurring rules for the period."""
+    """HTMX partial: render the subscription transactions for the period.
+
+    Fix 2: the section is driven by the closed-set Subscriptions
+    category instead of the recurring-rules detector. This partial is
+    month-scoped (it receives no ``range_mode``), so the window is the
+    period month.
+    """
     try:
         year_str, month_str = period.split("-")
         period_date = date_typ(int(year_str), int(month_str), 1)
@@ -1096,15 +1092,27 @@ async def dashboard_section_recurring(
     cards = await _list_active_cards(session)
     parsed_card_id = _parse_card_filter(card_id)
     service = DashboardService(session)
-    recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
-    merchant_names = await _lookup_merchant_names(
-        session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
+    month_start = period_date.replace(day=1)
+    last_day = calendar.monthrange(period_date.year, period_date.month)[1]
+    month_end = period_date.replace(day=last_day)
+    subscriptions = await service.subscriptions_summary(
+        window_start=month_start,
+        window_end=month_end,
+        card_id=parsed_card_id,
     )
+    subscription_rows = await service.subscriptions_transactions(
+        window_start=month_start,
+        window_end=month_end,
+        card_id=parsed_card_id,
+    )
+    recur_total_per_currency = subscriptions["total_per_currency"]
     context: dict[str, Any] = {
-        "recurring": recurring_rows,
-        "merchants_by_id": merchant_names,
+        "recurring": subscription_rows,
         "period_label": period,
         "card_label": _card_label(card_id, cards),
+        "recur_count": int(subscriptions["count"]),
+        "recur_monthly": int(recur_total_per_currency.get("CLP", Decimal("0"))),
+        "recur_total_per_currency": recur_total_per_currency,
     }
     return templates.TemplateResponse(
         request=request,

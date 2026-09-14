@@ -74,7 +74,7 @@ import calendar
 from dataclasses import dataclass, field
 from datetime import date as date_typ
 from decimal import Decimal
-from typing import TypeVar
+from typing import TypedDict, TypeVar
 from uuid import UUID
 
 from sqlalchemy import Select, and_, func, or_, select
@@ -127,6 +127,13 @@ _DEFAULT_MERCHANT_LIMIT: int = 10
 #: service keeps the same default so a caller that omits
 #: ``range_months`` gets a 6-month prior-period comparison.
 _DEFAULT_RANGE_MONTHS: int = 6
+
+
+#: ``display_name`` of the closed-set category that drives the
+#: "Suscripciones" KPI card and the subscriptions section. The lookup
+#: happens at query time (never a hard-coded UUID) so a missing
+#: category row degrades to "no subscriptions".
+_SUBSCRIPTIONS_DISPLAY_NAME: str = "Subscriptions"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +226,18 @@ def _add_months(d: date_typ, months: int) -> date_typ:
         month -= 12
         year += 1
     return date_typ(year, month, 1)
+
+
+class SubscriptionsSummary(TypedDict):
+    """Return shape of :meth:`DashboardService.subscriptions_summary`.
+
+    ``count`` is the number of Subscriptions-category transactions in
+    the window; ``total_per_currency`` keeps one entry per ISO-4217
+    currency present (CLP and USD are never summed).
+    """
+
+    count: int
+    total_per_currency: dict[str, Decimal]
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +807,6 @@ class DashboardService:
         ``limit`` exceeds the number of distinct merchants in
         the period — unreachable when ``limit`` is bounded by
         the number of rows the query returns).
-
         window_start / window_end:
             Optional aggregation bounds. When both are supplied, the
             rollup uses ``[window_start, window_end]`` instead of the
@@ -1177,6 +1195,141 @@ class DashboardService:
                 "updated_at": rule.updated_at,
             }
             for rule in matching
+        ]
+
+    # ------------------------------------------------------------------
+    # subscriptions (category-driven; Fix 2)
+    # ------------------------------------------------------------------
+
+    async def _subscriptions_category_id(self) -> UUID | None:
+        """Resolve the closed-set Subscriptions category id by display name.
+
+        The "Suscripciones" KPI card and the subscriptions section are
+        driven by the ``display_name == 'Subscriptions'`` category row
+        (design decision: the recurring-rules detector is LLM-dependent
+        and unstable, so the closed-set category is the source of
+        truth). The UUID is resolved at query time — it is never
+        hard-coded. A missing category row is a valid state (the
+        taxonomy may not be seeded yet) and simply yields ``None``.
+        """
+        stmt = (
+            select(Category.id)
+            .where(Category.display_name == _SUBSCRIPTIONS_DISPLAY_NAME)
+            .order_by(Category.sort_order.asc())
+            .limit(1)
+        )
+        category_id: UUID | None = await self._session.scalar(stmt)
+        return category_id
+
+    async def subscriptions_summary(
+        self,
+        *,
+        window_start: date_typ,
+        window_end: date_typ,
+        card_id: CardFilter = "all",
+    ) -> SubscriptionsSummary:
+        """Return the Subscriptions-category rollup for an explicit window.
+
+        The method aggregates ``Transaction`` rows whose
+        ``category_id`` matches the closed-set Subscriptions
+        category within ``[window_start, window_end]`` and returns::
+
+            {"count": <int>, "total_per_currency": {"CLP": Decimal(...), ...}}
+
+        The web dashboard uses this for the "Suscripciones" KPI card
+        (``count`` drives the headline; the CLP entry drives the
+        monthly total and the full ``total_per_currency`` dict feeds
+        the optional secondary-currency block).
+
+        Currency safety: totals are grouped by ``Transaction.currency``
+        exactly like every other dashboard method — CLP and USD are
+        never summed across currencies (the application has no FX
+        table).
+
+        When the Subscriptions category row is missing (the taxonomy
+        was not seeded), the summary degrades to
+        ``{"count": 0, "total_per_currency": {}}`` — never an error.
+        """
+        category_id = await self._subscriptions_category_id()
+        if category_id is None:
+            return SubscriptionsSummary(count=0, total_per_currency={})
+
+        stmt = (
+            select(
+                Transaction.currency,
+                func.coalesce(func.sum(Transaction.amount), 0).label("total"),
+                func.count(Transaction.id).label("txn_count"),
+            )
+            .where(Transaction.category_id == category_id)
+            .where(Transaction.date >= window_start)
+            .where(Transaction.date <= window_end)
+            .group_by(Transaction.currency)
+        )
+        stmt = self._apply_card_filter(stmt, card_id)
+
+        rows = (await self._session.execute(stmt)).all()
+        totals: dict[str, Decimal] = {}
+        total_count = 0
+        for row in rows:
+            totals[row.currency] = Decimal(row.total)
+            total_count += int(row.txn_count)
+        return SubscriptionsSummary(count=total_count, total_per_currency=totals)
+
+    async def subscriptions_transactions(
+        self,
+        *,
+        window_start: date_typ,
+        window_end: date_typ,
+        card_id: CardFilter = "all",
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        """Return the Subscriptions-category transactions in a window.
+
+        The subscriptions dashboard section renders this list
+        directly: each row carries the merchant display name (joined
+        through :class:`app.models.merchant.Merchant`, ``None`` when
+        the transaction has no merchant), the posting ``date``, the
+        signed ``amount``, the ISO ``currency`` code, and the raw
+        ``description`` as a display fallback for merchant-less rows.
+
+        Rows are ordered by ``date`` descending (the newest charges
+        first) with ``Transaction.id`` ascending as the stable
+        tiebreaker, and capped at ``limit`` rows. A missing
+        Subscriptions category row yields an empty list.
+        """
+        category_id = await self._subscriptions_category_id()
+        if category_id is None:
+            return []
+
+        stmt = (
+            select(
+                Transaction.id.label("txn_id"),
+                Transaction.date.label("txn_date"),
+                Transaction.amount.label("txn_amount"),
+                Transaction.currency.label("txn_currency"),
+                Transaction.description.label("txn_description"),
+                Merchant.name.label("merchant_name"),
+            )
+            .outerjoin(Merchant, Transaction.merchant_id == Merchant.id)
+            .where(Transaction.category_id == category_id)
+            .where(Transaction.date >= window_start)
+            .where(Transaction.date <= window_end)
+            .order_by(Transaction.date.desc(), Transaction.id.asc())
+            .limit(limit)
+        )
+        stmt = self._apply_card_filter(stmt, card_id)
+
+        rows = (await self._session.execute(stmt)).all()
+        return [
+            {
+                "id": row.txn_id,
+                "merchant_name": row.merchant_name,
+                "description": row.txn_description,
+                "date": row.txn_date,
+                "amount": Decimal(row.txn_amount),
+                "currency": row.txn_currency,
+            }
+            for row in rows
         ]
 
     # ------------------------------------------------------------------
