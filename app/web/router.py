@@ -714,8 +714,22 @@ async def _dashboard_context(
         card_id=selection.card_id,
         range_mode=selection.range_mode,
     )
-    categories = await service.categories(period=period_date, card_id=selection.card_id)
-    merchants = await service.merchants(period=period_date, card_id=selection.card_id)
+    # Fix 1: the categories and merchants sections aggregate over the
+    # resolved window (current -> period month, ytd/all_time/rolling ->
+    # the selected span) instead of silently collapsing to the period
+    # month. The summary KPI already used the same resolved window.
+    categories = await service.categories(
+        period=period_date,
+        card_id=selection.card_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    merchants = await service.merchants(
+        period=period_date,
+        card_id=selection.card_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
     monthly = await service.monthly_window(
         window_start=window_start, window_end=window_end, card_id=selection.card_id
     )

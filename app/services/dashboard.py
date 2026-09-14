@@ -593,6 +593,9 @@ class DashboardService:
         self,
         period: date_typ,
         card_id: CardFilter = "all",
+        *,
+        window_start: date_typ | None = None,
+        window_end: date_typ | None = None,
     ) -> list[CategoryBreakdown]:
         """Return the 12 closed-set categories with per-currency rollups.
 
@@ -611,9 +614,22 @@ class DashboardService:
         two steps — one query to fetch the per-currency
         rollups, one query to compute the period total
         (denominator of ``pct_of_total``) per currency.
+
+        Parameters
+        ----------
+        window_start / window_end:
+            Optional aggregation bounds. When both are supplied, the
+            rollups (and the ``pct_of_total`` denominator) use
+            ``[window_start, window_end]`` instead of the period month
+            bounds — this is how the web dashboard honours the
+            selected ``range_mode`` (YTD, all-time, rolling) for the
+            categories section. When both are ``None`` (the default),
+            the behaviour is unchanged: month-only bounds.
         """
         period_start = _first_of_month(period)
         period_end = _last_of_month(period)
+        if window_start is not None and window_end is not None:
+            period_start, period_end = window_start, window_end
 
         # Build the outerjoin ON clause. The card filter
         # (when ``card_id != "all"``) uses a correlated
@@ -745,6 +761,9 @@ class DashboardService:
         period: date_typ,
         card_id: CardFilter = "all",
         limit: int = _DEFAULT_MERCHANT_LIMIT,
+        *,
+        window_start: date_typ | None = None,
+        window_end: date_typ | None = None,
     ) -> list[MerchantBreakdown]:
         """Return the top-N merchants by total spent in the period.
 
@@ -769,9 +788,18 @@ class DashboardService:
         ``limit`` exceeds the number of distinct merchants in
         the period — unreachable when ``limit`` is bounded by
         the number of rows the query returns).
+
+        window_start / window_end:
+            Optional aggregation bounds. When both are supplied, the
+            rollup uses ``[window_start, window_end]`` instead of the
+            period month bounds (see :meth:`categories` for the full
+            rationale); when both are ``None`` the month-only
+            behaviour is unchanged.
         """
         period_start = _first_of_month(period)
         period_end = _last_of_month(period)
+        if window_start is not None and window_end is not None:
+            period_start, period_end = window_start, window_end
 
         # 1. Per-(merchant, currency) rollup.
         stmt = (

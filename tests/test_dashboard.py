@@ -1093,6 +1093,258 @@ class TestCategories:
 
 
 # ---------------------------------------------------------------------------
+# windowed categories / merchants (range-mode window override)
+# ---------------------------------------------------------------------------
+
+
+class TestWindowedSections:
+    """``categories`` / ``merchants`` honour the optional window override.
+
+    Fix 1: the web dashboard resolves the selected ``range_mode`` into an
+    explicit ``[window_start, window_end]`` pair (see
+    :func:`app.services.dashboard_selection.resolve_window`). The two
+    section queries must aggregate over that window instead of silently
+    collapsing to the selected period's calendar month. Without the
+    override (both args ``None``) the behaviour is unchanged: the bounds
+    stay ``[first_of_month(period), last_of_month(period)]``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_categories_window_override_spans_multiple_months(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """A window override aggregates transactions outside the period month.
+
+        Groceries has one transaction in 2026-05 (CLP 40,000) and one in
+        2026-07 (CLP 10,000). With ``period=2026-07`` (whose month bounds
+        alone would only see the July row), a window of
+        ``[2026-01-01, 2026-07-31]`` must aggregate both rows into
+        ``total_per_currency == {"CLP": 50000.00}`` and
+        ``transaction_count == 2``.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="40000.00",
+                txn_date=date(2026, 5, 20),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="10000.00",
+                txn_date=date(2026, 7, 10),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).categories(
+                period=date(2026, 7, 15),
+                card_id="all",
+                window_start=date(2026, 1, 1),
+                window_end=date(2026, 7, 31),
+            )
+
+        groceries_row = next(r for r in rows if r.category_id == groceries.id)
+        assert groceries_row.total_per_currency == {"CLP": Decimal("50000.00")}
+        assert groceries_row.transaction_count == 2
+        # pct_of_total is computed against the window's own per-currency
+        # denominator, so the single category owns 100% of the window.
+        assert groceries_row.pct_of_total == 1.0
+
+    @pytest.mark.asyncio
+    async def test_categories_window_override_respects_upper_bound(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """A transaction after ``window_end`` is excluded from the window rollup.
+
+        With ``window_end`` at the end of June, the July Groceries row is
+        invisible: the row comes back zero-spend even though the same
+        call without a window (July month bounds) would have counted it.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="10000.00",
+                txn_date=date(2026, 7, 10),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).categories(
+                period=date(2026, 6, 15),
+                card_id="all",
+                window_start=date(2026, 1, 1),
+                window_end=date(2026, 6, 30),
+            )
+
+        groceries_row = next(r for r in rows if r.category_id == groceries.id)
+        assert groceries_row.total_per_currency == {}
+        assert groceries_row.transaction_count == 0
+
+    @pytest.mark.asyncio
+    async def test_categories_without_window_keeps_period_month_bounds(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """No window args -> unchanged month-only behaviour (backward compatible).
+
+        The May transaction exists in the database but is outside the
+        July month bounds, so a window-less call must NOT see it.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="40000.00",
+                txn_date=date(2026, 5, 20),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="10000.00",
+                txn_date=date(2026, 7, 10),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).categories(
+                period=date(2026, 7, 15), card_id="all"
+            )
+
+        groceries_row = next(r for r in rows if r.category_id == groceries.id)
+        # Month bounds only: the May row is invisible.
+        assert groceries_row.total_per_currency == {"CLP": Decimal("10000.00")}
+        assert groceries_row.transaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_merchants_window_override_spans_multiple_months(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """The merchants window override aggregates across months like categories.
+
+        Netflix has one transaction in 2026-05 (CLP 12,000) and one in
+        2026-07 (CLP 8,000). With ``period=2026-07`` the month bounds see
+        only the July row; a ``[2026-01-01, 2026-07-31]`` window must
+        return one netflix row with ``total_per_currency ==
+        {"CLP": 20000.00}`` and ``transaction_count == 2``.
+        """
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="12000.00",
+                txn_date=date(2026, 5, 20),
+                currency="CLP",
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="8000.00",
+                txn_date=date(2026, 7, 10),
+                currency="CLP",
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).merchants(
+                period=date(2026, 7, 15),
+                card_id="all",
+                window_start=date(2026, 1, 1),
+                window_end=date(2026, 7, 31),
+            )
+
+        assert len(rows) == 1
+        assert rows[0].merchant_id == merchant_id
+        assert rows[0].total_per_currency == {"CLP": Decimal("20000.00")}
+        assert rows[0].transaction_count == 2
+        # ``last_seen_date`` is the most recent in-window transaction date.
+        assert rows[0].last_seen_date == date(2026, 7, 10)
+
+    @pytest.mark.asyncio
+    async def test_merchants_without_window_keeps_period_month_bounds(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """No window args -> unchanged month-only behaviour (backward compatible)."""
+        statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="12000.00",
+                txn_date=date(2026, 5, 20),
+                currency="CLP",
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_id,
+                merchant_id=merchant_id,
+                amount="8000.00",
+                txn_date=date(2026, 7, 10),
+                currency="CLP",
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).merchants(
+                period=date(2026, 7, 15), card_id="all"
+            )
+
+        assert len(rows) == 1
+        assert rows[0].total_per_currency == {"CLP": Decimal("8000.00")}
+        assert rows[0].transaction_count == 1
+        assert rows[0].last_seen_date == date(2026, 7, 10)
+
+
+# ---------------------------------------------------------------------------
 # merchants
 # ---------------------------------------------------------------------------
 
@@ -1413,9 +1665,16 @@ class TestMonthly:
 
         Mirrors the spec scenario "Zero-transaction months
         are still in the series": transactions in
-        2026-05 + 2026-07 but NOT in 2026-06 → response
-        is 3 rows; the 2026-06 row carries empty totals
-        and empty prev-month-pct.
+        2026-05 + 2026-07 but NOT in 2026-06 -> the 2026-06
+        row exists, carries empty totals and an empty count.
+
+        Uses :meth:`monthly_window` with an explicit window so the
+        scenario is anchored to fixed dates. The legacy
+        ``monthly(range_months=3)`` path anchors the series to
+        ``date.today()`` (2026-09 at the time of writing), so a fixed
+        May-July window is no longer reachable through it — the
+        time-bombed version of this test failed every month after
+        July 2026.
         """
         statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
         merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
@@ -1439,7 +1698,11 @@ class TestMonthly:
             await session.commit()
 
         async with session_factory() as session:
-            rows = await DashboardService(session).monthly(range_months=3, card_id="all")
+            rows = await DashboardService(session).monthly_window(
+                window_start=date(2026, 5, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
 
         assert len(rows) == 3
         # Find the 2026-06 row — the empty one.

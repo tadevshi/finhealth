@@ -609,6 +609,82 @@ async def test_dashboard_recurring_partial_returns_active_rules(
 
 
 # ---------------------------------------------------------------------------
+# Range-aware categories (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_categories_respect_all_time_range(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """The categories section aggregates over the selected range, not just the month.
+
+    Fix 1: with ``range_mode=all_time`` the resolved window spans the
+    earliest transaction month through the period end, so a June
+    Groceries transaction (CLP 10,000) must join the July one
+    (CLP 5,000) for a window total of CLP 15,000. With
+    ``range_mode=current`` the same request stays month-only and
+    shows CLP 5,000.
+    """
+    statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    categories = seeded_world["categories"]  # type: ignore[assignment]
+    groceries = categories["Groceries"]
+
+    async with session_factory() as session:
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="10000.00",
+            txn_date=date(2026, 6, 5),
+            currency="CLP",
+            category_id=groceries.id,
+        )
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="5000.00",
+            txn_date=date(2026, 7, 5),
+            currency="CLP",
+            category_id=groceries.id,
+        )
+        await session.commit()
+
+    def _categories_section(body: str) -> str:
+        """Slice the categories card out of the full sections payload.
+
+        The hero card already shows the windowed total, so the
+        assertion must be scoped to the categories markup between
+        its container and the merchants card to be meaningful.
+        """
+        start = body.index(CATEGORIES_TESTID)
+        end = body.index(MERCHANTS_TESTID)
+        return body[start:end]
+
+    all_time = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "all_time"},
+    )
+    assert all_time.status_code == 200
+    # The June row is inside the all-time window: the Groceries row
+    # aggregates both months (10,000 + 5,000).
+    assert "15,000" in _categories_section(all_time.text)
+
+    current = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert current.status_code == 200
+    # Month-only: the June row is outside the current-month window.
+    assert "15,000" not in _categories_section(current.text)
+    assert "5,000" in _categories_section(current.text)
+
+
+# ---------------------------------------------------------------------------
 # Filter coverage
 # ---------------------------------------------------------------------------
 
