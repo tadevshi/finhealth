@@ -532,6 +532,20 @@ async def test_patch_with_empty_string_category_id_clears_fk(
     assert body["category_id"] is None
 
 
+@pytest.mark.asyncio
+async def test_list_transactions_non_finite_amount_bound_is_422(seeded_client: AsyncClient) -> None:
+    """Non-finite Decimal bounds stay a 422 client error on the JSON API.
+
+    Decimal() parses "NaN"/"Infinity" without raising; the F3 fix keeps
+    the previous Pydantic contract for the JSON API too.
+    """
+    for raw in ("NaN", "sNaN", "Infinity", "-Infinity"):
+        response = await seeded_client.get("/api/v1/transactions", params={"min_amount": raw})
+        assert response.status_code == 422, raw
+        response = await seeded_client.get("/api/v1/transactions", params={"max_amount": raw})
+        assert response.status_code == 422, raw
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -1264,6 +1264,83 @@ class TestCardPaymentsExclusion:
         assert merchant_rows[0].transaction_count == 1
 
     @pytest.mark.asyncio
+    async def test_anchor_resolvers_survive_display_name_renames(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """The resolvers anchor on ``Category.name``, so display renames are harmless.
+
+        ``POST /api/v1/categories/{id}`` may rename ``display_name``; the
+        Subscriptions and Card Payments semantics must not move (F2 fix:
+        the resolvers key on the stable ``name`` column and the rename
+        endpoint rejects ``name`` changes for the anchored rows).
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+        card_payments = categories["Card Payments"]
+        subscriptions = categories["Subscriptions"]
+
+        async with session_factory() as session:
+            result = await session.execute(select(Category))
+            for row in result.scalars().all():
+                if row.name == "Card Payments":
+                    row.display_name = "Pagos a tarjeta"
+                elif row.name == "Subscriptions":
+                    row.display_name = "Suscripciones UI"
+            await session.commit()
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="-1943000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=card_payments.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="9990.00",
+                txn_date=date(2026, 7, 5),
+                currency="CLP",
+                category_id=subscriptions.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="50000.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            service = DashboardService(session)
+            rows = await service.categories(period=date(2026, 7, 15), card_id="all")
+            subs = await service.subscriptions_summary(
+                window_start=date(2026, 7, 1),
+                window_end=date(2026, 7, 31),
+                card_id="all",
+            )
+
+        # The display_name rename did not re-admit the payment into the
+        # distribution nor break the subscriptions anchor.
+        assert all(r.category_id != card_payments.id for r in rows)
+        groceries_row = next(r for r in rows if r.category_id == groceries.id)
+        # The subscriptions transaction IS spend and joins the CLP
+        # denominator: 50,000 / (50,000 + 9,990) — only the payment row
+        # leaves the denominator.
+        assert groceries_row.pct_of_total == 0.8335
+        assert subs["count"] == 1
+        assert subs["total_per_currency"] == {"CLP": Decimal("9990.00")}
+
+    @pytest.mark.asyncio
     async def test_missing_card_payments_row_degrades_without_exclusion(
         self,
         session_factory: async_sessionmaker[AsyncSession],

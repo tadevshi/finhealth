@@ -370,6 +370,52 @@ async def test_rename_category_422_on_name_collision(
 
 
 @pytest.mark.asyncio
+async def test_rename_category_anchors_reject_name_change(
+    seeded_client: AsyncClient,
+) -> None:
+    """Renaming the ``name`` of an anchored category returns 422.
+
+    The dashboard anchors the Subscriptions card/section and the Card
+    Payments spend exclusion on ``Category.name``; the rename endpoint
+    rejects ``name`` changes for those rows so the semantics cannot
+    silently move (F2 fix).
+    """
+    (subs_id,) = await _find_category_ids(seeded_client, "Subscriptions")
+    response = await seeded_client.post(
+        f"/api/v1/categories/{subs_id}",
+        json={"name": "Suscripciones"},
+    )
+    assert response.status_code == 422
+    assert "anchors" in response.json()["detail"]
+
+    (cp_id,) = await _find_category_ids(seeded_client, "Card Payments")
+    response = await seeded_client.post(
+        f"/api/v1/categories/{cp_id}",
+        json={"name": "Pagos"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_rename_category_anchor_display_name_rename_is_allowed(
+    seeded_client: AsyncClient,
+) -> None:
+    """Renaming only ``display_name`` of an anchored row stays allowed.
+
+    The dashboard resolvers key on ``name``, so a ``display_name``
+    rename is harmless and must keep working (F2 fix companion).
+    """
+    (subs_id,) = await _find_category_ids(seeded_client, "Subscriptions")
+    response = await seeded_client.post(
+        f"/api/v1/categories/{subs_id}",
+        json={"display_name": "Suscripciones UI"},
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Subscriptions"
+    assert response.json()["display_name"] == "Suscripciones UI"
+
+
+@pytest.mark.asyncio
 async def test_rename_category_422_on_empty_body(
     seeded_client: AsyncClient,
 ) -> None:

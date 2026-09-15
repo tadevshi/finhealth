@@ -643,6 +643,66 @@ async def test_dashboard_recurring_partial_lists_subscription_transactions(
 # ---------------------------------------------------------------------------
 # Range-aware categories (Fix 1) + category-driven subscriptions (Fix 2)
 # ---------------------------------------------------------------------------
+# Subscription period labeling (F1 quick fix): "/ mes" only for
+# single-month windows.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subscription_period_label_respects_range_mode(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """No surface claims "/ mes" for a multi-month subscriptions total.
+
+    ``range_mode=current`` shows the month total with the "/ mes"
+    suffix; ytd / rolling_6 / all_time windows aggregate several
+    months, so the badge shows the plain window total and the suffix
+    disappears from both the KPI card and the subscriptions section.
+    """
+    statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    categories = seeded_world["categories"]  # type: ignore[assignment]
+    subscriptions = categories["Subscriptions"]
+
+    async with session_factory() as session:
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="9990.00",
+            txn_date=date(2026, 7, 3),
+            currency="CLP",
+            category_id=subscriptions.id,
+        )
+        await session.commit()
+
+    current = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert current.status_code == 200
+    assert "$ 9,990 / mes" in current.text
+
+    for range_mode in ("ytd", "rolling_6", "all_time"):
+        response = await client.get(
+            SECTIONS_PATH,
+            params={"period": "2026-07", "card_id": "all", "range_mode": range_mode},
+        )
+        assert response.status_code == 200, range_mode
+        body = response.text
+        assert "9,990" in body, range_mode
+        recurring_section = body[body.index(RECURRING_TESTID) :]
+        # Neither the Suscripciones card nor the recurring section badge
+        # may claim "/ mes" for a multi-month window total.
+        assert "/ mes" not in recurring_section, range_mode
+        assert (
+            "/ mes" not in body[body.index("dashboard-summary") : body.index(CATEGORIES_TESTID)]
+        ), range_mode
+
+
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

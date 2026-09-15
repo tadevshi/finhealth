@@ -671,6 +671,34 @@ async def test_transactions_rows_empty_numeric_and_date_params_mean_no_filter(
 
 
 @pytest.mark.asyncio
+async def test_transactions_page_non_finite_amount_bound_is_422(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """Non-finite Decimal bounds (NaN/Infinity) are rejected with 422.
+
+    Decimal() parses "NaN"/"Infinity" without raising; the F3 fix
+    keeps the previous Pydantic contract: only finite decimals may
+    bound amounts, on the page, the HTMX partial, and the JSON API.
+    """
+    for raw in ("NaN", "sNaN", "Infinity", "-Infinity"):
+        response = await client.get(TRANSACTIONS_PATH, params={"min_amount": raw})
+        assert response.status_code == 422, raw
+        response = await client.get(TRANSACTIONS_PATH, params={"max_amount": raw})
+        assert response.status_code == 422, raw
+
+
+@pytest.mark.asyncio
+async def test_transactions_rows_non_finite_amount_bound_is_422(
+    client: AsyncClient, seeded_transactions: list[Transaction]
+) -> None:
+    """The HTMX partial shares the non-finite rejection (F3 fix)."""
+    response = await client.get(ROWS_PATH, params={"min_amount": "NaN"})
+    assert response.status_code == 422
+    response = await client.get(ROWS_PATH, params={"max_amount": "-Infinity"})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_transactions_rows_invalid_non_empty_param_still_422(
     client: AsyncClient, seeded_transactions: list[Transaction]
 ) -> None:

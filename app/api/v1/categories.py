@@ -41,6 +41,7 @@ from app.db.session import get_session
 from app.models.category import Category
 from app.models.transaction import Transaction
 from app.schemas.domain import CategoryRenameRequest, CategoryResponse
+from app.services.dashboard import ANCHORED_CATEGORY_NAMES
 
 router: APIRouter = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -158,6 +159,24 @@ async def rename_category(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Category {category_id} not found",
+        )
+
+    # Anchor guard: the dashboard resolves its semantic anchors
+    # (Subscriptions card/section, Card Payments spend exclusion) on
+    # the stable ``Category.name`` column. Renaming the ``name`` of
+    # one of those rows would silently change dashboard behaviour,
+    # so the rename endpoint rejects it with a 422; ``display_name``
+    # renames stay allowed because the resolvers never key on it.
+    if (
+        payload.name is not None
+        and payload.name != category.name
+        and category.name in ANCHORED_CATEGORY_NAMES
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Category name {category.name!r} anchors dashboard semantics and cannot be renamed"
+            ),
         )
 
     # 2. Collision check on the proposed ``name`` (only

@@ -132,14 +132,16 @@ _DEFAULT_MERCHANT_LIMIT: int = 10
 _DEFAULT_RANGE_MONTHS: int = 6
 
 
-#: ``display_name`` of the closed-set category that drives the
-#: "Suscripciones" KPI card and the subscriptions section. The lookup
-#: happens at query time (never a hard-coded UUID) so a missing
-#: category row degrades to "no subscriptions".
-_SUBSCRIPTIONS_DISPLAY_NAME: str = "Subscriptions"
+#: Closed-set ``name`` (the stable seed identifier the rename endpoint
+#: guards) of the category that drives the "Suscripciones" KPI card and
+#: the subscriptions section. The lookup happens at query time (never a
+#: hard-coded UUID) so a missing category row degrades to "no
+#: subscriptions".
+_SUBSCRIPTIONS_CATEGORY_NAME: str = "Subscriptions"
 
 
-#: ``display_name`` of the dedicated closed-set category for payments
+#: Closed-set ``name`` (the stable seed identifier the rename endpoint
+#: guards) of the dedicated category for payments
 #: TO the credit card (statement payment lines such as "MONTO
 #: CANCELADO"). Those transactions are not spend: the spend
 #: distributions (:meth:`categories`, :meth:`merchants` and the
@@ -147,7 +149,17 @@ _SUBSCRIPTIONS_DISPLAY_NAME: str = "Subscriptions"
 #: the category at query time. The lookup happens at query time (never
 #: a hard-coded UUID) so a missing category row — an un-migrated
 #: database — degrades to "no exclusion" instead of failing.
-_CARD_PAYMENTS_DISPLAY_NAME: str = "Card Payments"
+_CARD_PAYMENTS_CATEGORY_NAME: str = "Card Payments"
+
+
+#: Closed-set category ``name`` values whose semantics the dashboard
+#: anchors on (subscriptions card/section, Card Payments spend
+#: exclusion). ``app.api.v1.categories`` rejects renaming the ``name``
+#: of these rows; ``display_name`` renames are harmless because the
+#: resolvers anchor on ``name``.
+ANCHORED_CATEGORY_NAMES: frozenset[str] = frozenset(
+    {_SUBSCRIPTIONS_CATEGORY_NAME, _CARD_PAYMENTS_CATEGORY_NAME}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1285,7 +1297,7 @@ class DashboardService:
         """
         stmt = (
             select(Category.id)
-            .where(Category.display_name == _CARD_PAYMENTS_DISPLAY_NAME)
+            .where(Category.name == _CARD_PAYMENTS_CATEGORY_NAME)
             .order_by(Category.sort_order.asc())
             .limit(1)
         )
@@ -1318,7 +1330,7 @@ class DashboardService:
         """Resolve the closed-set Subscriptions category id by display name.
 
         The "Suscripciones" KPI card and the subscriptions section are
-        driven by the ``display_name == 'Subscriptions'`` category row
+        driven by the ``name == 'Subscriptions'`` category row
         (design decision: the recurring-rules detector is LLM-dependent
         and unstable, so the closed-set category is the source of
         truth). The UUID is resolved at query time — it is never
@@ -1327,7 +1339,7 @@ class DashboardService:
         """
         stmt = (
             select(Category.id)
-            .where(Category.display_name == _SUBSCRIPTIONS_DISPLAY_NAME)
+            .where(Category.name == _SUBSCRIPTIONS_CATEGORY_NAME)
             .order_by(Category.sort_order.asc())
             .limit(1)
         )

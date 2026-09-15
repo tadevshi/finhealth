@@ -95,12 +95,21 @@ def parse_optional_decimal(raw: str | None, *, field: str) -> Decimal | None:
     if raw is None or raw.strip() == "":
         return None
     try:
-        return Decimal(raw.strip())
+        value = Decimal(raw.strip())
     except InvalidOperation as exc:
         raise HTTPException(
             status_code=422,
             detail=f"`{field}` must be a decimal number; got {raw!r}",
         ) from exc
+    if not value.is_finite():
+        # Decimal accepts NaN/sNaN/Infinity without raising; those values
+        # are meaningless as amount bounds and previously Pydantic's
+        # Decimal query parsing rejected them, so keep the 422 contract.
+        raise HTTPException(
+            status_code=422,
+            detail=f"`{field}` must be a finite decimal number; got {raw!r}",
+        )
+    return value
 
 
 async def _query_transactions(
@@ -765,7 +774,9 @@ async def _dashboard_context(
         "recur_count": recur_count,
         "recur_monthly": recur_monthly,
         "recur_total_per_currency": recur_total_per_currency,
-        "recur_suffix": "" if selection.range_mode.kind == "all_time" else "/ mes",
+        # Only a single-month window earns the "/ mes" claim; ytd,
+        # rolling_N and all_time show the plain window total.
+        "recur_suffix": "/ mes" if selection.range_mode.kind == "current" else "",
         "window_start": window_start,
         "window_end": window_end,
     }
@@ -1113,6 +1124,7 @@ async def dashboard_section_recurring(
         "recur_count": int(subscriptions["count"]),
         "recur_monthly": int(recur_total_per_currency.get("CLP", Decimal("0"))),
         "recur_total_per_currency": recur_total_per_currency,
+        "recur_suffix": "/ mes",
     }
     return templates.TemplateResponse(
         request=request,

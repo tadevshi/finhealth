@@ -22,6 +22,9 @@
    recur_total_per_currency:
        Optional per-currency totals; the USD entry feeds the
        secondary currency block.
+       recur_suffix:
+           Label suffix for the CLP badge ("/ mes" only when the window
+           is exactly one month; empty string otherwise).
 #}
 <div id="dashboard-recurring"
      data-testid="dashboard-recurring"
@@ -40,7 +43,11 @@
     </div>
     <span class="px-3 py-1 rounded-full bg-surface-container-high
                  text-xs font-semibold text-success">
-      {% if recur_monthly %}$ {{ "{:,.0f}".format(recur_monthly) }} / mes{% else %}Sin cargos{% endif %}
+      {# ``recur_suffix`` is "/ mes" only for single-month windows; the
+         context passes "" for ytd / rolling_N / all_time so the badge
+         never claims a monthly cost for a multi-month total. #}
+      {% set recur_suffix = recur_suffix|default('/ mes') %}
+      {% if recur_monthly %}$ {{ "{:,.0f}".format(recur_monthly) }} {{ recur_suffix }}{% else %}Sin cargos{% endif %}
     </span>
   </div>
 
