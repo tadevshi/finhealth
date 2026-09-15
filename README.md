@@ -45,7 +45,7 @@ the money actually goes.
 
 - **Closed-set LLM categorization** (`phase2-categories`,
   [spec](openspec/specs/phase2-categories/spec.md)) — the ingestion
-  pipeline tells the LLM to emit one of 12 seeded Y-NAB category
+  pipeline tells the LLM to emit one of 13 seeded Y-NAB category
   names verbatim, resolves the emitted string against the seed
   in a single SELECT + in-memory dict cache, and stamps the
   ``category_id`` FK + ``low_confidence=False`` on every hit.
@@ -107,7 +107,7 @@ the money actually goes.
   merchants / monthly / recurring) that all return
   per-currency sub-rollups (``{"CLP": ..., "USD": ...}``).
   The service is the single source of truth for the
-  per-currency contract, the 12-row categories guarantee,
+  per-currency contract, the closed-set categories guarantee,
   the card-filter (``UUID | "all"``) semantics, and the
   monthly bar-chart time series. Multi-currency is honest
   about no FX: the app has no rate table, so the dashboard
@@ -276,14 +276,14 @@ for the per-section contract.
 | POST   | `/api/v1/transactions`                | Create one JSON transaction linked to an existing or new statement |
 | POST   | `/api/v1/transactions/batch`          | Create 1-200 JSON transactions atomically     |
 | PATCH  | `/api/v1/transactions/{transaction_id}` | Update a single transaction's category      |
-| GET    | `/api/v1/categories`                  | List the 12 closed-set Y-NAB categories (PR #2) |
+| GET    | `/api/v1/categories`                  | List the 13 closed-set Y-NAB categories (PR #2, +0003) |
 | POST   | `/api/v1/categories/{id}`             | Rename a category + propagate to its transactions (PR #2) |
 | GET    | `/api/v1/merchants`                   | List canonical merchants (PR #4)              |
 | POST   | `/api/v1/merchants/{id}/aliases`      | Bind a user-supplied alias to a merchant (PR #4) |
 | GET    | `/api/v1/recurring`                   | List active recurring-transaction rules, freshest first (PR #5) |
 | PATCH  | `/api/v1/recurring/{id}`              | Activate or deactivate a recurring rule (PR #5) |
 | GET    | `/api/v1/dashboard/summary`           | Phase 3 KPI tile payload for a single month (PR #9) |
-| GET    | `/api/v1/dashboard/categories`        | Phase 3 12 closed-set category rows for a month (PR #9) |
+| GET    | `/api/v1/dashboard/categories`        | Phase 3 closed-set category rows for a month, excluding Card Payments (PR #9, +0003) |
 | GET    | `/api/v1/dashboard/merchants`         | Phase 3 top-N merchants for a month (PR #9) |
 | GET    | `/api/v1/dashboard/monthly`           | Phase 3 monthly time series for the bar chart (PR #9) |
 | GET    | `/api/v1/dashboard/recurring`         | Phase 3 active recurring rules with an in-band occurrence (PR #9) |

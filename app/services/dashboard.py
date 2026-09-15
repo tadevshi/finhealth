@@ -14,9 +14,12 @@ The five methods
 * :meth:`summary` — KPI tile data for a single calendar
   month (total, daily avg, count, top category, top
   merchant, % change vs. prior month).
-* :meth:`categories` — 12 rows (one per seeded closed-set
-  :class:`app.models.category.Category`), ordered by the
-  largest single-currency total descending.
+* :meth:`categories` — the spend categories with per-currency
+  rollups, ordered by the largest single-currency total
+  descending. The seeded "Card Payments" category (statement
+  payments to the credit card are not spend) is excluded from
+  the rows and from the ``pct_of_total`` denominator; on a
+  migrated database the section returns the other 12 rows.
 * :meth:`merchants` — top-N merchants by total, ordered by
   the largest single-currency total descending.
 * :meth:`monthly` — time series of monthly totals for the
@@ -74,7 +77,7 @@ import calendar
 from dataclasses import dataclass, field
 from datetime import date as date_typ
 from decimal import Decimal
-from typing import TypeVar
+from typing import TypedDict, TypeVar
 from uuid import UUID
 
 from sqlalchemy import Select, and_, func, or_, select
@@ -127,6 +130,36 @@ _DEFAULT_MERCHANT_LIMIT: int = 10
 #: service keeps the same default so a caller that omits
 #: ``range_months`` gets a 6-month prior-period comparison.
 _DEFAULT_RANGE_MONTHS: int = 6
+
+
+#: Closed-set ``name`` (the stable seed identifier the rename endpoint
+#: guards) of the category that drives the "Suscripciones" KPI card and
+#: the subscriptions section. The lookup happens at query time (never a
+#: hard-coded UUID) so a missing category row degrades to "no
+#: subscriptions".
+_SUBSCRIPTIONS_CATEGORY_NAME: str = "Subscriptions"
+
+
+#: Closed-set ``name`` (the stable seed identifier the rename endpoint
+#: guards) of the dedicated category for payments
+#: TO the credit card (statement payment lines such as "MONTO
+#: CANCELADO"). Those transactions are not spend: the spend
+#: distributions (:meth:`categories`, :meth:`merchants` and the
+#: top-category / top-merchant rollups behind :meth:`summary`) exclude
+#: the category at query time. The lookup happens at query time (never
+#: a hard-coded UUID) so a missing category row — an un-migrated
+#: database — degrades to "no exclusion" instead of failing.
+_CARD_PAYMENTS_CATEGORY_NAME: str = "Card Payments"
+
+
+#: Closed-set category ``name`` values whose semantics the dashboard
+#: anchors on (subscriptions card/section, Card Payments spend
+#: exclusion). ``app.api.v1.categories`` rejects renaming the ``name``
+#: of these rows; ``display_name`` renames are harmless because the
+#: resolvers anchor on ``name``.
+ANCHORED_CATEGORY_NAMES: frozenset[str] = frozenset(
+    {_SUBSCRIPTIONS_CATEGORY_NAME, _CARD_PAYMENTS_CATEGORY_NAME}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +252,18 @@ def _add_months(d: date_typ, months: int) -> date_typ:
         month -= 12
         year += 1
     return date_typ(year, month, 1)
+
+
+class SubscriptionsSummary(TypedDict):
+    """Return shape of :meth:`DashboardService.subscriptions_summary`.
+
+    ``count`` is the number of Subscriptions-category transactions in
+    the window; ``total_per_currency`` keeps one entry per ISO-4217
+    currency present (CLP and USD are never summed).
+    """
+
+    count: int
+    total_per_currency: dict[str, Decimal]
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +516,15 @@ class DashboardService:
         Ties (two categories with the same total) are broken
         by ``Category.sort_order`` ascending so the result
         is stable.
+
+        Card Payments exclusion: transactions in the dedicated
+        "Card Payments" category (statement payments are not spend)
+        are dropped from the join, so a CLP -1,943,000 "MONTO
+        CANCELADO" payment can never win the top-category slot. A
+        missing category row (un-migrated database) applies no
+        exclusion.
         """
+        card_payments_id = await self._card_payments_category_id()
         # Build the outerjoin ON clause with the optional card filter
         # (same subquery approach as :meth:`categories`).
         outerjoin_on = and_(
@@ -479,6 +532,12 @@ class DashboardService:
             Transaction.date >= period_start,
             Transaction.date <= period_end,
         )
+        if card_payments_id is not None:
+            # Payments to the card are not spend: never rank them.
+            outerjoin_on = and_(
+                outerjoin_on,
+                Transaction.category_id.is_distinct_from(card_payments_id),
+            )
         if card_id != "all":
             card_subq = select(Statement.id).where(Statement.credit_card_id == card_id)
             outerjoin_on = and_(
@@ -547,6 +606,13 @@ class DashboardService:
         broken by ``Merchant.name`` ascending (a stable
         string order). The names are pre-fetched in a
         second query so the sort key is sync.
+
+        Card Payments exclusion: transactions in the dedicated
+        "Card Payments" category (statement payments are not spend)
+        never contribute to the top-merchant rollup — a CLP -1,943,000
+        "MONTO CANCELADO" payment must not surface as a top merchant
+        or distort a merchant's total. A missing category row
+        (un-migrated database) applies no exclusion.
         """
         from sqlalchemy import select as sa_select
 
@@ -562,6 +628,7 @@ class DashboardService:
             .group_by(Transaction.merchant_id, Transaction.currency)
         )
         stmt = self._apply_card_filter(stmt, card_id)
+        stmt = self._spend_only_filter(stmt, await self._card_payments_category_id())
 
         rows = (await self._session.execute(stmt)).all()
         per_merchant: dict[UUID, dict[str, Decimal]] = {}
@@ -593,17 +660,30 @@ class DashboardService:
         self,
         period: date_typ,
         card_id: CardFilter = "all",
+        *,
+        window_start: date_typ | None = None,
+        window_end: date_typ | None = None,
     ) -> list[CategoryBreakdown]:
-        """Return the 12 closed-set categories with per-currency rollups.
+        """Return the spend categories with per-currency rollups.
 
-        Every row of the seeded ``categories`` table appears
-        in the response — zero-spend categories carry
-        ``total_per_currency == {}`` and ``pct_of_total ==
-        0.0`` (per the spec scenario "All 12 categories are
-        returned even at zero spend"). The response is
-        ordered by the largest single-currency total
+        Every seeded spend category appears in the response —
+        zero-spend categories carry ``total_per_currency == {}`` and
+        ``pct_of_total == 0.0`` (per the spec scenario "All
+        categories are returned even at zero spend"). The response
+        is ordered by the largest single-currency total
         descending, with ``Category.sort_order`` ascending
         as the stable tiebreaker.
+
+        Card Payments exclusion: the dedicated "Card Payments"
+        category (statement payments to the credit card are not
+        spend) never appears in the response, and its transactions
+        are excluded from the ``pct_of_total`` denominator — a
+        CLP -1,943,000 "MONTO CANCELADO" payment must not make the
+        denominator negative. On a migrated database the section
+        therefore returns 12 rows (the closed set minus Card
+        Payments); on an un-migrated database (no such category
+        row) the exclusion is skipped and every category row is
+        returned, preserving the old behaviour.
 
         The SQL is a ``LEFT JOIN`` from ``Category`` to the
         aggregated ``Transaction`` rows so the zero-spend
@@ -611,9 +691,24 @@ class DashboardService:
         two steps — one query to fetch the per-currency
         rollups, one query to compute the period total
         (denominator of ``pct_of_total``) per currency.
+
+        Parameters
+        ----------
+        window_start / window_end:
+            Optional aggregation bounds. When both are supplied, the
+            rollups (and the ``pct_of_total`` denominator) use
+            ``[window_start, window_end]`` instead of the period month
+            bounds — this is how the web dashboard honours the
+            selected ``range_mode`` (YTD, all-time, rolling) for the
+            categories section. When both are ``None`` (the default),
+            the behaviour is unchanged: month-only bounds.
         """
         period_start = _first_of_month(period)
         period_end = _last_of_month(period)
+        if window_start is not None and window_end is not None:
+            period_start, period_end = window_start, window_end
+
+        card_payments_id = await self._card_payments_category_id()
 
         # Build the outerjoin ON clause. The card filter
         # (when ``card_id != "all"``) uses a correlated
@@ -650,6 +745,11 @@ class DashboardService:
             .outerjoin(Transaction, outerjoin_on)
             .group_by(Category.id, Category.display_name, Category.sort_order, Transaction.currency)
         )
+        # The dedicated Card Payments category never appears in the
+        # spend distribution (a plain filter on the left table keeps
+        # the LEFT JOIN semantics for every other row).
+        if card_payments_id is not None:
+            stmt = stmt.where(Category.id != card_payments_id)
 
         rows = (await self._session.execute(stmt)).all()
 
@@ -683,11 +783,16 @@ class DashboardService:
             .group_by(Transaction.currency)
         )
         period_totals_stmt = self._apply_card_filter(period_totals_stmt, card_id)
+        # Card-Payments transactions are not spend: exclude them from
+        # the pct_of_total denominator too (missing row → no exclusion,
+        # see :meth:`_spend_only_filter`).
+        period_totals_stmt = self._spend_only_filter(period_totals_stmt, card_payments_id)
         period_total_rows = (await self._session.execute(period_totals_stmt)).all()
         period_total: dict[str, Decimal] = {r.currency: Decimal(r.total) for r in period_total_rows}
 
-        # 4. Compose the response. One row per category
-        #    (always 12 — the LEFT JOIN guarantees it).
+        # 4. Compose the response. One row per spend category (the
+        #    Card Payments row was filtered out above; the LEFT JOIN
+        #    guarantees every other category survives).
         result: list[CategoryBreakdown] = []
         for cat_id, entry in per_cat.items():
             # ``pct_of_total`` is the largest single-currency
@@ -745,6 +850,9 @@ class DashboardService:
         period: date_typ,
         card_id: CardFilter = "all",
         limit: int = _DEFAULT_MERCHANT_LIMIT,
+        *,
+        window_start: date_typ | None = None,
+        window_end: date_typ | None = None,
     ) -> list[MerchantBreakdown]:
         """Return the top-N merchants by total spent in the period.
 
@@ -769,9 +877,17 @@ class DashboardService:
         ``limit`` exceeds the number of distinct merchants in
         the period — unreachable when ``limit`` is bounded by
         the number of rows the query returns).
+        window_start / window_end:
+            Optional aggregation bounds. When both are supplied, the
+            rollup uses ``[window_start, window_end]`` instead of the
+            period month bounds (see :meth:`categories` for the full
+            rationale); when both are ``None`` the month-only
+            behaviour is unchanged.
         """
         period_start = _first_of_month(period)
         period_end = _last_of_month(period)
+        if window_start is not None and window_end is not None:
+            period_start, period_end = window_start, window_end
 
         # 1. Per-(merchant, currency) rollup.
         stmt = (
@@ -788,6 +904,11 @@ class DashboardService:
             .group_by(Transaction.merchant_id, Transaction.currency)
         )
         stmt = self._apply_card_filter(stmt, card_id)
+        # Card-Payments transactions are not spend: they never surface
+        # as a top merchant and never distort a merchant's rollup with
+        # a large negative total (missing row → no exclusion, see
+        # :meth:`_spend_only_filter`).
+        stmt = self._spend_only_filter(stmt, await self._card_payments_category_id())
 
         rows = (await self._session.execute(stmt)).all()
 
@@ -1149,6 +1270,191 @@ class DashboardService:
                 "updated_at": rule.updated_at,
             }
             for rule in matching
+        ]
+
+    # ------------------------------------------------------------------
+    # Card Payments exclusion (statement payments are not spend)
+    # ------------------------------------------------------------------
+
+    async def _card_payments_category_id(self) -> UUID | None:
+        """Resolve the closed-set Card Payments category id by display name.
+
+        The dedicated "Card Payments" category (migration
+        ``0003_card_payments_category``) holds payments TO the credit
+        card — statement payment lines such as "MONTO CANCELADO".
+        Those transactions are not spend, so the spend distributions
+        exclude the category at query time. The UUID is resolved at
+        query time — it is never hard-coded. A missing category row is
+        a valid state (an un-migrated database) and simply yields
+        ``None``, which means "apply no exclusion".
+
+        Deliberate scope note: ``summary``'s period totals and the
+        ``monthly`` / ``monthly_window`` bar series intentionally still
+        include Card Payments transactions (signed semantics) pending a
+        separate product decision; only the spend distributions
+        (categories, merchants, top-category / top-merchant) exclude
+        them today.
+        """
+        stmt = (
+            select(Category.id)
+            .where(Category.name == _CARD_PAYMENTS_CATEGORY_NAME)
+            .order_by(Category.sort_order.asc())
+            .limit(1)
+        )
+        category_id: UUID | None = await self._session.scalar(stmt)
+        return category_id
+
+    def _spend_only_filter(
+        self,
+        stmt: Select[_SelectT],
+        card_payments_id: UUID | None,
+    ) -> Select[_SelectT]:
+        """Restrict a ``Transaction`` query to spend (non-Card-Payments rows).
+
+        When ``card_payments_id`` is ``None`` (the category row does not
+        exist — an un-migrated database) the statement is returned
+        unchanged: no exclusion, preserving the pre-migration
+        behaviour. ``is_distinct_from`` keeps ``category_id IS NULL``
+        rows (uncategorised spend) in the aggregation, which a plain
+        ``!=`` comparison would drop through SQL three-valued logic.
+        """
+        if card_payments_id is None:
+            return stmt
+        return stmt.where(Transaction.category_id.is_distinct_from(card_payments_id))
+
+    # ------------------------------------------------------------------
+    # subscriptions (category-driven; Fix 2)
+    # ------------------------------------------------------------------
+
+    async def _subscriptions_category_id(self) -> UUID | None:
+        """Resolve the closed-set Subscriptions category id by display name.
+
+        The "Suscripciones" KPI card and the subscriptions section are
+        driven by the ``name == 'Subscriptions'`` category row
+        (design decision: the recurring-rules detector is LLM-dependent
+        and unstable, so the closed-set category is the source of
+        truth). The UUID is resolved at query time — it is never
+        hard-coded. A missing category row is a valid state (the
+        taxonomy may not be seeded yet) and simply yields ``None``.
+        """
+        stmt = (
+            select(Category.id)
+            .where(Category.name == _SUBSCRIPTIONS_CATEGORY_NAME)
+            .order_by(Category.sort_order.asc())
+            .limit(1)
+        )
+        category_id: UUID | None = await self._session.scalar(stmt)
+        return category_id
+
+    async def subscriptions_summary(
+        self,
+        *,
+        window_start: date_typ,
+        window_end: date_typ,
+        card_id: CardFilter = "all",
+    ) -> SubscriptionsSummary:
+        """Return the Subscriptions-category rollup for an explicit window.
+
+        The method aggregates ``Transaction`` rows whose
+        ``category_id`` matches the closed-set Subscriptions
+        category within ``[window_start, window_end]`` and returns::
+
+            {"count": <int>, "total_per_currency": {"CLP": Decimal(...), ...}}
+
+        The web dashboard uses this for the "Suscripciones" KPI card
+        (``count`` drives the headline; the CLP entry drives the
+        monthly total and the full ``total_per_currency`` dict feeds
+        the optional secondary-currency block).
+
+        Currency safety: totals are grouped by ``Transaction.currency``
+        exactly like every other dashboard method — CLP and USD are
+        never summed across currencies (the application has no FX
+        table).
+
+        When the Subscriptions category row is missing (the taxonomy
+        was not seeded), the summary degrades to
+        ``{"count": 0, "total_per_currency": {}}`` — never an error.
+        """
+        category_id = await self._subscriptions_category_id()
+        if category_id is None:
+            return SubscriptionsSummary(count=0, total_per_currency={})
+
+        stmt = (
+            select(
+                Transaction.currency,
+                func.coalesce(func.sum(Transaction.amount), 0).label("total"),
+                func.count(Transaction.id).label("txn_count"),
+            )
+            .where(Transaction.category_id == category_id)
+            .where(Transaction.date >= window_start)
+            .where(Transaction.date <= window_end)
+            .group_by(Transaction.currency)
+        )
+        stmt = self._apply_card_filter(stmt, card_id)
+
+        rows = (await self._session.execute(stmt)).all()
+        totals: dict[str, Decimal] = {}
+        total_count = 0
+        for row in rows:
+            totals[row.currency] = Decimal(row.total)
+            total_count += int(row.txn_count)
+        return SubscriptionsSummary(count=total_count, total_per_currency=totals)
+
+    async def subscriptions_transactions(
+        self,
+        *,
+        window_start: date_typ,
+        window_end: date_typ,
+        card_id: CardFilter = "all",
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        """Return the Subscriptions-category transactions in a window.
+
+        The subscriptions dashboard section renders this list
+        directly: each row carries the merchant display name (joined
+        through :class:`app.models.merchant.Merchant`, ``None`` when
+        the transaction has no merchant), the posting ``date``, the
+        signed ``amount``, the ISO ``currency`` code, and the raw
+        ``description`` as a display fallback for merchant-less rows.
+
+        Rows are ordered by ``date`` descending (the newest charges
+        first) with ``Transaction.id`` ascending as the stable
+        tiebreaker, and capped at ``limit`` rows. A missing
+        Subscriptions category row yields an empty list.
+        """
+        category_id = await self._subscriptions_category_id()
+        if category_id is None:
+            return []
+
+        stmt = (
+            select(
+                Transaction.id.label("txn_id"),
+                Transaction.date.label("txn_date"),
+                Transaction.amount.label("txn_amount"),
+                Transaction.currency.label("txn_currency"),
+                Transaction.description.label("txn_description"),
+                Merchant.name.label("merchant_name"),
+            )
+            .outerjoin(Merchant, Transaction.merchant_id == Merchant.id)
+            .where(Transaction.category_id == category_id)
+            .where(Transaction.date >= window_start)
+            .where(Transaction.date <= window_end)
+            .order_by(Transaction.date.desc(), Transaction.id.asc())
+            .limit(limit)
+        )
+        stmt = self._apply_card_filter(stmt, card_id)
+
+        rows = (await self._session.execute(stmt)).all()
+        return [
+            {
+                "id": row.txn_id,
+                "merchant_name": row.merchant_name,
+                "description": row.txn_description,
+                "date": row.txn_date,
+                "amount": Decimal(row.txn_amount),
+                "currency": row.txn_currency,
+            }
+            for row in rows
         ]
 
     # ------------------------------------------------------------------

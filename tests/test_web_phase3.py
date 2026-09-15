@@ -100,6 +100,7 @@ MONTHLY_LIST_TESTID = 'data-testid="dashboard-monthly-list"'
 MONTHLY_BAR_TESTID = 'data-testid="dashboard-monthly-bar"'
 RECURRING_TESTID = 'data-testid="dashboard-recurring"'
 RECURRING_LIST_TESTID = 'data-testid="dashboard-recurring-list"'
+RECURRING_ROW_TESTID = 'data-testid="dashboard-recurring-row"'
 
 # The pickers use ``x-model`` to bind to the Alpine state and
 # Alpine to drive the HTMX refresh; the test surface does not
@@ -563,38 +564,64 @@ async def test_dashboard_monthly_partial_returns_time_series(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_recurring_partial_returns_active_rules(
+async def test_dashboard_recurring_partial_lists_subscription_transactions(
     client: AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     seeded_world: dict[str, object],
 ) -> None:
-    """The recurring partial lists the active rules with an in-band occurrence."""
-    merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    """The subscriptions section lists Subscriptions-category transactions.
+
+    Fix 2: the section is driven by the closed-set Subscriptions
+    category (the recurring-rules detector is LLM-dependent and
+    unstable). A transaction tagged ``Subscriptions`` appears with
+    its merchant name and formatted amount; an active
+    ``RecurringRule`` — seeded here deliberately — is ignored, as is
+    a same-window transaction in a different category.
+    """
     statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    merchant_usd = seeded_world["merchant_usd_id"]  # type: ignore[arg-type]
+    statement_b = seeded_world["statement_b_id"]  # type: ignore[arg-type]
+    categories = seeded_world["categories"]  # type: ignore[assignment]
+    subscriptions = categories["Subscriptions"]
+    groceries = categories["Groceries"]
 
     async with session_factory() as session:
-        rule = RecurringRule(
-            merchant_id=merchant_id,
-            period_days=30,
-            period_label="monthly",
-            amount_min=Decimal("9.99"),
-            amount_max=Decimal("9.99"),
-            currency="CLP",
-            is_active=True,
-            confidence=0.95,
-            last_seen_date=date(2026, 7, 5),
-            occurrences=4,
+        # An active recurring rule that would match under the old
+        # detector-driven behaviour — it must not drive this section.
+        session.add(
+            RecurringRule(
+                merchant_id=merchant_clp,
+                period_days=30,
+                period_label="monthly",
+                amount_min=Decimal("9.99"),
+                amount_max=Decimal("9.99"),
+                currency="CLP",
+                is_active=True,
+                confidence=0.95,
+                last_seen_date=date(2026, 7, 5),
+                occurrences=4,
+            )
         )
-        session.add(rule)
         await session.commit()
-        await session.refresh(rule)
         _add_transaction(
             session,
             statement_id=statement_id,
-            merchant_id=merchant_id,
-            amount="9.99",
+            merchant_id=merchant_clp,
+            amount="9990.00",
             txn_date=date(2026, 7, 15),
             currency="CLP",
+            category_id=subscriptions.id,
+        )
+        # Same window, different category — must not be listed.
+        _add_transaction(
+            session,
+            statement_id=statement_b,
+            merchant_id=merchant_usd,
+            amount="80.00",
+            txn_date=date(2026, 7, 20),
+            currency="USD",
+            category_id=groceries.id,
         )
         await session.commit()
 
@@ -603,12 +630,226 @@ async def test_dashboard_recurring_partial_returns_active_rules(
     body = response.text
     assert RECURRING_TESTID in body
     assert RECURRING_LIST_TESTID in body
-    # The rule row is present with the merchant name resolved.
+    # The subscription transaction's merchant name and formatted
+    # amount are rendered; exactly one row.
     assert "netflix" in body
-    assert "monthly" in body
+    assert "9,990" in body
+    assert body.count(RECURRING_ROW_TESTID) == 1
+    # Non-subscription data stays out of the section.
+    assert "spotify" not in body
+    assert "monthly" not in body
 
 
 # ---------------------------------------------------------------------------
+# Range-aware categories (Fix 1) + category-driven subscriptions (Fix 2)
+# ---------------------------------------------------------------------------
+# Subscription period labeling (F1 quick fix): "/ mes" only for
+# single-month windows.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subscription_period_label_respects_range_mode(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """No surface claims "/ mes" for a multi-month subscriptions total.
+
+    ``range_mode=current`` shows the month total with the "/ mes"
+    suffix; ytd / rolling_6 / all_time windows aggregate several
+    months, so the badge shows the plain window total and the suffix
+    disappears from both the KPI card and the subscriptions section.
+    """
+    statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    categories = seeded_world["categories"]  # type: ignore[assignment]
+    subscriptions = categories["Subscriptions"]
+
+    async with session_factory() as session:
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="9990.00",
+            txn_date=date(2026, 7, 3),
+            currency="CLP",
+            category_id=subscriptions.id,
+        )
+        await session.commit()
+
+    current = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert current.status_code == 200
+    assert "$ 9,990 / mes" in current.text
+
+    for range_mode in ("ytd", "rolling_6", "all_time"):
+        response = await client.get(
+            SECTIONS_PATH,
+            params={"period": "2026-07", "card_id": "all", "range_mode": range_mode},
+        )
+        assert response.status_code == 200, range_mode
+        body = response.text
+        assert "9,990" in body, range_mode
+        recurring_section = body[body.index(RECURRING_TESTID) :]
+        # Neither the Suscripciones card nor the recurring section badge
+        # may claim "/ mes" for a multi-month window total.
+        assert "/ mes" not in recurring_section, range_mode
+        assert (
+            "/ mes" not in body[body.index("dashboard-summary") : body.index(CATEGORIES_TESTID)]
+        ), range_mode
+
+
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_categories_respect_all_time_range(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """The categories section aggregates over the selected range, not just the month.
+
+    Fix 1: with ``range_mode=all_time`` the resolved window spans the
+    earliest transaction month through the period end, so a June
+    Groceries transaction (CLP 10,000) must join the July one
+    (CLP 5,000) for a window total of CLP 15,000. With
+    ``range_mode=current`` the same request stays month-only and
+    shows CLP 5,000.
+    """
+    statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    categories = seeded_world["categories"]  # type: ignore[assignment]
+    groceries = categories["Groceries"]
+
+    async with session_factory() as session:
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="10000.00",
+            txn_date=date(2026, 6, 5),
+            currency="CLP",
+            category_id=groceries.id,
+        )
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="5000.00",
+            txn_date=date(2026, 7, 5),
+            currency="CLP",
+            category_id=groceries.id,
+        )
+        await session.commit()
+
+    def _categories_section(body: str) -> str:
+        """Slice the categories card out of the full sections payload.
+
+        The hero card already shows the windowed total, so the
+        assertion must be scoped to the categories markup between
+        its container and the merchants card to be meaningful.
+        """
+        start = body.index(CATEGORIES_TESTID)
+        end = body.index(MERCHANTS_TESTID)
+        return body[start:end]
+
+    all_time = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "all_time"},
+    )
+    assert all_time.status_code == 200
+    # The June row is inside the all-time window: the Groceries row
+    # aggregates both months (10,000 + 5,000).
+    assert "15,000" in _categories_section(all_time.text)
+
+    current = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert current.status_code == 200
+    # Month-only: the June row is outside the current-month window.
+    assert "15,000" not in _categories_section(current.text)
+    assert "5,000" in _categories_section(current.text)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_subscriptions_driven_by_category_not_rules(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_world: dict[str, object],
+) -> None:
+    """Fix 2: the Suscripciones card and section come from the category.
+
+    A transaction tagged ``Subscriptions`` in the window drives both
+    the KPI card (count + per-currency totals) and the recurring
+    section list (merchant name + amount). An active ``RecurringRule``
+    with an in-band transaction is deliberately seeded and must be
+    ignored: the detector is LLM-dependent, and the closed-set category
+    is the source of truth.
+    """
+    statement_id = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+    merchant_id = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+    categories = seeded_world["categories"]  # type: ignore[assignment]
+    subscriptions = categories["Subscriptions"]
+
+    async with session_factory() as session:
+        # A recurring rule that would match netflix under the old
+        # detector-driven behaviour — it must not influence the card.
+        session.add(
+            RecurringRule(
+                merchant_id=merchant_id,
+                period_days=30,
+                period_label="monthly",
+                amount_min=Decimal("9990.00"),
+                amount_max=Decimal("9990.00"),
+                currency="CLP",
+                is_active=True,
+                confidence=0.95,
+                last_seen_date=date(2026, 7, 3),
+                occurrences=4,
+            )
+        )
+        await session.commit()
+        _add_transaction(
+            session,
+            statement_id=statement_id,
+            merchant_id=merchant_id,
+            amount="9990.00",
+            txn_date=date(2026, 7, 3),
+            currency="CLP",
+            category_id=subscriptions.id,
+        )
+        await session.commit()
+
+    response = await client.get(
+        SECTIONS_PATH,
+        params={"period": "2026-07", "card_id": "all", "range_mode": "current"},
+    )
+    assert response.status_code == 200
+    body = response.text
+    # The Suscripciones card shows the category-derived count and the
+    # CLP total ("$ 9,990 / mes"), driven by the category — not the
+    # rule's amount_min alone.
+    assert "9,990" in body
+    # The recurring section lists the subscription transaction's
+    # merchant name and formatted amount.
+    assert RECURRING_TESTID in body
+    assert RECURRING_LIST_TESTID in body
+    assert "netflix" in body
+    # Discriminator: the section is no longer rule-driven. The old
+    # copy counted "cargos recurrentes con movimiento" and labelled
+    # rows with the rule's ``period_label``; the new copy renders
+    # subscription transactions. Scoped to the recurring section —
+    # the monthly chart section legitimately contains "monthly".
+    recurring_section = body[body.index(RECURRING_TESTID) :]
+    assert "cargos recurrentes con movimiento" not in recurring_section
+    assert "monthly" not in recurring_section
+
+
 # Filter coverage
 # ---------------------------------------------------------------------------
 

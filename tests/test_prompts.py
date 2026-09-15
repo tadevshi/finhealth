@@ -1,16 +1,19 @@
 """Tests for the closed-set category instruction in the LLM prompts.
 
 The Phase 2 categories foundation depends on the LLM emitting one of
-12 canonical names verbatim. The prompt module is the single source of
-truth for that list, so the tests assert:
+13 canonical names verbatim (the 12 Phase 2 names plus "Card Payments",
+added by migration ``0003_card_payments_category``). The prompt module
+is the single source of truth for that list, so the tests assert:
 
-* every one of the 12 names appears in the rendered prompt;
+* every one of the 13 names appears in the rendered prompt;
 * the few-shot examples (``_NACIONAL_EXAMPLE_OUTPUT`` and
   ``_INTERNACIONAL_EXAMPLE_OUTPUT``) use names from the set;
-* the JSON schema inline in the prompt mentions the closed set.
+* the JSON schema inline in the prompt mentions the closed set;
+* both templates carry the "Card Payments" classification rule —
+  payments/credits TO the credit card, never purchases or refunds.
 
 These tests are part of the PR #2 acceptance criteria — without
-them, a future refactor of the prompt that drops one of the 12 names
+them, a future refactor of the prompt that drops one of the 13 names
 silently would only be caught at the ingestion boundary.
 """
 
@@ -53,14 +56,26 @@ ESTADO DE CUENTA INTERNACIONAL
 # ---------------------------------------------------------------------------
 
 
-def test_seed_category_names_count_is_twelve() -> None:
-    """The closed set has exactly 12 entries.
+def test_seed_category_names_count_is_thirteen() -> None:
+    """The closed set has exactly 13 entries.
 
-    The Phase 2 design locks the count at 12 — the Y-NAB-derived
-    flat taxonomy. A regression that adds or drops a name would
-    drift the design and the seed, so the count is asserted.
+    The Phase 2 design locked the count at 12 — the Y-NAB-derived
+    flat taxonomy. Migration ``0003_card_payments_category`` added
+    the 13th name ("Card Payments") so statement payments to the
+    credit card get their own closed-set category. A regression
+    that adds or drops a name would drift the design and the seed,
+    so the count is asserted.
     """
-    assert len(SEED_CATEGORY_NAMES) == 12
+    assert len(SEED_CATEGORY_NAMES) == 13
+
+
+def test_seed_category_names_end_with_card_payments() -> None:
+    """The 13th and newest closed-set member is "Card Payments".
+
+    Migration ``0003_card_payments_category`` appends it after the
+    12 Phase 2 names so the existing members keep their order.
+    """
+    assert SEED_CATEGORY_NAMES[-1] == "Card Payments"
 
 
 def test_seed_category_names_are_distinct() -> None:
@@ -89,8 +104,8 @@ def test_seed_category_names_have_canonical_casing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_nacional_prompt_lists_all_twelve_categories() -> None:
-    """Every one of the 12 names appears in the NACIONAL template.
+def test_nacional_prompt_lists_all_thirteen_categories() -> None:
+    """Every one of the 13 names appears in the NACIONAL template.
 
     The closed-set enumeration is in the "INSTRUCTIONS" section
     of the template. Each name is asserted to be present
@@ -125,8 +140,8 @@ def test_nacional_prompt_examples_use_closed_set() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_internacional_prompt_lists_all_twelve_categories() -> None:
-    """Every one of the 12 names appears in the INTERNACIONAL template."""
+def test_internacional_prompt_lists_all_thirteen_categories() -> None:
+    """Every one of the 13 names appears in the INTERNACIONAL template."""
     for name in SEED_CATEGORY_NAMES:
         assert name in INTERNACIONAL_PROMPT, (
             f"INTERNACIONAL prompt is missing category {name!r} from the closed set"
@@ -147,7 +162,7 @@ def test_internacional_prompt_examples_use_closed_set() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_json_lists_all_twelve_categories() -> None:
+def test_schema_json_lists_all_thirteen_categories() -> None:
     """The inline ``_schema_json()`` output mentions every name.
 
     The JSON schema is rendered verbatim into the prompt. A
@@ -181,14 +196,14 @@ def test_schema_json_mentions_closed_set_phrase() -> None:
 
 
 def test_build_extraction_prompt_nacional_contains_closed_set() -> None:
-    """The rendered NACIONAL prompt contains every one of the 12 names."""
+    """The rendered NACIONAL prompt contains every one of the 13 names."""
     prompt = build_extraction_prompt("NACIONAL", NACIONAL_SAMPLE_TEXT)
     for name in SEED_CATEGORY_NAMES:
         assert name in prompt, f"Rendered NACIONAL prompt is missing {name!r}"
 
 
 def test_build_extraction_prompt_internacional_contains_closed_set() -> None:
-    """The rendered INTERNACIONAL prompt contains every one of the 12 names."""
+    """The rendered INTERNACIONAL prompt contains every one of the 13 names."""
     prompt = build_extraction_prompt("INTERNACIONAL", INTERNACIONAL_SAMPLE_TEXT)
     for name in SEED_CATEGORY_NAMES:
         assert name in prompt, f"Rendered INTERNACIONAL prompt is missing {name!r}"
@@ -205,3 +220,49 @@ def test_build_extraction_prompt_embeds_schema() -> None:
     for name in SEED_CATEGORY_NAMES:
         matches = re.findall(re.escape(name), prompt)
         assert len(matches) >= 1, f"{name!r} not in rendered prompt at all"
+
+
+# ---------------------------------------------------------------------------
+# Card Payments classification rule
+# ---------------------------------------------------------------------------
+
+
+_CARD_PAYMENT_RULE_MARKERS = (
+    "MONTO CANCELADO",
+    "PAGO DE TARJETA",
+    "PAGO MINIMO",
+    "PAGO CONTADO",
+)
+
+
+def test_templates_mention_thirteen_closed_set_names() -> None:
+    """Both templates state the count as 13 after Card Payments joined.
+
+    The instruction text says "one of the 13 closed-set names"; a
+    stale "12" would contradict the enumerated list and confuse the
+    model about the size of the set.
+    """
+    for template in (NACIONAL_PROMPT, INTERNACIONAL_PROMPT):
+        assert "13 closed-set names" in template, "Template does not say '13 closed-set names'"
+        assert "12 closed-set names" not in template
+
+
+def test_nacional_prompt_carries_card_payments_rule() -> None:
+    """The NACIONAL template classifies statement payments as Card Payments.
+
+    The rule must name the Chilean statement payment lines (MONTO
+    CANCELADO, PAGO DE TARJETA, PAGO MINIMO, PAGO CONTADO) and forbid
+    using the category for purchases or refunds of purchases.
+    """
+    for marker in _CARD_PAYMENT_RULE_MARKERS:
+        assert marker in NACIONAL_PROMPT, f"NACIONAL prompt is missing payment marker {marker!r}"
+    assert "Card Payments" in NACIONAL_PROMPT
+
+
+def test_internacional_prompt_carries_card_payments_rule() -> None:
+    """The INTERNACIONAL template carries the same Card Payments rule."""
+    for marker in _CARD_PAYMENT_RULE_MARKERS:
+        assert marker in INTERNACIONAL_PROMPT, (
+            f"INTERNACIONAL prompt is missing payment marker {marker!r}"
+        )
+    assert "Card Payments" in INTERNACIONAL_PROMPT

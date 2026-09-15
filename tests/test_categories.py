@@ -3,7 +3,7 @@
 Covers:
 
 * the ``Category`` ORM model (round-trip + name uniqueness);
-* the ``GET /api/v1/categories`` endpoint (returns 12 rows in
+* the ``GET /api/v1/categories`` endpoint (returns 13 rows in
   ``sort_order`` ascending);
 * the ``POST /api/v1/categories/{id}`` rename endpoint (happy
   path, 404, 422 collision, atomicity rollback);
@@ -16,7 +16,7 @@ The tests run against a fresh disposable PostgreSQL database per
 test (via the ``client`` fixture from :mod:`tests.conftest`)
 and the schema is created by the same :func:`Base.metadata.create_all`
 call the production app uses at startup. The migration
-round-trips (so the seed of 12 categories) are exercised by
+round-trips (so the seed of 13 categories — 12 plus "Card Payments") are exercised by
 :mod:`tests.test_alembic`; the unit tests here only care about
 the API contract, not the migration shape.
 """
@@ -48,9 +48,9 @@ from app.models.base import Base
 
 @pytest_asyncio.fixture
 async def seeded_engine(test_settings) -> AsyncIterator[AsyncEngine]:
-    """Yield a fresh engine with the schema created and the 12 categories seeded.
+    """Yield a fresh engine with the schema created and the 13 categories seeded.
 
-    The 12 categories are inserted in ``sort_order`` so a
+    The 13 categories are inserted in ``sort_order`` so a
     ``GET /api/v1/categories`` test can assert the exact
     order. The schema is created by
     :func:`Base.metadata.create_all` so the test surface
@@ -75,6 +75,7 @@ async def seeded_engine(test_settings) -> AsyncIterator[AsyncEngine]:
                 ("Personal Care", "Personal Care", 10),
                 ("Uncategorized", "Uncategorized", 11),
                 ("Other", "Other", 12),
+                ("Card Payments", "Card Payments", 13),
             )
             for name, display, order in seed:
                 session.add(
@@ -176,17 +177,20 @@ async def test_category_name_must_be_unique(seeded_engine: AsyncEngine) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_categories_returns_twelve_in_sort_order(
+async def test_list_categories_returns_thirteen_in_sort_order(
     seeded_client: AsyncClient,
 ) -> None:
-    """``GET /api/v1/categories`` returns the 12 seeded rows in ``sort_order``."""
+    """``GET /api/v1/categories`` returns the 13 seeded rows in ``sort_order``."""
     response = await seeded_client.get("/api/v1/categories")
     assert response.status_code == 200
     payload = response.json()
-    assert len(payload) == 12
-    # The 12 names are returned in the canonical sort_order
-    # order (1..12). The test asserts both the *order* and
-    # the *names* in one pass.
+    assert len(payload) == 13
+    # The 13 names are returned in the canonical sort_order
+    # order (1..13). The test asserts both the *order* and
+    # the *names* in one pass. "Card Payments" is the 13th
+    # closed-set member (migration 0003); unlike the dashboard
+    # distributions, the taxonomy endpoint returns the full
+    # closed set.
     names = [row["name"] for row in payload]
     assert names == [
         "Dining Out",
@@ -201,6 +205,7 @@ async def test_list_categories_returns_twelve_in_sort_order(
         "Personal Care",
         "Uncategorized",
         "Other",
+        "Card Payments",
     ]
     # Every row carries the expected response shape.
     for row in payload:
@@ -362,6 +367,52 @@ async def test_rename_category_422_on_name_collision(
     )
     assert response.status_code == 422
     assert "Transportation" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_rename_category_anchors_reject_name_change(
+    seeded_client: AsyncClient,
+) -> None:
+    """Renaming the ``name`` of an anchored category returns 422.
+
+    The dashboard anchors the Subscriptions card/section and the Card
+    Payments spend exclusion on ``Category.name``; the rename endpoint
+    rejects ``name`` changes for those rows so the semantics cannot
+    silently move (F2 fix).
+    """
+    (subs_id,) = await _find_category_ids(seeded_client, "Subscriptions")
+    response = await seeded_client.post(
+        f"/api/v1/categories/{subs_id}",
+        json={"name": "Suscripciones"},
+    )
+    assert response.status_code == 422
+    assert "anchors" in response.json()["detail"]
+
+    (cp_id,) = await _find_category_ids(seeded_client, "Card Payments")
+    response = await seeded_client.post(
+        f"/api/v1/categories/{cp_id}",
+        json={"name": "Pagos"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_rename_category_anchor_display_name_rename_is_allowed(
+    seeded_client: AsyncClient,
+) -> None:
+    """Renaming only ``display_name`` of an anchored row stays allowed.
+
+    The dashboard resolvers key on ``name``, so a ``display_name``
+    rename is harmless and must keep working (F2 fix companion).
+    """
+    (subs_id,) = await _find_category_ids(seeded_client, "Subscriptions")
+    response = await seeded_client.post(
+        f"/api/v1/categories/{subs_id}",
+        json={"display_name": "Suscripciones UI"},
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Subscriptions"
+    assert response.json()["display_name"] == "Suscripciones UI"
 
 
 @pytest.mark.asyncio

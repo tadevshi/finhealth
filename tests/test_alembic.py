@@ -158,7 +158,7 @@ def test_empty_database_creates_schema_constraints_and_deterministic_seeds(
                 "recurring_rules",
             } <= tables
             assert await connection.fetchval("SELECT count(*) FROM banks") == 3
-            assert await connection.fetchval("SELECT count(*) FROM categories") == 12
+            assert await connection.fetchval("SELECT count(*) FROM categories") == 13
             assert (
                 await connection.fetchval(
                     "SELECT count(*) FROM pg_constraint WHERE conname = 'uq_recurring_rules_upsert_key'"
@@ -204,21 +204,24 @@ def test_mid_baseline_failure_rolls_back_schema(
 
 
 def test_baseline_and_source_revisions_exist() -> None:
-    """The exact migration lineage is 0001 (destructive) → 0002 (additive source)."""
+    """The exact migration lineage is 0001 (destructive) → 0002 → 0003."""
     versions = ALEMBIC_DIR / "versions"
     assert sorted(path.name for path in versions.glob("*.py")) == [
         "0001_postgresql_baseline.py",
         "0002_statement_source.py",
+        "0003_card_payments_category.py",
     ]
 
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(_alembic_config())
-    assert script.get_current_head() == "0002_statement_source"
+    assert script.get_current_head() == "0003_card_payments_category"
     baseline = script.get_revision("0001_postgresql_baseline")
     assert baseline.down_revision is None
     source_revision = script.get_revision("0002_statement_source")
     assert source_revision.down_revision == "0001_postgresql_baseline"
+    card_payments_revision = script.get_revision("0003_card_payments_category")
+    assert card_payments_revision.down_revision == "0002_statement_source"
 
 
 # ---------------------------------------------------------------------------
@@ -475,9 +478,9 @@ def test_downgrade_to_baseline_refuses_api_rows(
     async def assert_unchanged() -> None:
         connection = await _connect(host, user, port, password, database)
         try:
-            # Refusal leaves the newer schema, the revision stamp and all data intact.
+            # Refusal leaves the newest schema, the revision stamp and all data intact.
             revision = await connection.fetchval("SELECT version_num FROM alembic_version")
-            assert revision == "0002_statement_source"
+            assert revision == "0003_card_payments_category"
             nullable = await connection.fetchval(
                 "SELECT is_nullable FROM information_schema.columns "
                 "WHERE table_name = 'statements' AND column_name = 'file_path'"
@@ -546,10 +549,10 @@ def test_migration_runner_traverses_versioned_populated_database(
     """The runner must allow forward traversal on a recognized versioned database."""
     host, user, port, password, database = postgres_database
     _seed_populated_baseline(host, user, port, password, database)
-    # A versioned populated database is no longer refused: 0002 applies cleanly.
+    # A versioned populated database is no longer refused: 0002 and 0003 apply cleanly.
     alembic_upgrade(_alembic_config(), "head")
     revision = _revision_of(host, user, port, password, database)
-    assert revision == "0002_statement_source"
+    assert revision == "0003_card_payments_category"
 
 
 def _revision_of(host: str, user: str, port: int, password: str, database: str) -> str:
@@ -574,11 +577,11 @@ def test_head_no_op_and_unknown_revision_failures(
     # At-head upgrade is a no-op (idempotent).
     alembic_upgrade(_alembic_config(), "head")
     revision = _revision_of(host, user, port, password, database)
-    assert revision == "0002_statement_source"
+    assert revision == "0003_card_payments_category"
     with pytest.raises(Exception):  # noqa: B017 - alembic raises various revision errors
         alembic_upgrade(_alembic_config(), "0009_does_not_exist")
     revision = _revision_of(host, user, port, password, database)
-    assert revision == "0002_statement_source"
+    assert revision == "0003_card_payments_category"
 
 
 def test_offline_downgrade_sql_guard_coverage(
@@ -609,3 +612,157 @@ def test_offline_downgrade_sql_guard_coverage(
     guard_position = emitted.index("file_path IS NULL")
     first_alter = emitted.index("ALTER TABLE")
     assert guard_position < first_alter
+
+
+# ---------------------------------------------------------------------------
+# 0003_card_payments_category: idempotent additive category seed
+# ---------------------------------------------------------------------------
+
+
+_CARD_PAYMENTS_ID = "10000000-0000-0000-0000-000000000013"
+_CARD_PAYMENTS_NAME = "Card Payments"
+
+
+async def _categories_count(host: str, user: str, port: int, password: str, database: str) -> int:
+    connection = await _connect(host, user, port, password, database)
+    try:
+        count: int = await connection.fetchval("SELECT count(*) FROM categories")
+        return count
+    finally:
+        await connection.close()
+
+
+async def _categories_rows(host: str, user: str, port: int, password: str, database: str) -> list:
+    connection = await _connect(host, user, port, password, database)
+    try:
+        return await connection.fetch(
+            "SELECT id, name, display_name, sort_order FROM categories ORDER BY sort_order"
+        )
+    finally:
+        await connection.close()
+
+
+def test_upgrade_to_head_seeds_card_payments_category(
+    postgres_database: tuple[str, str, int, str, str],
+) -> None:
+    """Upgrade to head inserts the 13th closed-set category deterministically."""
+    host, user, port, password, database = postgres_database
+    alembic_upgrade(_alembic_config(), "head")
+
+    async def assert_seeded() -> None:
+        rows = await _categories_rows(host, user, port, password, database)
+        assert len(rows) == 13
+        card_payments = rows[-1]
+        assert card_payments["id"] == _CARD_PAYMENTS_ID
+        assert card_payments["name"] == _CARD_PAYMENTS_NAME
+        assert card_payments["display_name"] == _CARD_PAYMENTS_NAME
+        assert card_payments["sort_order"] == 13
+
+    _run(assert_seeded())
+
+
+def test_downgrade_0003_restores_twelve_and_reupgrades(
+    postgres_database: tuple[str, str, int, str, str],
+) -> None:
+    """Downgrading 0003 deletes the Card Payments row; the upgrade re-adds it."""
+    host, user, port, password, database = postgres_database
+    alembic_upgrade(_alembic_config(), "head")
+    alembic_downgrade(_alembic_config(), "0002_statement_source")
+
+    async def assert_downgraded() -> None:
+        assert await _categories_count(host, user, port, password, database) == 12
+        rows = await _categories_rows(host, user, port, password, database)
+        assert all(row["name"] != _CARD_PAYMENTS_NAME for row in rows)
+
+    _run(assert_downgraded())
+
+    # The round-trip must leave the chain upgradeable again.
+    alembic_upgrade(_alembic_config(), "head")
+
+    async def assert_reseeded() -> None:
+        rows = await _categories_rows(host, user, port, password, database)
+        assert len(rows) == 13
+        card_payments = rows[-1]
+        assert card_payments["id"] == _CARD_PAYMENTS_ID
+        assert card_payments["name"] == _CARD_PAYMENTS_NAME
+        assert card_payments["display_name"] == _CARD_PAYMENTS_NAME
+        assert card_payments["sort_order"] == 13
+
+    _run(assert_reseeded())
+
+
+def test_card_payments_seed_is_idempotent_on_same_id(
+    postgres_database: tuple[str, str, int, str, str],
+) -> None:
+    """An already-seeded Card Payments row (same id) is never duplicated."""
+    host, user, port, password, database = postgres_database
+    alembic_upgrade(_alembic_config(), "0002_statement_source")
+
+    async def preseed() -> None:
+        connection = await _connect(host, user, port, password, database)
+        try:
+            await connection.execute(
+                "INSERT INTO categories (id, created_at, updated_at, name, "
+                "display_name, sort_order) "
+                "VALUES ($1, now(), now(), $2, $3, 13)",
+                _CARD_PAYMENTS_ID,
+                _CARD_PAYMENTS_NAME,
+                _CARD_PAYMENTS_NAME,
+            )
+        finally:
+            await connection.close()
+
+    _run(preseed())
+    alembic_upgrade(_alembic_config(), "head")
+
+    _run(assert_thirteen(host, user, port, password, database))
+
+
+def test_card_payments_seed_is_idempotent_on_same_name(
+    postgres_database: tuple[str, str, int, str, str],
+) -> None:
+    """A pre-existing category row with the same name but a different id survives.
+
+    The upgrade must neither fail on the unique ``name`` constraint nor
+    insert a second row: the operator's own row is adopted as-is.
+    """
+    host, user, port, password, database = postgres_database
+    alembic_upgrade(_alembic_config(), "0002_statement_source")
+    operator_id = "99999999-9999-9999-9999-999999999999"
+
+    async def preseed() -> None:
+        connection = await _connect(host, user, port, password, database)
+        try:
+            await connection.execute(
+                "INSERT INTO categories (id, created_at, updated_at, name, "
+                "display_name, sort_order) "
+                "VALUES ($1, now(), now(), $2, $3, 99)",
+                operator_id,
+                _CARD_PAYMENTS_NAME,
+                _CARD_PAYMENTS_NAME,
+            )
+        finally:
+            await connection.close()
+
+    _run(preseed())
+    alembic_upgrade(_alembic_config(), "head")
+
+    async def assert_no_duplicate() -> None:
+        rows = await _categories_rows(host, user, port, password, database)
+        card_payments_rows = [row for row in rows if row["name"] == _CARD_PAYMENTS_NAME]
+        assert len(card_payments_rows) == 1
+        # The operator's own row identity is preserved; no deterministic
+        # duplicate was inserted under the migration id.
+        assert card_payments_rows[0]["id"] == operator_id
+        assert len(rows) == 13
+
+    _run(assert_no_duplicate())
+
+
+async def assert_thirteen(host: str, user: str, port: int, password: str, database: str) -> None:
+    """Shared assertion: exactly 13 categories, Card Payments present once."""
+    rows = await _categories_rows(host, user, port, password, database)
+    assert len(rows) == 13
+    card_payments_rows = [row for row in rows if row["name"] == _CARD_PAYMENTS_NAME]
+    assert len(card_payments_rows) == 1
+    assert card_payments_rows[0]["id"] == _CARD_PAYMENTS_ID

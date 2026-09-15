@@ -13,13 +13,14 @@ surface lives under ``/api/v1`` and is wired separately by
 
 from __future__ import annotations
 
+import calendar
 import uuid
 from datetime import date as date_typ
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -29,7 +30,6 @@ from app.db.session import get_session
 from app.models.bank import Bank
 from app.models.category import Category
 from app.models.credit_card import CreditCard
-from app.models.merchant import Merchant
 from app.models.statement import Statement
 from app.models.transaction import Transaction
 from app.services.dashboard import DashboardService
@@ -55,6 +55,61 @@ web_router: APIRouter = APIRouter(tags=["web"])
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def parse_optional_date(raw: str | None, *, field: str) -> date_typ | None:
+    """Parse a query-string date, treating an empty value as "no filter".
+
+    The HTML filter form serialises untouched fields as empty
+    strings (``date_from=&date_to=&min_amount=``), and programmatic
+    clients can send the same shape. An empty or whitespace-only
+    value therefore means "absent" and yields ``None``.
+
+    A non-empty unparseable value keeps the strict 422 contract —
+    "treat empty as absent" must never become "ignore invalid". The
+    error detail names the offending ``field`` so the client can
+    locate the bad value.
+
+    The JSON API at ``app.api.v1.transactions`` imports these helpers
+    so the HTML and JSON surfaces share one parsing rule.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return date_typ.fromisoformat(raw.strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"`{field}` must be an ISO date (YYYY-MM-DD); got {raw!r}",
+        ) from exc
+
+
+def parse_optional_decimal(raw: str | None, *, field: str) -> Decimal | None:
+    """Parse a query-string decimal, treating an empty value as "no filter".
+
+    Mirrors :func:`parse_optional_date`: empty/whitespace-only values
+    are absent, garbage non-empty values raise HTTP 422 with a clear
+    detail naming the offending ``field``, and valid non-empty values
+    keep their exact behaviour.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = Decimal(raw.strip())
+    except InvalidOperation as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"`{field}` must be a decimal number; got {raw!r}",
+        ) from exc
+    if not value.is_finite():
+        # Decimal accepts NaN/sNaN/Infinity without raising; those values
+        # are meaningless as amount bounds and previously Pydantic's
+        # Decimal query parsing rejected them, so keep the 422 contract.
+        raise HTTPException(
+            status_code=422,
+            detail=f"`{field}` must be a finite decimal number; got {raw!r}",
+        )
+    return value
 
 
 async def _query_transactions(
@@ -277,20 +332,38 @@ async def transactions_page(
         Query(description="Optional filter to a single statement."),
     ] = None,
     date_from: Annotated[
-        date_typ | None,
-        Query(description="Inclusive lower bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     date_to: Annotated[
-        date_typ | None,
-        Query(description="Inclusive upper bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     min_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive lower bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     max_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive upper bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     description: Annotated[
         str | None,
@@ -336,13 +409,19 @@ async def transactions_page(
     so the per-row ``<select>`` and the filter form's
     multi-select see the same 12 options in the same order.
     """
+    # Fix 3: the form serialises untouched fields as empty strings; the
+    # empty values mean "no filter" while garbage stays a 422.
+    parsed_date_from = parse_optional_date(date_from, field="date_from")
+    parsed_date_to = parse_optional_date(date_to, field="date_to")
+    parsed_min_amount = parse_optional_decimal(min_amount, field="min_amount")
+    parsed_max_amount = parse_optional_decimal(max_amount, field="max_amount")
     transactions = await _query_transactions(
         session,
         statement_id=statement_id,
-        date_from=date_from,
-        date_to=date_to,
-        min_amount=min_amount,
-        max_amount=max_amount,
+        date_from=parsed_date_from,
+        date_to=parsed_date_to,
+        min_amount=parsed_min_amount,
+        max_amount=parsed_max_amount,
         description=description,
         currency=currency,
         category_id=category_id,
@@ -358,10 +437,10 @@ async def transactions_page(
         "total": len(transactions),
         "filters": {
             "statement_id": statement_id,
-            "date_from": date_from,
-            "date_to": date_to,
-            "min_amount": min_amount,
-            "max_amount": max_amount,
+            "date_from": parsed_date_from,
+            "date_to": parsed_date_to,
+            "min_amount": parsed_min_amount,
+            "max_amount": parsed_max_amount,
             "description": description,
             "currency": currency,
             "category_id": category_id or [],
@@ -395,20 +474,38 @@ async def transactions_rows_partial(
         Query(description="Optional filter to a single statement."),
     ] = None,
     date_from: Annotated[
-        date_typ | None,
-        Query(description="Inclusive lower bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     date_to: Annotated[
-        date_typ | None,
-        Query(description="Inclusive upper bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     min_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive lower bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     max_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive upper bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     description: Annotated[
         str | None,
@@ -451,13 +548,15 @@ async def transactions_rows_partial(
     ``<select>`` markup stays meaningful when the partial is
     re-rendered (e.g. on first paint or after a PATCH swap).
     """
+    # Fix 3: shared empty-string tolerance with the page (see
+    # :func:`parse_optional_date`).
     transactions = await _query_transactions(
         session,
         statement_id=statement_id,
-        date_from=date_from,
-        date_to=date_to,
-        min_amount=min_amount,
-        max_amount=max_amount,
+        date_from=parse_optional_date(date_from, field="date_from"),
+        date_to=parse_optional_date(date_to, field="date_to"),
+        min_amount=parse_optional_decimal(min_amount, field="min_amount"),
+        max_amount=parse_optional_decimal(max_amount, field="max_amount"),
         description=description,
         currency=currency,
         category_id=category_id,
@@ -620,19 +719,42 @@ async def _dashboard_context(
         card_id=selection.card_id,
         range_mode=selection.range_mode,
     )
-    categories = await service.categories(period=period_date, card_id=selection.card_id)
-    merchants = await service.merchants(period=period_date, card_id=selection.card_id)
+    # Fix 1: the categories and merchants sections aggregate over the
+    # resolved window (current -> period month, ytd/all_time/rolling ->
+    # the selected span) instead of silently collapsing to the period
+    # month. The summary KPI already used the same resolved window.
+    categories = await service.categories(
+        period=period_date,
+        card_id=selection.card_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    merchants = await service.merchants(
+        period=period_date,
+        card_id=selection.card_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
     monthly = await service.monthly_window(
         window_start=window_start, window_end=window_end, card_id=selection.card_id
     )
-    recurring_rows = await service.recurring(period=period_date, card_id=selection.card_id)
-    merchant_names = await _lookup_merchant_names(
-        session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
+    # Fix 2: the "Suscripciones" KPI card and the recurring section are
+    # driven by the closed-set Subscriptions category (the recurring-rules
+    # detector is LLM-dependent and unstable). Both render over the same
+    # resolved window as the other sections.
+    subscriptions_summary = await service.subscriptions_summary(
+        window_start=window_start,
+        window_end=window_end,
+        card_id=selection.card_id,
     )
-    recur_count = len(recurring_rows)
-    recur_monthly = sum(
-        int(row.get("amount_min", 0) or 0) for row in recurring_rows if row.get("currency") == "CLP"
+    subscription_rows = await service.subscriptions_transactions(
+        window_start=window_start,
+        window_end=window_end,
+        card_id=selection.card_id,
     )
+    recur_total_per_currency = subscriptions_summary["total_per_currency"]
+    recur_count = int(subscriptions_summary["count"])
+    recur_monthly = int(recur_total_per_currency.get("CLP", Decimal("0")))
     context: dict[str, Any] = {
         "request": request,
         "cards": cards,
@@ -640,8 +762,7 @@ async def _dashboard_context(
         "categories": categories,
         "merchants": merchants,
         "monthly": monthly,
-        "recurring": recurring_rows,
-        "merchants_by_id": merchant_names,
+        "recurring": subscription_rows,
         "period_label": labels.period_label,
         "period_iso": selection.period.iso(),
         "card_label": labels.card_label,
@@ -652,6 +773,10 @@ async def _dashboard_context(
         "selected_card_id": str(selection.card_id),
         "recur_count": recur_count,
         "recur_monthly": recur_monthly,
+        "recur_total_per_currency": recur_total_per_currency,
+        # Only a single-month window earns the "/ mes" claim; ytd,
+        # rolling_N and all_time show the plain window total.
+        "recur_suffix": "/ mes" if selection.range_mode.kind == "current" else "",
         "window_start": window_start,
         "window_end": window_end,
     }
@@ -675,24 +800,6 @@ async def _list_active_cards(session: AsyncSession) -> list[CreditCard]:
         .order_by(CreditCard.bank_id.asc(), CreditCard.card_number_masked.asc())
     )
     return list(result.scalars().all())
-
-
-async def _lookup_merchant_names(
-    session: AsyncSession, merchant_ids: list[uuid.UUID]
-) -> dict[uuid.UUID, str]:
-    """Resolve ``merchant_id`` UUIDs to display names for the recurring partial.
-
-    The recurring section is the only section that needs the
-    merchant name in the template. Loading every merchant name
-    in a single round-trip keeps the partial render to one
-    extra query (instead of one per row).
-    """
-    if not merchant_ids:
-        return {}
-    result = await session.execute(
-        select(Merchant.id, Merchant.name).where(Merchant.id.in_(merchant_ids))
-    )
-    return dict[uuid.UUID, str](result.all())  # type: ignore[arg-type]
 
 
 @web_router.get(
@@ -819,20 +926,21 @@ async def dashboard_section_summary(
     service = DashboardService(session)
     summary = await service.summary(period=period_date, card_id=parsed_card_id)
 
-    # ``Suscripciones`` KPI card needs the live recurring rules, not a
-    # hard-coded count. We re-use the same service call the rest of
-    # the dashboard makes; the rules are already filtered by the
-    # service for in-band occurrences in the period.
-    recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
-    recur_count = len(recurring_rows)
-    # Sum the per-rule minimum amount (CLP only — USD is rare in the
-    # recurring dataset and would skew the total without FX conversion).
-    recur_monthly = 0
-    for row in recurring_rows:
-        amount = row.get("amount_min", 0) or 0
-        currency = row.get("currency", "CLP")
-        if currency == "CLP":
-            recur_monthly += int(amount)
+    # Fix 2: the ``Suscripciones`` KPI card is driven by the closed-set
+    # Subscriptions category (the recurring-rules detector is
+    # LLM-dependent and unstable). This partial is month-scoped (it
+    # receives no ``range_mode``), so the window is the period month.
+    month_start = period_date.replace(day=1)
+    last_day = calendar.monthrange(period_date.year, period_date.month)[1]
+    month_end = period_date.replace(day=last_day)
+    subscriptions = await service.subscriptions_summary(
+        window_start=month_start,
+        window_end=month_end,
+        card_id=parsed_card_id,
+    )
+    recur_total_per_currency = subscriptions["total_per_currency"]
+    recur_count = int(subscriptions["count"])
+    recur_monthly = int(recur_total_per_currency.get("CLP", Decimal("0")))
 
     context: dict[str, Any] = {
         "summary": summary,
@@ -841,6 +949,7 @@ async def dashboard_section_summary(
         "range_label": "",
         "recur_count": recur_count,
         "recur_monthly": recur_monthly,
+        "recur_total_per_currency": recur_total_per_currency,
     }
     return templates.TemplateResponse(
         request=request,
@@ -978,7 +1087,13 @@ async def dashboard_section_recurring(
     period: Annotated[str, Query(description="ISO 'YYYY-MM' month label.")],
     card_id: Annotated[str, Query(description="UUID or 'all'.")] = "all",
 ) -> HTMLResponse:
-    """HTMX partial: render the active recurring rules for the period."""
+    """HTMX partial: render the subscription transactions for the period.
+
+    Fix 2: the section is driven by the closed-set Subscriptions
+    category instead of the recurring-rules detector. This partial is
+    month-scoped (it receives no ``range_mode``), so the window is the
+    period month.
+    """
     try:
         year_str, month_str = period.split("-")
         period_date = date_typ(int(year_str), int(month_str), 1)
@@ -988,15 +1103,28 @@ async def dashboard_section_recurring(
     cards = await _list_active_cards(session)
     parsed_card_id = _parse_card_filter(card_id)
     service = DashboardService(session)
-    recurring_rows = await service.recurring(period=period_date, card_id=parsed_card_id)
-    merchant_names = await _lookup_merchant_names(
-        session, [uuid.UUID(str(row["merchant_id"])) for row in recurring_rows]
+    month_start = period_date.replace(day=1)
+    last_day = calendar.monthrange(period_date.year, period_date.month)[1]
+    month_end = period_date.replace(day=last_day)
+    subscriptions = await service.subscriptions_summary(
+        window_start=month_start,
+        window_end=month_end,
+        card_id=parsed_card_id,
     )
+    subscription_rows = await service.subscriptions_transactions(
+        window_start=month_start,
+        window_end=month_end,
+        card_id=parsed_card_id,
+    )
+    recur_total_per_currency = subscriptions["total_per_currency"]
     context: dict[str, Any] = {
-        "recurring": recurring_rows,
-        "merchants_by_id": merchant_names,
+        "recurring": subscription_rows,
         "period_label": period,
         "card_label": _card_label(card_id, cards),
+        "recur_count": int(subscriptions["count"]),
+        "recur_monthly": int(recur_total_per_currency.get("CLP", Decimal("0"))),
+        "recur_total_per_currency": recur_total_per_currency,
+        "recur_suffix": "/ mes",
     }
     return templates.TemplateResponse(
         request=request,

@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Final
 
@@ -44,6 +42,7 @@ from app.services.transaction_creation import (
     TransactionCreationError,
     TransactionCreationService,
 )
+from app.web.router import parse_optional_date, parse_optional_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -217,20 +216,38 @@ async def list_transactions(
         Query(description="Filter to a single statement."),
     ] = None,
     date_from: Annotated[
-        date | None,
-        Query(description="Inclusive lower bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     date_to: Annotated[
-        date | None,
-        Query(description="Inclusive upper bound on the posting date."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the posting date (ISO YYYY-MM-DD). "
+                "An empty string means no filter."
+            ),
+        ),
     ] = None,
     min_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive lower bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive lower bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     max_amount: Annotated[
-        Decimal | None,
-        Query(description="Inclusive upper bound on the absolute amount."),
+        str | None,
+        Query(
+            description=(
+                "Inclusive upper bound on the absolute amount. An empty string means no filter."
+            ),
+        ),
     ] = None,
     description: Annotated[
         str | None,
@@ -285,24 +302,32 @@ async def list_transactions(
     Phase 1, the dataset is small enough that ``OFFSET`` is
     fine and the implementation is trivial.
     """
+    # Fix 3: empty-string values (``date_from=``) mean "no filter" —
+    # the HTML filter form serialises untouched fields that way —
+    # while garbage non-empty values keep the strict 422 contract.
+    parsed_date_from = parse_optional_date(date_from, field="date_from")
+    parsed_date_to = parse_optional_date(date_to, field="date_to")
+    parsed_min_amount = parse_optional_decimal(min_amount, field="min_amount")
+    parsed_max_amount = parse_optional_decimal(max_amount, field="max_amount")
+
     # The query is built incrementally — every filter is a single
     # ``WHERE`` clause, and we only add the ``ORDER BY`` once.
     query = select(Transaction)
     if statement_id is not None:
         query = query.where(Transaction.statement_id == statement_id)
-    if date_from is not None:
-        query = query.where(Transaction.date >= date_from)
-    if date_to is not None:
-        query = query.where(Transaction.date <= date_to)
-    if min_amount is not None:
+    if parsed_date_from is not None:
+        query = query.where(Transaction.date >= parsed_date_from)
+    if parsed_date_to is not None:
+        query = query.where(Transaction.date <= parsed_date_to)
+    if parsed_min_amount is not None:
         # ``amount`` is signed; bounding the *absolute* value
         # means a refund of $1.000 and a charge of $1.000 both
         # match ``min_amount=500``. ``InstrumentedAttribute`` does
         # not expose ``.abs()`` directly, so we use SQL's
         # ``func.abs`` and compare in SQL rather than Python.
-        query = query.where(func.abs(Transaction.amount) >= min_amount)
-    if max_amount is not None:
-        query = query.where(func.abs(Transaction.amount) <= max_amount)
+        query = query.where(func.abs(Transaction.amount) >= parsed_min_amount)
+    if parsed_max_amount is not None:
+        query = query.where(func.abs(Transaction.amount) <= parsed_max_amount)
     if description is not None:
         # ``ilike`` provides case-insensitive PostgreSQL matching.
         # already case-insensitive for ASCII. We use ``func.lower``
