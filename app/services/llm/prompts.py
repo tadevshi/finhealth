@@ -183,9 +183,11 @@ _INTERNACIONAL_EXAMPLE_OUTPUT: Final = json.dumps(
 # Phase 2 — closed-set category names
 # ---------------------------------------------------------------------------
 #
-# The 12 names the LLM is told to emit verbatim. They mirror the
-# ``categories`` seed in migration ``0005_phase2_categories`` and
-# are the closed set the application accepts at the API boundary.
+# The 13 names the LLM is told to emit verbatim. The first 12 mirror
+# the ``categories`` seed in migration ``0001_postgresql_baseline``;
+# the 13th ("Card Payments") is added by migration
+# ``0003_card_payments_category``. Together they are the closed set
+# the application accepts at the API boundary.
 #
 SEED_CATEGORY_NAMES: Final = (
     "Groceries",
@@ -200,6 +202,7 @@ SEED_CATEGORY_NAMES: Final = (
     "Subscriptions",
     "Other",
     "Uncategorized",
+    "Card Payments",
 )
 
 
@@ -227,12 +230,16 @@ leading "$" and thousand separators). Do not normalise.
 4. If the description contains an "NN/NN" installment marker, set \
 ``installment_number`` and ``installment_total`` accordingly and \
 copy the amount into ``installment_value``. Otherwise leave them null.
-5. Choose exactly one of the following 12 category names — the \
-closed set the application accepts: Groceries, Dining Out, \
+5. Choose exactly one of the following 13 closed-set names — \
+the list the application accepts: Groceries, Dining Out, \
 Transportation, Bills, Entertainment, Shopping, Health, Travel, \
-Personal Care, Subscriptions, Other, Uncategorized. Use ``Other`` \
-if the best match is not in the list. Use null if the description \
-is unreadable.
+Personal Care, Subscriptions, Other, Uncategorized, Card Payments. \
+Use ``Other`` if the best match is not in the list. Use null if the \
+description is unreadable.
+   Card Payments rule: use ``Card Payments`` only for payments or \
+credits TO the credit card — statement payment lines such as \
+"MONTO CANCELADO", "PAGO DE TARJETA", "PAGO MINIMO", "PAGO \
+CONTADO" — never for purchases or refunds of purchases.
 6. Extract the statement header fields into the ``metadata`` object:
    * ``card_number_masked`` — the masked PAN as printed on every \
 page (e.g. "XXXX XXXX XXXX 0000").
@@ -298,12 +305,16 @@ Do not normalise.
 4. If the description contains an "NN/NN" installment marker, set \
 ``installment_number`` and ``installment_total`` accordingly and \
 copy the amount into ``installment_value``. Otherwise leave them null.
-5. Choose exactly one of the following 12 category names — the \
-closed set the application accepts: Groceries, Dining Out, \
+5. Choose exactly one of the following 13 closed-set names — \
+the list the application accepts: Groceries, Dining Out, \
 Transportation, Bills, Entertainment, Shopping, Health, Travel, \
-Personal Care, Subscriptions, Other, Uncategorized. Use ``Other`` \
-if the best match is not in the list. Use null if the description \
-is unreadable.
+Personal Care, Subscriptions, Other, Uncategorized, Card Payments. \
+Use ``Other`` if the best match is not in the list. Use null if the \
+description is unreadable.
+   Card Payments rule: use ``Card Payments`` only for payments or \
+credits TO the credit card — statement payment lines such as \
+"MONTO CANCELADO", "PAGO DE TARJETA", "PAGO MINIMO", "PAGO \
+CONTADO" — never for purchases or refunds of purchases.
 6. Extract the statement header fields into the ``metadata`` object:
    * ``card_number_masked`` — the masked PAN as printed on every \
 page (e.g. "XXXX XXXX XXXX 0000").
@@ -383,7 +394,7 @@ def _schema_json() -> str:
                 "amount": "string in the original visual format",
                 "currency": "CLP or USD",
                 "category": (
-                    "one of the 12 closed-set names: "
+                    "one of the 13 closed-set names: "
                     + ", ".join(SEED_CATEGORY_NAMES)
                     + "; or null when the description is unreadable"
                 ),

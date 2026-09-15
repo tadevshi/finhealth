@@ -23,15 +23,18 @@ dashboard looks alive):
 * 6 statements on the USD card (Feb .. Jul 2026).
 * ~6 merchants (Jumbo, Lider, Starbucks, Uber, Apple, Netflix)
   with realistic CLP/USD amounts.
-* ~30 transactions across the 12 closed-set categories
+* ~30 transactions across the closed-set categories
   (Groceries, Dining, Transport, Services, Subscriptions,
   Shopping) so every category has at least one non-zero row.
 * 3 active recurring rules (Netflix, Spotify, Apple Services)
   so the Suscripciones KPI card is non-zero and the
   Suscripciones recurrentes section has rows.
 
-The categories table is left alone (it is the 12-row closed
-set seeded by Alembic migration 0001).
+The categories table is only filled when rows are missing: it is the
+13-row closed set seeded by Alembic migrations 0001 +
+0003_card_payments_category (the 13th member, "Card Payments", holds
+payments TO the credit card and is excluded from the dashboard spend
+distributions).
 
 The script uses the validated structured ``POSTGRES_*`` settings shared
 with the application, so it always targets the configured PostgreSQL database.
@@ -382,6 +385,7 @@ async def seed_demo() -> None:
             "Personal Care",
             "Uncategorized",
             "Other",
+            "Card Payments",
         ]
         cat_rows = (await session.execute(select(Category))).scalars().all()
         categories_by_name = {c.name: c for c in cat_rows}

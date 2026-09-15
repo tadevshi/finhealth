@@ -72,14 +72,17 @@ from app.services.dashboard_selection import RangeMode
 
 @pytest_asyncio.fixture
 async def dashboard_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine]:
-    """Yield a fresh engine with the full schema + the 12 seeded categories.
+    """Yield a fresh engine with the full schema + the 13 closed-set categories.
 
     Mirrors the ``recurring_engine`` fixture from
     :mod:`tests.test_recurring`, with the addition of the
-    closed-set 12-row ``categories`` seed the dashboard
-    service depends on (the categories migration is
+    closed-set 13-row ``categories`` seed the dashboard
+    service depends on (the categories migrations are
     exercised by :mod:`tests.test_alembic`; the seed here
-    keeps the unit test self-contained).
+    keeps the unit test self-contained). The 13th row,
+    "Card Payments", is the category the dashboard service
+    excludes from its spend distributions (see
+    :class:`TestCardPaymentsExclusion`).
     """
     engine: AsyncEngine = create_engine(test_settings.database_url)
     try:
@@ -104,6 +107,7 @@ async def dashboard_engine(test_settings: Settings) -> AsyncIterator[AsyncEngine
                 ("Personal Care", "Personal Care", 10),
                 ("Uncategorized", "Uncategorized", 11),
                 ("Other", "Other", 12),
+                ("Card Payments", "Card Payments", 13),
             ):
                 session.add(
                     Category(
@@ -1090,6 +1094,269 @@ class TestCategories:
         uncategorized_row = next(row for row in rows if row.category_id == uncategorized.id)
         assert uncategorized_row.total_per_currency == {"CLP": Decimal("100.00")}
         assert uncategorized_row.transaction_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Card Payments exclusion (statement payments are not spend)
+# ---------------------------------------------------------------------------
+
+
+class TestCardPaymentsExclusion:
+    """Card-Payments-categorized transactions stay out of the spend distributions.
+
+    A credit-card statement payment (e.g. "MONTO CANCELADO",
+    CLP -1,943,000) is not spend: it is a transfer to the card.
+    When it was categorized as "Other" it dragged the CLP
+    denominator negative and every ``pct_of_total`` collapsed to
+    0.0 on the all-time dashboard. These tests pin the new
+    contract:
+
+    * the Card Payments category row is not returned by
+      :meth:`DashboardService.categories`;
+    * Card-Payments transactions are excluded from the
+      ``pct_of_total`` denominator;
+    * they never win ``_top_category`` / ``_top_merchant`` and are
+      excluded from :meth:`DashboardService.merchants`;
+    * a missing Card Payments category row (un-migrated database)
+      degrades to the old, non-excluding behaviour;
+    * ``summary`` / ``monthly`` totals intentionally keep the
+      signed semantics (documented follow-up decision).
+    """
+
+    @pytest.mark.asyncio
+    async def test_categories_excludes_card_payments_row_and_denominator(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """The payment row vanishes and Groceries pct becomes 100% of the clean CLP total.
+
+        Groceries spends CLP 50,000; the Card Payments transaction is
+        CLP -1,943,000. Without the exclusion the CLP denominator
+        would be -1,893,000 and Groceries' ``pct_of_total`` would be
+        0.0; with the exclusion the denominator is exactly the
+        Groceries spend and the pct is 1.0.
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+        card_payments = categories["Card Payments"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="50000.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="-1943000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=card_payments.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).categories(
+                period=date(2026, 7, 15), card_id="all"
+            )
+
+        assert all(r.category_id != card_payments.id for r in rows)
+        groceries_row = next(r for r in rows if r.category_id == groceries.id)
+        assert groceries_row.total_per_currency == {"CLP": Decimal("50000.00")}
+        assert groceries_row.transaction_count == 1
+        assert groceries_row.pct_of_total == 1.0
+
+    @pytest.mark.asyncio
+    async def test_top_category_never_card_payments_when_it_is_the_only_spend(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """A lone -1.9M statement payment yields no top category or top merchant.
+
+        Without the exclusion the Card Payments category (and the
+        payment's merchant) would "win" the top slots with a huge
+        negative total.
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        card_payments = categories["Card Payments"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="-1943000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=card_payments.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            service = DashboardService(session)
+            response = await service.summary(date(2026, 7, 15))
+            merchant_rows = await service.merchants(date(2026, 7, 15), card_id="all")
+
+        assert response.top_category_id is None
+        assert response.top_merchant_id is None
+        assert merchant_rows == []
+
+    @pytest.mark.asyncio
+    async def test_merchants_exclude_card_payments_even_with_large_negative_total(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """A merchant whose total is dominated by a -1.9M payment keeps its spend rollup.
+
+        The payment rides on the same merchant as the Groceries
+        spend: without the exclusion the merchant rollup would be
+        CLP -1,893,000 with 2 transactions; with the exclusion it is
+        the clean CLP 50,000 spend.
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+        card_payments = categories["Card Payments"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="50000.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="-1943000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=card_payments.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            merchant_rows = await DashboardService(session).merchants(
+                date(2026, 7, 15), card_id="all"
+            )
+
+        assert len(merchant_rows) == 1
+        assert merchant_rows[0].merchant_id == merchant_clp
+        assert merchant_rows[0].total_per_currency == {"CLP": Decimal("50000.00")}
+        assert merchant_rows[0].transaction_count == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_card_payments_row_degrades_without_exclusion(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Un-migrated databases (no Card Payments row) keep the old behaviour.
+
+        The resolver finds no row, no exclusion clause is applied,
+        and the payment drags the denominator negative exactly as it
+        does today — the Groceries ``pct_of_total`` collapses to 0.0.
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        groceries = categories["Groceries"]
+        card_payments = categories["Card Payments"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="50000.00",
+                txn_date=date(2026, 7, 3),
+                currency="CLP",
+                category_id=groceries.id,
+            )
+            payment = _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="-1943000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=card_payments.id,
+            )
+            await session.commit()
+            # Deleting the category row sets ``transactions.category_id``
+            # to NULL (the FK is ON DELETE SET NULL): the state an
+            # un-migrated database is in.
+            await session.delete(card_payments)
+            await session.commit()
+            await session.refresh(payment)
+
+        async with session_factory() as session:
+            rows = await DashboardService(session).categories(
+                period=date(2026, 7, 15), card_id="all"
+            )
+
+        # The row is gone, no exclusion fired: 13 seeded rows minus the
+        # deleted one.
+        assert len(rows) == 12
+        assert all(r.category_id != card_payments.id for r in rows)
+        groceries_row = next(r for r in rows if r.category_id == groceries.id)
+        # The payment still counts in the signed CLP denominator
+        # (documented current behaviour): pct collapses to 0.0.
+        assert groceries_row.pct_of_total == 0.0
+
+    @pytest.mark.asyncio
+    async def test_summary_totals_still_include_card_payments(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_world: dict[str, object],
+    ) -> None:
+        """Summary KPI totals keep the signed semantics for now.
+
+        Excluding Card Payments from the ``summary`` / ``monthly``
+        totals is a deliberate follow-up decision; this test pins
+        the current signed behaviour so the follow-up is a visible
+        contract change, not a silent drift.
+        """
+        statement_a = seeded_world["statement_a_id"]  # type: ignore[arg-type]
+        merchant_clp = seeded_world["merchant_clp_id"]  # type: ignore[arg-type]
+        categories = seeded_world["categories"]  # type: ignore[assignment]
+        card_payments = categories["Card Payments"]
+
+        async with session_factory() as session:
+            _add_transaction(
+                session,
+                statement_id=statement_a,
+                merchant_id=merchant_clp,
+                amount="-1943000.00",
+                txn_date=date(2026, 7, 20),
+                currency="CLP",
+                category_id=card_payments.id,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            response = await DashboardService(session).summary(date(2026, 7, 15))
+
+        assert response.total_per_currency == {"CLP": Decimal("-1943000.00")}
+        assert response.transaction_count == 1
 
 
 # ---------------------------------------------------------------------------

@@ -14,9 +14,12 @@ The five methods
 * :meth:`summary` — KPI tile data for a single calendar
   month (total, daily avg, count, top category, top
   merchant, % change vs. prior month).
-* :meth:`categories` — 12 rows (one per seeded closed-set
-  :class:`app.models.category.Category`), ordered by the
-  largest single-currency total descending.
+* :meth:`categories` — the spend categories with per-currency
+  rollups, ordered by the largest single-currency total
+  descending. The seeded "Card Payments" category (statement
+  payments to the credit card are not spend) is excluded from
+  the rows and from the ``pct_of_total`` denominator; on a
+  migrated database the section returns the other 12 rows.
 * :meth:`merchants` — top-N merchants by total, ordered by
   the largest single-currency total descending.
 * :meth:`monthly` — time series of monthly totals for the
@@ -134,6 +137,17 @@ _DEFAULT_RANGE_MONTHS: int = 6
 #: happens at query time (never a hard-coded UUID) so a missing
 #: category row degrades to "no subscriptions".
 _SUBSCRIPTIONS_DISPLAY_NAME: str = "Subscriptions"
+
+
+#: ``display_name`` of the dedicated closed-set category for payments
+#: TO the credit card (statement payment lines such as "MONTO
+#: CANCELADO"). Those transactions are not spend: the spend
+#: distributions (:meth:`categories`, :meth:`merchants` and the
+#: top-category / top-merchant rollups behind :meth:`summary`) exclude
+#: the category at query time. The lookup happens at query time (never
+#: a hard-coded UUID) so a missing category row — an un-migrated
+#: database — degrades to "no exclusion" instead of failing.
+_CARD_PAYMENTS_DISPLAY_NAME: str = "Card Payments"
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +504,15 @@ class DashboardService:
         Ties (two categories with the same total) are broken
         by ``Category.sort_order`` ascending so the result
         is stable.
+
+        Card Payments exclusion: transactions in the dedicated
+        "Card Payments" category (statement payments are not spend)
+        are dropped from the join, so a CLP -1,943,000 "MONTO
+        CANCELADO" payment can never win the top-category slot. A
+        missing category row (un-migrated database) applies no
+        exclusion.
         """
+        card_payments_id = await self._card_payments_category_id()
         # Build the outerjoin ON clause with the optional card filter
         # (same subquery approach as :meth:`categories`).
         outerjoin_on = and_(
@@ -498,6 +520,12 @@ class DashboardService:
             Transaction.date >= period_start,
             Transaction.date <= period_end,
         )
+        if card_payments_id is not None:
+            # Payments to the card are not spend: never rank them.
+            outerjoin_on = and_(
+                outerjoin_on,
+                Transaction.category_id.is_distinct_from(card_payments_id),
+            )
         if card_id != "all":
             card_subq = select(Statement.id).where(Statement.credit_card_id == card_id)
             outerjoin_on = and_(
@@ -566,6 +594,13 @@ class DashboardService:
         broken by ``Merchant.name`` ascending (a stable
         string order). The names are pre-fetched in a
         second query so the sort key is sync.
+
+        Card Payments exclusion: transactions in the dedicated
+        "Card Payments" category (statement payments are not spend)
+        never contribute to the top-merchant rollup — a CLP -1,943,000
+        "MONTO CANCELADO" payment must not surface as a top merchant
+        or distort a merchant's total. A missing category row
+        (un-migrated database) applies no exclusion.
         """
         from sqlalchemy import select as sa_select
 
@@ -581,6 +616,7 @@ class DashboardService:
             .group_by(Transaction.merchant_id, Transaction.currency)
         )
         stmt = self._apply_card_filter(stmt, card_id)
+        stmt = self._spend_only_filter(stmt, await self._card_payments_category_id())
 
         rows = (await self._session.execute(stmt)).all()
         per_merchant: dict[UUID, dict[str, Decimal]] = {}
@@ -616,16 +652,26 @@ class DashboardService:
         window_start: date_typ | None = None,
         window_end: date_typ | None = None,
     ) -> list[CategoryBreakdown]:
-        """Return the 12 closed-set categories with per-currency rollups.
+        """Return the spend categories with per-currency rollups.
 
-        Every row of the seeded ``categories`` table appears
-        in the response — zero-spend categories carry
-        ``total_per_currency == {}`` and ``pct_of_total ==
-        0.0`` (per the spec scenario "All 12 categories are
-        returned even at zero spend"). The response is
-        ordered by the largest single-currency total
+        Every seeded spend category appears in the response —
+        zero-spend categories carry ``total_per_currency == {}`` and
+        ``pct_of_total == 0.0`` (per the spec scenario "All
+        categories are returned even at zero spend"). The response
+        is ordered by the largest single-currency total
         descending, with ``Category.sort_order`` ascending
         as the stable tiebreaker.
+
+        Card Payments exclusion: the dedicated "Card Payments"
+        category (statement payments to the credit card are not
+        spend) never appears in the response, and its transactions
+        are excluded from the ``pct_of_total`` denominator — a
+        CLP -1,943,000 "MONTO CANCELADO" payment must not make the
+        denominator negative. On a migrated database the section
+        therefore returns 12 rows (the closed set minus Card
+        Payments); on an un-migrated database (no such category
+        row) the exclusion is skipped and every category row is
+        returned, preserving the old behaviour.
 
         The SQL is a ``LEFT JOIN`` from ``Category`` to the
         aggregated ``Transaction`` rows so the zero-spend
@@ -649,6 +695,8 @@ class DashboardService:
         period_end = _last_of_month(period)
         if window_start is not None and window_end is not None:
             period_start, period_end = window_start, window_end
+
+        card_payments_id = await self._card_payments_category_id()
 
         # Build the outerjoin ON clause. The card filter
         # (when ``card_id != "all"``) uses a correlated
@@ -685,6 +733,11 @@ class DashboardService:
             .outerjoin(Transaction, outerjoin_on)
             .group_by(Category.id, Category.display_name, Category.sort_order, Transaction.currency)
         )
+        # The dedicated Card Payments category never appears in the
+        # spend distribution (a plain filter on the left table keeps
+        # the LEFT JOIN semantics for every other row).
+        if card_payments_id is not None:
+            stmt = stmt.where(Category.id != card_payments_id)
 
         rows = (await self._session.execute(stmt)).all()
 
@@ -718,11 +771,16 @@ class DashboardService:
             .group_by(Transaction.currency)
         )
         period_totals_stmt = self._apply_card_filter(period_totals_stmt, card_id)
+        # Card-Payments transactions are not spend: exclude them from
+        # the pct_of_total denominator too (missing row → no exclusion,
+        # see :meth:`_spend_only_filter`).
+        period_totals_stmt = self._spend_only_filter(period_totals_stmt, card_payments_id)
         period_total_rows = (await self._session.execute(period_totals_stmt)).all()
         period_total: dict[str, Decimal] = {r.currency: Decimal(r.total) for r in period_total_rows}
 
-        # 4. Compose the response. One row per category
-        #    (always 12 — the LEFT JOIN guarantees it).
+        # 4. Compose the response. One row per spend category (the
+        #    Card Payments row was filtered out above; the LEFT JOIN
+        #    guarantees every other category survives).
         result: list[CategoryBreakdown] = []
         for cat_id, entry in per_cat.items():
             # ``pct_of_total`` is the largest single-currency
@@ -834,6 +892,11 @@ class DashboardService:
             .group_by(Transaction.merchant_id, Transaction.currency)
         )
         stmt = self._apply_card_filter(stmt, card_id)
+        # Card-Payments transactions are not spend: they never surface
+        # as a top merchant and never distort a merchant's rollup with
+        # a large negative total (missing row → no exclusion, see
+        # :meth:`_spend_only_filter`).
+        stmt = self._spend_only_filter(stmt, await self._card_payments_category_id())
 
         rows = (await self._session.execute(stmt)).all()
 
@@ -1196,6 +1259,56 @@ class DashboardService:
             }
             for rule in matching
         ]
+
+    # ------------------------------------------------------------------
+    # Card Payments exclusion (statement payments are not spend)
+    # ------------------------------------------------------------------
+
+    async def _card_payments_category_id(self) -> UUID | None:
+        """Resolve the closed-set Card Payments category id by display name.
+
+        The dedicated "Card Payments" category (migration
+        ``0003_card_payments_category``) holds payments TO the credit
+        card — statement payment lines such as "MONTO CANCELADO".
+        Those transactions are not spend, so the spend distributions
+        exclude the category at query time. The UUID is resolved at
+        query time — it is never hard-coded. A missing category row is
+        a valid state (an un-migrated database) and simply yields
+        ``None``, which means "apply no exclusion".
+
+        Deliberate scope note: ``summary``'s period totals and the
+        ``monthly`` / ``monthly_window`` bar series intentionally still
+        include Card Payments transactions (signed semantics) pending a
+        separate product decision; only the spend distributions
+        (categories, merchants, top-category / top-merchant) exclude
+        them today.
+        """
+        stmt = (
+            select(Category.id)
+            .where(Category.display_name == _CARD_PAYMENTS_DISPLAY_NAME)
+            .order_by(Category.sort_order.asc())
+            .limit(1)
+        )
+        category_id: UUID | None = await self._session.scalar(stmt)
+        return category_id
+
+    def _spend_only_filter(
+        self,
+        stmt: Select[_SelectT],
+        card_payments_id: UUID | None,
+    ) -> Select[_SelectT]:
+        """Restrict a ``Transaction`` query to spend (non-Card-Payments rows).
+
+        When ``card_payments_id`` is ``None`` (the category row does not
+        exist — an un-migrated database) the statement is returned
+        unchanged: no exclusion, preserving the pre-migration
+        behaviour. ``is_distinct_from`` keeps ``category_id IS NULL``
+        rows (uncategorised spend) in the aggregation, which a plain
+        ``!=`` comparison would drop through SQL three-valued logic.
+        """
+        if card_payments_id is None:
+            return stmt
+        return stmt.where(Transaction.category_id.is_distinct_from(card_payments_id))
 
     # ------------------------------------------------------------------
     # subscriptions (category-driven; Fix 2)
