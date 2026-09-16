@@ -8,42 +8,38 @@ Phase 1 ingests every line-item in a bank statement, and Phase 2 enriches each r
 
 ### Requirement: `DashboardService.summary` Returns KPI Aggregates for a Period
 
-`DashboardService.summary(period, range, card_id)` MUST return aggregated KPI data for the calendar month `period` (ISO `YYYY-MM`) restricted to the lookback window `range` (one of `3`, `6`, `12`, or `0` for all-time) and to a single card when `card_id` is a UUID, or to every card when `card_id == "all"`. The response MUST include: `total_per_currency` (dict `{currency: amount}`, no FX conversion), `daily_avg_per_currency` (`{currency: total / calendar days of the period month}` — July divides by 31, Feb by 28/29, independent of transaction-date density), `transaction_count` (int), `transaction_count_per_currency` (`{currency: count}`; absent for empty currencies), `top_category_id` + `top_category_total_per_currency` (the closed-set category with the largest sum in any currency, broken down by currency), `top_merchant_id` + `top_merchant_total_per_currency` (analogous for merchant), `comparison_to_prev_period_pct_per_currency` (signed % change vs. the same period in the previous month, or `{}` if the previous month has no transactions in that currency), `period_start` + `period_end` (ISO dates), and `card_id` (echo of the input). `top_category_total_per_currency` and `top_merchant_total_per_currency` are also multi-currency dicts. (Q1, Q2, Q3, Q4, Q8)
+`DashboardService.summary(period, range, card_id)` MUST return aggregated KPI data for ISO `YYYY-MM` period, `range ∈ {3,6,12,0}` (0 = all-time), and `card_id ∈ UUID | "all"`. Response fields: `total_per_currency` (`{currency: amount}`, no FX), `daily_avg_per_currency` (`{currency: total / calendar_days_of_period_month}` — July divides by 31, Feb by 28/29, independent of transaction-date density), `transaction_count` (int), `transaction_count_per_currency` (`{currency: count}`; absent for empty currencies), `top_category_id` + `top_category_total_per_currency`, `top_merchant_id` + `top_merchant_total_per_currency`, `comparison_to_prev_period_pct_per_currency` (signed % vs. prior month or `{}`), `period_start`/`period_end` (ISO dates), `card_id` (echo).
+(Previously: `daily_avg_per_currency` divided by distinct days with at least one transaction; response lacked `transaction_count_per_currency`.)
 
-#### Scenario: Summary for a single-currency period
+#### Scenario: Single-currency period
 
-- **GIVEN** 5 CLP transactions in `2026-07` across the "Groceries" and "Dining Out" categories
-- **WHEN** the service calls `summary(period="2026-07", range=6, card_id="all")`
-- **THEN** the response carries `total_per_currency == {"CLP": <sum>}` and `transaction_count == 5`
-- **AND** `daily_avg_per_currency["CLP"] == total_per_currency["CLP"] / <calendar days of the period month>`
-- **AND** `period_start == "2026-07-01"` and `period_end == "2026-07-31"`
-- **AND** `card_id == "all"`
+- **GIVEN** 5 CLP transactions in `2026-07` all dated `2026-07-01`
+- **WHEN** `summary("2026-07", 6, "all")`
+- **THEN** `total_per_currency == {"CLP": <sum>}`, `transaction_count == 5`, `transaction_count_per_currency == {"CLP": 5}`, `daily_avg == total/31`, `period_start/end == 2026-07-01/31`
 
-#### Scenario: Multi-currency period returns side-by-side
+#### Scenario: Multi-currency period
 
-- **GIVEN** 3 CLP transactions and 2 USD transactions in `2026-07`
-- **WHEN** the service calls `summary(period="2026-07", range=6, card_id="all")`
-- **THEN** `total_per_currency` is `{"CLP": <clp_sum>, "USD": <usd_sum>}` with both keys present
-- **AND** `daily_avg_per_currency` carries a per-currency entry for each currency present
-- **AND** the response does NOT sum the two currencies into a single number
+- **GIVEN** 3 CLP + 2 USD in `2026-07`
+- **WHEN** `summary("2026-07", 6, "all")`
+- **THEN** both keys in `total_per_currency` and `transaction_count_per_currency`; currencies not summed
 
-#### Scenario: Single-card filter excludes other cards
+#### Scenario: Single-card filter
 
-- **GIVEN** card A has 4 transactions in `2026-07` and card B has 3 transactions in `2026-07`
-- **WHEN** the service calls `summary(period="2026-07", range=6, card_id=<card_A.uuid>)`
-- **THEN** `transaction_count == 4` and the totals reflect only card A's rows
+- **GIVEN** card A: 4 txns; card B: 3 txns in `2026-07`
+- **WHEN** `summary("2026-07", 6, <A>)`
+- **THEN** `transaction_count == 4`; per-currency counts reflect A only
 
 #### Scenario: `range=0` is all-time
 
-- **GIVEN** transactions span `2025-01` through `2026-07`
-- **WHEN** the service calls `summary(period="2026-07", range=0, card_id="all")`
-- **THEN** the previous-period comparison is computed against `2026-06` (not against the dataset minimum), and `daily_avg_per_currency` uses the calendar days of the period month, not the full history
+- **GIVEN** data spans `2025-01`–`2026-07`
+- **WHEN** `summary("2026-07", 0, "all")`
+- **THEN** comparison vs. `2026-06`; `daily_avg` uses 31 calendar days, not full history
 
-#### Scenario: Empty period returns zeros, not an error
+#### Scenario: Empty period
 
 - **GIVEN** no transactions in `2026-07`
-- **WHEN** the service calls `summary(period="2026-07", range=6, card_id="all")`
-- **THEN** the response is `200` with `total_per_currency == {}`, `transaction_count == 0`, `top_category_id is None`, `top_merchant_id is None`, and `comparison_to_prev_period_pct_per_currency == {}`
+- **WHEN** `summary("2026-07", 6, "all")`
+- **THEN** `total_per_currency == {}`, `transaction_count == 0`, `transaction_count_per_currency == {}`, top fields `None`
 
 ### Requirement: `DashboardService.categories` Returns All 12 Closed-Set Categories for a Period
 
@@ -456,45 +452,121 @@ The `GET /dashboard` page MUST render the monthly time series as Tailwind bar ch
 - **WHEN** the test asserts the response body
 - **THEN** the bar tiles, KPI grid, category block, and recurring list are all present in the response (no JS-dependent content is missing)
 
-### Requirement: `GET /dashboard` Page with Card Picker and Period Picker
+### Requirement: `GET /dashboard` Page with Responsive Shell, Live Hero, and Unified Refresh
 
-`GET /dashboard` MUST return `200` with the full HTML page. The page MUST include: a card picker (Alpine.js dropdown, options = "Todas las cards" + every active `CreditCard` row from the database, default = "Todas"), a period picker (Alpine.js dropdown, options = current month + last 3 / 6 / 12 months + all-time, default = "current month"), and 5 sections rendering data from the 5 dashboard endpoints. Changing either picker MUST trigger an HTMX partial refresh (an `hx-get` request to the relevant endpoint, swapped into the corresponding `<div hx-target>`) — no full page reload. The `GET /dashboard` route MUST live in `app/web/router.py` and call `DashboardService` directly (not the API endpoints) for the initial render, so the first paint is a single DB roundtrip per service call. (Q1, Q2, Q6, Q7)
+`GET /dashboard` MUST return `200` with a server-rendered page using a dashboard-scoped responsive shell: a desktop sidebar (~240px) and a mobile compact top bar with responsive navigation. The page MUST contain a constrained content region (~1136px max), a live-data hero with per-currency totals, four KPI cards, a visible `period` / `card_id` / `range_mode` form, and five data-backed sections inside one replaceable HTMX target. Any selection change MUST submit the form to `GET /dashboard/sections`, atomically swapping the hero, labels, and all five sections. Defaults: card = "Todas" (`all`) plus every active `CreditCard`; period = current month; `range_mode` ∈ `{current, 3, 6, 12, 0}` with default `current` (Mes actual); a 6-month window is used only when the user explicitly selects it. Inactive cards MUST NOT appear. CLP/USD render side-by-side; no cross-currency aggregation. No anomaly section, placeholder, or route. No JS chart library. Route lives in `app/web/router.py` using `DashboardService` directly.
+(Previously: Alpine pickers with per-section `hx-get` to `/api/v1/dashboard/*` and unconstrained content column.)
 
-#### Scenario: Page returns 200 with the full layout
+#### Scenario: Page returns 200 with shell, hero, and five sections
 
 - **GIVEN** the user navigates to `/dashboard`
-- **WHEN** the test client calls `GET /dashboard`
-- **THEN** the response is `200` with `Content-Type: text/html`
-- **AND** the body contains the card picker, the period picker, and the 5 sections (KPI grid, categories block, top merchants block, monthly bar chart, recurring list)
+- **WHEN** the test client issues `GET /dashboard`
+- **THEN** the response contains a desktop sidebar, mobile top bar/nav, constrained region, live hero, four KPI cards, visible selection form, and five sections
 
-#### Scenario: Card picker defaults to "Todas las cards"
+#### Scenario: Selection change atomically refreshes hero and all sections
 
-- **GIVEN** two `CreditCard` rows exist, both with `is_active=True`
-- **WHEN** the dashboard page is rendered
-- **THEN** the card picker `<option>` list has 3 entries: "Todas las cards" (selected by default), `<card_A.display_name>`, `<card_B.display_name>`
-- **AND** "Todas las cards" has the `selected` attribute
+- **GIVEN** the dashboard is rendered
+- **WHEN** any selection control changes and the form submits
+- **THEN** exactly one request hits `/dashboard/sections`
+- **AND** hero, KPIs, categories, merchants, monthly, and recurring swap in one HTMX operation
 
-#### Scenario: Period picker defaults to the current month
+#### Scenario: Defaults and inactive-card exclusion
 
-- **GIVEN** today is `2026-07-15`
-- **WHEN** the dashboard page is rendered
-- **THEN** the period picker `<option>` list has 5 entries: "Current month" (selected by default), "Last 3 months", "Last 6 months", "Last 12 months", "All-time"
-- **AND** "Current month" has the `selected` attribute
+- **GIVEN** two active and one inactive `CreditCard`
+- **WHEN** the dashboard renders
+- **THEN** the picker shows "Todas" (selected) plus the two active cards only; period defaults to current month; `range_mode` defaults to `current` (Mes actual)
+- **AND** no anomaly link/section/placeholder appears
 
-#### Scenario: Picker change triggers an HTMX partial refresh
+## ADDED Requirements
 
-- **GIVEN** the user changes the card picker to a specific card
-- **WHEN** the Alpine handler updates the page state
-- **THEN** the relevant KPI / categories / merchants / monthly / recurring `<div>` triggers an `hx-get` request to the corresponding `/api/v1/dashboard/*` endpoint with the new `card_id` and `period`
-- **AND** the response is swapped into the target `<div>` without a full page reload
-- **AND** the test asserts the page HTML includes `hx-get="/api/v1/dashboard/summary?..."` (or equivalent) wiring on at least one target
+### Requirement: `DashboardSelection` Value Object and Date-Window Resolver
 
-#### Scenario: Inactive cards are not in the picker
+The dashboard MUST compose every partial from a server-side `DashboardSelection(period, card_id, range_mode)` with `range_mode ∈ {rolling(N), ytd, all_time}`. A pure resolver yields `(window_start, window_end)`: rolling = last N months ending in period; YTD = January 1 of period's year through `period_end`; all_time = earliest card-filtered transaction through `period_end`. Resolver MUST be deterministic with injected "today". API `range=0` MUST continue to resolve to `all_time`; API clients MUST NOT silently change.
 
-- **GIVEN** two `CreditCard` rows exist: one with `is_active=True`, one with `is_active=False`
-- **WHEN** the dashboard page is rendered
-- **THEN** the card picker shows only the active card + "Todas las cards" (the inactive card is excluded)
+#### Scenario: YTD window
 
-## Out of Scope
+- **GIVEN** `period="2026-07"`, `range_mode="ytd"`
+- **WHEN** resolver runs
+- **THEN** `window_start="2026-01-01"`, `window_end="2026-07-31"`
 
-A real `AnomalyDetector` service (the "anomaly flags" claim in the README is served by the top-3-by-category endpoint, which is honest about being "top spenders", not anomalies). Pre-computed `daily_spend_aggregates` table (Option B). Persisted `anomaly_flags` table (Option C). A JS chart library (Tailwind bars only per Q6). CSV / PDF export (deferred to Phase 4 — the README lists "exports" in Phase 4 per Q7). Real-time WebSocket updates (HTMX polling is enough for v1; the UI does not auto-refresh in v1). Multi-user / auth. Mobile-specific UX (the dashboard is desktop-first; mobile-friendly via Tailwind responsive utilities but no mobile-only features). Renaming or altering the existing `RecurringRuleResponse` shape from Phase 2 PR #5 (this capability reuses it as-is). Adding new closed-set categories beyond the existing 12 (the seed is frozen from Phase 2). FX conversion between CLP and USD (the app has no rate table; per-currency sub-rollups are the v1 contract). Persisting user preferences (last-selected card, last-selected period) across sessions (the defaults are always "Todas" and "current month").
+#### Scenario: all_time window
+
+- **GIVEN** earliest transaction `2025-02-10`
+- **WHEN** resolver with `range_mode="all_time"`, `period="2026-07"`
+- **THEN** `window_start="2025-02-01"`, `window_end="2026-07-31"`
+
+#### Scenario: API `range=0` compatibility
+
+- **GIVEN** API client sends `range=0`
+- **WHEN** endpoint translates
+- **THEN** resolver receives `range_mode="all_time"` with identical pre-change behavior
+
+### Requirement: Live Per-Currency Transaction Counts
+
+The web summary partial MUST render each currency's count from `transaction_count_per_currency`, not from hard-coded literals.
+
+#### Scenario: USD count derived
+
+- **GIVEN** 2 USD transactions in `2026-07`
+- **WHEN** partial renders
+- **THEN** USD count displays `2`
+
+### Requirement: Truthful Anomaly Empty State
+
+While no anomaly detector is configured, the dashboard MUST NOT reserve a prominent empty anomaly panel or claim anomalies are available.
+
+#### Scenario: No anomaly panel
+
+- **GIVEN** no detector configured
+- **WHEN** dashboard rendered
+- **THEN** no anomaly placeholder or "no anomalies" banner
+
+### Requirement: Desktop Shell Navigation
+
+The sidebar MUST expose only valid route destinations: `/dashboard` (active here), `/transactions`, `/upload`. The active destination MUST be visually indicated. The sidebar MUST NOT link to `/recurring`, `/settings`, `/anomaly`, or any non-existent route.
+
+#### Scenario: Sidebar links resolve to real routes
+
+- **GIVEN** the sidebar is rendered
+- **WHEN** each `href` is inspected
+- **THEN** every link resolves to an existing endpoint and `/dashboard` is marked active
+
+### Requirement: Mobile Navigation
+
+At ≤ mobile breakpoint, the dashboard MUST render a compact top bar with responsive navigation exposing the same valid destinations. Touch targets MUST be ≥ 44px. No dead destinations.
+
+#### Scenario: 390px viewport shows valid nav
+
+- **GIVEN** viewport is 390px wide
+- **WHEN** the dashboard renders
+- **THEN** top bar and nav are visible with ≥ 44px targets and only valid route links
+
+### Requirement: Constrained Responsive Container
+
+The content region MUST cap at ~1136px and center. Category/merchant and monthly/recurring grids MUST approximate a 680/440 split on desktop and stack on mobile. No overflow at 390px.
+
+#### Scenario: Layout constrains and stacks responsively
+
+- **GIVEN** desktop viewport
+- **WHEN** measured
+- **THEN** content is centered within the max width; at 390px, grids stack without overflow
+
+### Requirement: Visible Category Bars
+
+`dashboard_categories.html` MUST render category bars as visible markup. No hidden duplicate bar list may exist solely to satisfy tests.
+
+#### Scenario: Bars are visible without hidden duplicates
+
+- **GIVEN** the categories partial renders for a period with spend
+- **WHEN** the DOM is inspected
+- **THEN** every category bar is visible and no hidden duplicate container exists
+
+### Requirement: Empty States
+
+Each of the five sections MUST render a structured empty state when its data is empty for the active selection. Empty states MUST NOT break the unified HTMX swap boundary.
+
+#### Scenario: Empty states render within the swap target
+
+- **GIVEN** no transactions in the selected period
+- **WHEN** the dashboard or `/dashboard/sections` renders
+- **THEN** each section shows its empty state and the HTMX target is fully replaced
